@@ -1,0 +1,14 @@
+{
+  "name": "rtach-tests",
+  "version": "1.0.0",
+  "description": "Integration tests and benchmarks for rtach",
+  "scripts": {
+    "test": "bun test",
+    "test:functional": "bun test functional.test.ts",
+    "test:benchmark": "bun test benchmark.test.ts",
+    "bench": "bun run benchmark.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  }
+}

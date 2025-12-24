@@ -1,0 +1,5 @@
+zig-out/
+build/
+.env
+.zig-cache/
+node_modules/
