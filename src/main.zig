@@ -11,7 +11,14 @@ const RingBuffer = @import("ringbuffer.zig").RingBuffer;
 pub const Protocol = @import("protocol.zig");
 
 /// Version string - increment when making changes that require redeployment
-pub const version = "1.3.0";
+/// 1.4.0 - Added shell integration (OSC 133) for input detection
+/// 1.4.1 - Fixed SIGWINCH handling to check on every loop iteration
+/// 1.5.0 - Limit initial scrollback to 16KB for faster reconnects
+/// 1.6.0 - Add request_scrollback for on-demand old scrollback loading
+/// 1.6.1 - Fix ResponseHeader padding (use packed struct for exact 5-byte header)
+/// 1.7.0 - Add client_id to attach packet to prevent duplicate connections from same device
+/// 1.8.0 - Skip scrollback on attach when in alternate screen mode (fixes TUI app corruption)
+pub const version = "1.8.0";
 
 pub const std_options: std.Options = .{
     .log_level = .info,
@@ -25,6 +32,7 @@ const Args = struct {
     no_detach_char: bool = false,
     detach_char: u8 = 0x1c, // Ctrl+\ by default
     scrollback_size: usize = 1024 * 1024, // 1MB default
+    client_id: ?[Protocol.CLIENT_ID_SIZE]u8 = null, // Unique client identifier (UUID)
 
     const Mode = enum {
         create, // -c: Create new session, attach to it
@@ -112,6 +120,7 @@ fn attach(allocator: std.mem.Allocator, args: Args) !void {
         .socket_path = args.socket_path,
         .detach_char = if (args.no_detach_char) null else args.detach_char,
         .redraw_method = args.redraw_method,
+        .client_id = args.client_id,
     });
     defer client.deinit();
 
@@ -121,6 +130,33 @@ fn attach(allocator: std.mem.Allocator, args: Args) !void {
 fn socketExists(path: []const u8) bool {
     const stat = std.fs.cwd().statFile(path) catch return false;
     return stat.kind == .unix_domain_socket;
+}
+
+/// Parse UUID string (with or without dashes) to 16-byte array
+fn parseClientId(id_str: []const u8) ?[Protocol.CLIENT_ID_SIZE]u8 {
+    var result: [Protocol.CLIENT_ID_SIZE]u8 = undefined;
+    var out_idx: usize = 0;
+
+    var i: usize = 0;
+    while (i < id_str.len and out_idx < Protocol.CLIENT_ID_SIZE) {
+        // Skip dashes
+        if (id_str[i] == '-') {
+            i += 1;
+            continue;
+        }
+
+        // Need at least 2 hex chars
+        if (i + 1 >= id_str.len) break;
+
+        const high = std.fmt.charToDigit(id_str[i], 16) catch return null;
+        const low = std.fmt.charToDigit(id_str[i + 1], 16) catch return null;
+        result[out_idx] = (high << 4) | low;
+        out_idx += 1;
+        i += 2;
+    }
+
+    if (out_idx != Protocol.CLIENT_ID_SIZE) return null;
+    return result;
 }
 
 fn parseArgs(allocator: std.mem.Allocator) !Args {
@@ -175,6 +211,11 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
         } else if (std.mem.eql(u8, arg, "-s")) {
             if (args_iter.next()) |size_str| {
                 result.scrollback_size = std.fmt.parseInt(usize, size_str, 10) catch 1024 * 1024;
+            }
+        } else if (std.mem.eql(u8, arg, "-C") or std.mem.eql(u8, arg, "--client-id")) {
+            // Parse client ID as UUID string (32 hex chars or 36 with dashes)
+            if (args_iter.next()) |id_str| {
+                result.client_id = parseClientId(id_str);
             }
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             printUsage();

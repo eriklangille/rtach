@@ -8,6 +8,7 @@ else
 const posix = std.posix;
 const Protocol = @import("protocol.zig");
 const RingBuffer = @import("ringbuffer.zig").DynamicRingBuffer;
+const ShellIntegration = @import("shell_integration.zig");
 
 const log = std.log.scoped(.master);
 
@@ -26,6 +27,7 @@ fn getTIOCSWINSZ() c_int {
 extern "c" fn grantpt(fd: c_int) c_int;
 extern "c" fn unlockpt(fd: c_int) c_int;
 extern "c" fn ptsname(fd: c_int) ?[*:0]const u8;
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
 pub const MasterOptions = struct {
     socket_path: []const u8,
@@ -39,6 +41,7 @@ const ClientConn = struct {
     stream: xev.Stream,
     reader: Protocol.PacketReader = .{},
     attached: bool = false,
+    client_id: ?[Protocol.CLIENT_ID_SIZE]u8 = null, // Unique client identifier
     completion: xev.Completion = .{},
     read_buf: [512]u8 = undefined,
     master: *Master = undefined,
@@ -74,6 +77,11 @@ pub const Master = struct {
 
     // Window size
     winsize: Protocol.Winsize = .{ .rows = 24, .cols = 80 },
+
+    // Alternate screen state tracking
+    // When true, the terminal is in alternate screen mode (vim, less, Claude Code, etc.)
+    // We skip sending scrollback on attach when in this mode since the TUI will redraw itself
+    in_alternate_screen: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, options: MasterOptions) !*Master {
         const self = try allocator.create(Master);
@@ -192,13 +200,52 @@ pub const Master = struct {
             posix.dup2(slave_fd, 2) catch {};
             if (slave_fd > 2) posix.close(slave_fd);
 
-            const argv = [_:null]?[*:0]const u8{
-                @ptrCast(self.options.command.ptr),
-                null,
+            // Deploy shell integration files
+            ShellIntegration.deployIntegrationFiles() catch |err| {
+                log.warn("failed to deploy shell integration: {}", .{err});
             };
 
-            // Inherit parent's environment (critical for shell startup)
-            _ = posix.execvpeZ(@ptrCast(self.options.command.ptr), &argv, std.c.environ) catch {};
+            // Detect shell type and prepare args with integration
+            const shell_type = ShellIntegration.detectShellType(self.options.command);
+            log.info("detected shell type: {s}", .{@tagName(shell_type)});
+
+            const shell_setup = ShellIntegration.prepareShellArgs(
+                self.allocator,
+                @ptrCast(self.options.command.ptr),
+                shell_type,
+            ) catch |err| {
+                log.warn("failed to prepare shell args: {}, falling back to direct exec", .{err});
+                // Fall back to direct exec
+                const argv = [_:null]?[*:0]const u8{
+                    @ptrCast(self.options.command.ptr),
+                    null,
+                };
+                _ = posix.execvpeZ(@ptrCast(self.options.command.ptr), &argv, std.c.environ) catch {};
+                posix.exit(127);
+            };
+
+            // Set extra environment variable if needed (e.g., ZDOTDIR for zsh)
+            if (shell_setup.env_name) |name| {
+                if (shell_setup.env_value) |value| {
+                    _ = setenv(name, value, 1);
+                }
+            }
+
+            // Log the command being executed
+            log.info("executing shell: {s}", .{shell_setup.argv[0].?});
+            if (shell_setup.argc > 1) {
+                if (shell_setup.argv[1]) |arg1| {
+                    log.info("  arg1: {s}", .{arg1});
+                }
+            }
+            if (shell_setup.argc > 2) {
+                if (shell_setup.argv[2]) |arg2| {
+                    log.info("  arg2: {s}", .{arg2});
+                }
+            }
+
+            // Execute shell with integration
+            _ = posix.execvpeZ(shell_setup.argv[0].?, &shell_setup.argv, std.c.environ) catch {};
             posix.exit(127);
         }
 
@@ -280,6 +327,11 @@ pub const Master = struct {
         }
 
         const data = self.pty_read_buf[0..n];
+
+        // Track alternate screen state by scanning for escape sequences
+        // ESC[?1049h = enter alternate screen, ESC[?1049l = exit
+        // ESC[?47h / ESC[?47l = older variant
+        self.updateAlternateScreenState(data);
 
         // Store in scrollback
         self.scrollback.write(data);
@@ -470,15 +522,72 @@ pub const Master = struct {
     fn handleClientPacket(self: *Master, idx: usize, pkt: Protocol.Packet) !void {
         switch (pkt.header.type) {
             .attach => {
-                log.info("client {} attached", .{idx});
+                // Get client ID from attach packet (if provided)
+                const client_id = pkt.getClientId();
+
+                // If client ID provided, kick any existing connection with same ID
+                if (client_id) |id| {
+                    var i: usize = 0;
+                    while (i < self.clients.items.len) {
+                        const other = self.clients.items[i];
+                        if (i != idx and other.client_id != null and std.mem.eql(u8, &other.client_id.?, &id)) {
+                            log.info("kicking duplicate client {} (same client_id as {})", .{ i, idx });
+                            posix.close(other.fd);
+                            self.allocator.destroy(other);
+                            _ = self.clients.swapRemove(i);
+                            // Adjust idx if needed (swapRemove may have moved our client)
+                            if (idx == self.clients.items.len) {
+                                // Our client was swapped, now at position i
+                                return self.handleClientPacket(i, pkt);
+                            }
+                            // Don't increment i - check the swapped element
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    self.clients.items[idx].client_id = id;
+                }
+
+                log.info("client {} attached (client_id: {}, alt_screen: {})", .{ idx, if (client_id != null) @as(u64, @bitCast(client_id.?[0..8].*)) else 0, self.in_alternate_screen });
                 self.clients.items[idx].attached = true;
 
-                const slices = self.scrollback.slices();
-                if (slices.first.len > 0) {
-                    _ = posix.write(self.clients.items[idx].fd, slices.first) catch {};
-                }
-                if (slices.second.len > 0) {
-                    _ = posix.write(self.clients.items[idx].fd, slices.second) catch {};
+                // Skip sending scrollback if in alternate screen mode (vim, less, Claude Code, etc.)
+                // The TUI app will redraw itself when it receives SIGWINCH
+                // Sending old scrollback would corrupt the display
+                if (self.in_alternate_screen) {
+                    log.info("skipping scrollback (alternate screen active)", .{});
+                } else {
+                    // Only send last 16KB of scrollback on attach (a few screens worth)
+                    // This prevents UI freezes when reconnecting to sessions with large history
+                    // Full scrollback is still stored and could be requested on-demand later
+                    const max_initial_scrollback: usize = 16 * 1024;
+                    const slices = self.scrollback.slices();
+                    const total_len = slices.first.len + slices.second.len;
+
+                    if (total_len <= max_initial_scrollback) {
+                        // Small buffer - send all
+                        if (slices.first.len > 0) {
+                            _ = posix.write(self.clients.items[idx].fd, slices.first) catch {};
+                        }
+                        if (slices.second.len > 0) {
+                            _ = posix.write(self.clients.items[idx].fd, slices.second) catch {};
+                        }
+                    } else {
+                        // Large buffer - only send the tail
+                        const skip = total_len - max_initial_scrollback;
+                        if (skip < slices.first.len) {
+                            // Skip part of first slice, send rest of first + all of second
+                            _ = posix.write(self.clients.items[idx].fd, slices.first[skip..]) catch {};
+                            if (slices.second.len > 0) {
+                                _ = posix.write(self.clients.items[idx].fd, slices.second) catch {};
+                            }
+                        } else {
+                            // Skip all of first slice, skip part of second
+                            const skip_second = skip - slices.first.len;
+                            _ = posix.write(self.clients.items[idx].fd, slices.second[skip_second..]) catch {};
+                        }
+                        log.info("sent last {}KB of {}KB scrollback", .{ max_initial_scrollback / 1024, total_len / 1024 });
+                    }
                 }
             },
             .detach => {
@@ -513,6 +622,84 @@ pub const Master = struct {
                     _ = posix.write(self.clients.items[idx].fd, slices.second) catch {};
                 }
             },
+            .request_scrollback => {
+                // Client requests old scrollback (everything before the 16KB initial send)
+                const max_initial: usize = 16 * 1024;
+                const slices = self.scrollback.slices();
+                const total_len = slices.first.len + slices.second.len;
+
+                if (total_len <= max_initial) {
+                    // All scrollback was already sent on attach, nothing more to send
+                    // Send empty response
+                    const header = Protocol.ResponseHeader{
+                        .type = .scrollback,
+                        .len = 0,
+                    };
+                    _ = posix.write(self.clients.items[idx].fd, std.mem.asBytes(&header)) catch {};
+                    log.info("scrollback request: no additional data (all sent on attach)", .{});
+                } else {
+                    // Send the OLD scrollback (everything before the last 16KB)
+                    const old_len = total_len - max_initial;
+                    const header = Protocol.ResponseHeader{
+                        .type = .scrollback,
+                        .len = @intCast(old_len),
+                    };
+                    _ = posix.write(self.clients.items[idx].fd, std.mem.asBytes(&header)) catch {};
+
+                    // Send old scrollback data
+                    if (old_len <= slices.first.len) {
+                        // Old scrollback is entirely in first slice
+                        _ = posix.write(self.clients.items[idx].fd, slices.first[0..old_len]) catch {};
+                    } else {
+                        // Old scrollback spans first slice + part of second
+                        if (slices.first.len > 0) {
+                            _ = posix.write(self.clients.items[idx].fd, slices.first) catch {};
+                        }
+                        const second_len = old_len - slices.first.len;
+                        _ = posix.write(self.clients.items[idx].fd, slices.second[0..second_len]) catch {};
+                    }
+                    log.info("scrollback request: sent {}KB of old scrollback", .{old_len / 1024});
+                }
+            },
+        }
+    }
+
+    /// Scan data for alternate screen escape sequences and update state
+    /// Looks for: ESC[?1049h (enter), ESC[?1049l (exit), ESC[?47h/l (older variant)
+    fn updateAlternateScreenState(self: *Master, data: []const u8) void {
+        // Look for escape sequences in the data
+        // We need to find ESC [ ? followed by 1049 or 47, then h or l
+        var i: usize = 0;
+        while (i < data.len) {
+            // Look for ESC (0x1B)
+            if (data[i] == 0x1B) {
+                // Check for CSI: ESC [
+                if (i + 1 < data.len and data[i + 1] == '[') {
+                    // Check for private mode: ?
+                    if (i + 2 < data.len and data[i + 2] == '?') {
+                        // Parse the number
+                        var num: u32 = 0;
+                        var j = i + 3;
+                        while (j < data.len and data[j] >= '0' and data[j] <= '9') {
+                            num = num * 10 + (data[j] - '0');
+                            j += 1;
+                        }
+                        // Check for h (set) or l (reset) and matching number
+                        if (j < data.len) {
+                            if ((num == 1049 or num == 47)) {
+                                if (data[j] == 'h') {
+                                    self.in_alternate_screen = true;
+                                    log.info("entered alternate screen (mode {})", .{num});
+                                } else if (data[j] == 'l') {
+                                    self.in_alternate_screen = false;
+                                    log.info("exited alternate screen (mode {})", .{num});
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            i += 1;
         }
     }
 

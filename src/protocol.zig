@@ -14,6 +14,23 @@ pub const MessageType = enum(u8) {
     winch = 3,
     /// Request screen redraw
     redraw = 4,
+    /// Request old scrollback (everything before the initial 16KB)
+    request_scrollback = 5,
+};
+
+/// Response types for master → client protocol.
+/// Used for framed responses that need length prefixes.
+pub const ResponseType = enum(u8) {
+    /// Old scrollback data (prepend to current screen)
+    scrollback = 1,
+};
+
+/// Response header for framed master → client messages
+/// Use packed to ensure no padding between type (1 byte) and len (4 bytes)
+/// Total size: exactly 5 bytes
+pub const ResponseHeader = packed struct {
+    type: ResponseType,
+    len: u32, // Length of following data (up to 4GB)
 };
 
 /// Packet header - compatible with dtach
@@ -32,6 +49,9 @@ pub const Winsize = extern struct {
 
 /// Maximum payload size (fits in u8 len field)
 pub const MAX_PAYLOAD_SIZE = 255;
+
+/// Client ID size (UUID = 16 bytes)
+pub const CLIENT_ID_SIZE = 16;
 
 /// Full packet structure
 pub const Packet = struct {
@@ -63,13 +83,25 @@ pub const Packet = struct {
         return pkt;
     }
 
-    pub fn initAttach() Packet {
-        return .{
+    pub fn initAttach(client_id: ?*const [CLIENT_ID_SIZE]u8) Packet {
+        var pkt = Packet{
             .header = .{
                 .type = .attach,
-                .len = 0,
+                .len = if (client_id != null) CLIENT_ID_SIZE else 0,
             },
         };
+        if (client_id) |id| {
+            @memcpy(pkt.payload[0..CLIENT_ID_SIZE], id);
+        }
+        return pkt;
+    }
+
+    /// Get client ID from attach packet payload (returns null if no client ID)
+    pub fn getClientId(self: *const Packet) ?[CLIENT_ID_SIZE]u8 {
+        if (self.header.type != .attach or self.header.len < CLIENT_ID_SIZE) {
+            return null;
+        }
+        return self.payload[0..CLIENT_ID_SIZE].*;
     }
 
     pub fn initDetach() Packet {

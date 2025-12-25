@@ -14,6 +14,7 @@ pub const ClientOptions = struct {
     socket_path: []const u8,
     detach_char: ?u8 = 0x1c, // Ctrl+\ by default
     redraw_method: RedrawMethod = .none,
+    client_id: ?[Protocol.CLIENT_ID_SIZE]u8 = null, // Unique client identifier
 };
 
 pub const Client = struct {
@@ -122,8 +123,9 @@ pub const Client = struct {
         try self.setupRawTerminal();
         errdefer self.restoreTerminal();
 
-        // Send attach message
-        const attach_pkt = Protocol.Packet.initAttach();
+        // Send attach message with optional client_id
+        const client_id_ptr: ?*const [Protocol.CLIENT_ID_SIZE]u8 = if (self.options.client_id) |*id| id else null;
+        const attach_pkt = Protocol.Packet.initAttach(client_id_ptr);
         _ = try posix.write(self.socket_fd, attach_pkt.serialize());
 
         // Send initial window size
@@ -163,14 +165,16 @@ pub const Client = struct {
         };
 
         while (self.running) {
+            // Check for pending window size change on every iteration
+            // (signal may have arrived without interrupting poll)
+            if (winch_pending) {
+                winch_pending = false;
+                self.sendWindowSize() catch {};
+            }
+
             const ready = posix.poll(&poll_fds, -1) catch |err| {
                 if (err == error.Interrupted) {
-                    // Check for pending window size change
-                    if (winch_pending) {
-                        winch_pending = false;
-                        self.sendWindowSize() catch {};
-                    }
-                    continue;
+                    continue; // Will check winch_pending at top of loop
                 }
                 return err;
             };
