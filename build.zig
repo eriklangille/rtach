@@ -49,6 +49,31 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
 
+    // Integration tests (requires bun) - functional tests only
+    // Run with: zig build integration-test
+    const integration_test_step = b.step("integration-test", "Run functional integration tests (requires bun)");
+    integration_test_step.dependOn(b.getInstallStep()); // Build first
+
+    const bun_test = b.addSystemCommand(&.{ "bun", "test", "functional.test.ts" });
+    bun_test.setCwd(b.path("tests"));
+    bun_test.step.dependOn(b.getInstallStep());
+    integration_test_step.dependOn(&bun_test.step);
+
+    // Benchmarks (manual, not part of CI)
+    // Run with: zig build benchmark
+    const benchmark_step = b.step("benchmark", "Run performance benchmarks (manual)");
+    benchmark_step.dependOn(b.getInstallStep());
+
+    const bun_bench = b.addSystemCommand(&.{ "bun", "test", "benchmark.test.ts" });
+    bun_bench.setCwd(b.path("tests"));
+    bun_bench.step.dependOn(b.getInstallStep());
+    benchmark_step.dependOn(&bun_bench.step);
+
+    // Full test: unit + functional integration
+    const full_test_step = b.step("test-all", "Run unit and functional integration tests");
+    full_test_step.dependOn(&run_unit_tests.step);
+    full_test_step.dependOn(&bun_test.step);
+
     // Cross-compilation targets for deployment
     const CrossTarget = struct {
         name: []const u8,
@@ -69,7 +94,7 @@ pub fn build(b: *std.Build) void {
 
         const cross_xev = b.dependency("libxev", .{
             .target = resolved_target,
-            .optimize = .ReleaseSafe,
+            .optimize = .ReleaseFast,
         });
 
         const cross_exe = b.addExecutable(.{
@@ -77,7 +102,7 @@ pub fn build(b: *std.Build) void {
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/main.zig"),
                 .target = resolved_target,
-                .optimize = .ReleaseSafe,
+                .optimize = .ReleaseFast,
                 .strip = true,
                 .link_libc = true,
             }),

@@ -399,3 +399,71 @@ describe("rtach command execution", () => {
     await killAndWait(master, 9);
   });
 });
+
+describe("rtach stress tests", () => {
+  let socketPath: string;
+
+  beforeEach(() => {
+    socketPath = uniqueSocketPath();
+  });
+
+  afterEach(() => {
+    cleanupSocket(socketPath);
+  });
+
+  test("rapid client connect/disconnect (bounds safety)", async () => {
+    // This test exercises the client array management code
+    // to catch any out-of-bounds issues with swapRemove
+    const master = await startDetachedMaster(socketPath);
+
+    // Rapidly connect and disconnect 20 clients
+    for (let i = 0; i < 20; i++) {
+      const client = await connectClient(socketPath);
+      // Small delay to ensure connection is established
+      await Bun.sleep(10);
+      client.kill(9);
+      await client.exited;
+    }
+
+    // Master should still be healthy - verify by connecting a final client
+    const finalClient = await connectAndWait(socketPath);
+    await writeToProc(finalClient, "final-test");
+    const output = await waitForOutput(finalClient, "final-test");
+    expect(output).toContain("final-test");
+
+    finalClient.kill(9);
+    await finalClient.exited;
+    await killAndWait(master, 9);
+  });
+
+  test("simultaneous connect/disconnect (race conditions)", async () => {
+    const master = await startDetachedMaster(socketPath);
+
+    // Connect multiple clients simultaneously
+    const clients = await Promise.all([
+      connectClient(socketPath),
+      connectClient(socketPath),
+      connectClient(socketPath),
+      connectClient(socketPath),
+      connectClient(socketPath),
+    ]);
+
+    await Bun.sleep(50);
+
+    // Kill them all at once
+    await Promise.all(clients.map(async (c) => {
+      c.kill(9);
+      await c.exited;
+    }));
+
+    // Master should survive
+    const verifyClient = await connectAndWait(socketPath);
+    await writeToProc(verifyClient, "verify");
+    const output = await waitForOutput(verifyClient, "verify");
+    expect(output).toContain("verify");
+
+    verifyClient.kill(9);
+    await verifyClient.exited;
+    await killAndWait(master, 9);
+  });
+});

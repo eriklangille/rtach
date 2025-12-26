@@ -18,7 +18,10 @@ pub const Protocol = @import("protocol.zig");
 /// 1.6.1 - Fix ResponseHeader padding (use packed struct for exact 5-byte header)
 /// 1.7.0 - Add client_id to attach packet to prevent duplicate connections from same device
 /// 1.8.0 - Skip scrollback on attach when in alternate screen mode (fixes TUI app corruption)
-pub const version = "1.8.0";
+/// 1.8.1 - Remove OSC 133 from shell integration (caused resize bugs in Ghostty)
+/// 1.8.2 - Track and restore cursor visibility state on reconnect (fixes dual cursor in Claude Code)
+/// 1.8.3 - Performance: ReleaseFast, writev for scrollback, debug logs in hot paths
+pub const version = "1.8.3";
 
 pub const std_options: std.Options = .{
     .log_level = .info,

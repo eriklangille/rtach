@@ -13,66 +13,28 @@ pub const ShellType = enum {
 /// Embedded shell integration scripts
 pub const bash_integration =
     \\# Clauntty Shell Integration for Bash (embedded in rtach)
-    \\# Emits OSC 133 sequences for terminal prompt detection
+    \\# Minimal - just sets env var to indicate integration is active
     \\[[ "$-" != *i* ]] && return
     \\[[ -n "$CLAUNTTY_SHELL_INTEGRATION" ]] && return
     \\export CLAUNTTY_SHELL_INTEGRATION=1
-    \\_clauntty_executing=""
-    \\__clauntty_precmd() {
-    \\    local ret=$?
-    \\    if [[ -n "$_clauntty_executing" ]]; then
-    \\        builtin printf '\e]133;D;%s\a' "$ret"
-    \\    fi
-    \\    builtin printf '\e]133;A\a'
-    \\    _clauntty_executing=""
-    \\}
-    \\__clauntty_preexec() {
-    \\    builtin printf '\e]133;C\a'
-    \\    _clauntty_executing=1
-    \\}
-    \\trap '__clauntty_preexec' DEBUG
-    \\PROMPT_COMMAND="__clauntty_precmd${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
     \\
 ;
 
 pub const zsh_integration =
     \\# Clauntty Shell Integration for Zsh (embedded in rtach)
+    \\# Minimal - just sets env var to indicate integration is active
     \\[[ -o interactive ]] || return
     \\[[ -n "$CLAUNTTY_SHELL_INTEGRATION" ]] && return
     \\export CLAUNTTY_SHELL_INTEGRATION=1
-    \\typeset -g _clauntty_executing=""
-    \\__clauntty_precmd() {
-    \\    local ret=$?
-    \\    [[ -n "$_clauntty_executing" ]] && print -n "\e]133;D;${ret}\a"
-    \\    print -n "\e]133;A\a"
-    \\    _clauntty_executing=""
-    \\}
-    \\__clauntty_preexec() {
-    \\    print -n "\e]133;C\a"
-    \\    _clauntty_executing=1
-    \\}
-    \\autoload -Uz add-zsh-hook
-    \\add-zsh-hook precmd __clauntty_precmd
-    \\add-zsh-hook preexec __clauntty_preexec
     \\
 ;
 
 pub const fish_integration =
     \\# Clauntty Shell Integration for Fish (embedded in rtach)
+    \\# Minimal - just sets env var to indicate integration is active
     \\status is-interactive; or exit
     \\set -q CLAUNTTY_SHELL_INTEGRATION; and exit
     \\set -gx CLAUNTTY_SHELL_INTEGRATION 1
-    \\set -g _clauntty_executing ""
-    \\function __clauntty_prompt --on-event fish_prompt
-    \\    set -l s $status
-    \\    test -n "$_clauntty_executing"; and printf '\e]133;D;%s\a' $s
-    \\    printf '\e]133;A\a'
-    \\    set -g _clauntty_executing ""
-    \\end
-    \\function __clauntty_preexec --on-event fish_preexec
-    \\    printf '\e]133;C\a'
-    \\    set -g _clauntty_executing 1
-    \\end
     \\
 ;
 

@@ -1,16 +1,44 @@
 const std = @import("std");
 const builtin = @import("builtin");
-// Use Dynamic API on Linux for runtime io_uring -> epoll fallback
+// Use platform-appropriate xev backend:
+// - Linux: Dynamic (runtime io_uring -> epoll fallback)
+// - macOS: Kqueue
+// - Other: Dynamic fallback
 const xev = if (builtin.os.tag == .linux)
     @import("xev").Dynamic
+else if (builtin.os.tag == .macos)
+    @import("xev").Kqueue
 else
-    @import("xev");
+    @import("xev").Dynamic;
 const posix = std.posix;
 const Protocol = @import("protocol.zig");
 const RingBuffer = @import("ringbuffer.zig").DynamicRingBuffer;
 const ShellIntegration = @import("shell_integration.zig");
 
 const log = std.log.scoped(.master);
+
+/// Write multiple slices in a single syscall using writev
+/// More efficient than multiple write() calls for ring buffer slices
+fn writeSlices(fd: posix.fd_t, first: []const u8, second: []const u8) void {
+    if (first.len == 0 and second.len == 0) return;
+
+    // Build iovec array, skipping empty slices
+    var iov: [2]posix.iovec_const = undefined;
+    var iov_len: usize = 0;
+
+    if (first.len > 0) {
+        iov[iov_len] = .{ .base = first.ptr, .len = first.len };
+        iov_len += 1;
+    }
+    if (second.len > 0) {
+        iov[iov_len] = .{ .base = second.ptr, .len = second.len };
+        iov_len += 1;
+    }
+
+    if (iov_len > 0) {
+        _ = posix.writev(fd, iov[0..iov_len]) catch {};
+    }
+}
 
 // Terminal ioctl constants
 fn getTIOCSWINSZ() c_int {
@@ -82,6 +110,10 @@ pub const Master = struct {
     // When true, the terminal is in alternate screen mode (vim, less, Claude Code, etc.)
     // We skip sending scrollback on attach when in this mode since the TUI will redraw itself
     in_alternate_screen: bool = false,
+
+    // Cursor visibility state (DECTCEM mode)
+    // When false, cursor should be hidden (TUI apps like Claude Code hide the cursor)
+    cursor_visible: bool = true,
 
     pub fn init(allocator: std.mem.Allocator, options: MasterOptions) !*Master {
         const self = try allocator.create(Master);
@@ -328,10 +360,10 @@ pub const Master = struct {
 
         const data = self.pty_read_buf[0..n];
 
-        // Track alternate screen state by scanning for escape sequences
-        // ESC[?1049h = enter alternate screen, ESC[?1049l = exit
-        // ESC[?47h / ESC[?47l = older variant
-        self.updateAlternateScreenState(data);
+        // Track terminal mode state by scanning for escape sequences
+        // Alternate screen: ESC[?1049h/l, ESC[?47h/l
+        // Cursor visibility: ESC[?25h/l
+        self.updateTerminalModeState(data);
 
         // Store in scrollback
         self.scrollback.write(data);
@@ -387,8 +419,12 @@ pub const Master = struct {
             return .disarm;
         };
 
-        // Get the fd from the TCP wrapper
-        const client_fd = client_tcp.fd();
+        // Get the fd from the TCP wrapper (API differs between backends)
+        // TCPStream (kqueue) has fd as a field, TCPDynamic (linux) has fd() method
+        const client_fd = if (@hasField(@TypeOf(client_tcp), "fd"))
+            client_tcp.fd
+        else
+            client_tcp.fd();
 
         // Create client state
         const client = self.allocator.create(ClientConn) catch {
@@ -556,6 +592,11 @@ pub const Master = struct {
                 // Sending old scrollback would corrupt the display
                 if (self.in_alternate_screen) {
                     log.info("skipping scrollback (alternate screen active)", .{});
+                    // Restore cursor visibility state - TUI apps typically hide the cursor
+                    if (!self.cursor_visible) {
+                        _ = posix.write(self.clients.items[idx].fd, "\x1b[?25l") catch {};
+                        log.debug("restored hidden cursor state", .{});
+                    }
                 } else {
                     // Only send last 16KB of scrollback on attach (a few screens worth)
                     // This prevents UI freezes when reconnecting to sessions with large history
@@ -565,28 +606,26 @@ pub const Master = struct {
                     const total_len = slices.first.len + slices.second.len;
 
                     if (total_len <= max_initial_scrollback) {
-                        // Small buffer - send all
-                        if (slices.first.len > 0) {
-                            _ = posix.write(self.clients.items[idx].fd, slices.first) catch {};
-                        }
-                        if (slices.second.len > 0) {
-                            _ = posix.write(self.clients.items[idx].fd, slices.second) catch {};
-                        }
+                        // Small buffer - send all in one syscall
+                        writeSlices(self.clients.items[idx].fd, slices.first, slices.second);
                     } else {
                         // Large buffer - only send the tail
                         const skip = total_len - max_initial_scrollback;
                         if (skip < slices.first.len) {
                             // Skip part of first slice, send rest of first + all of second
-                            _ = posix.write(self.clients.items[idx].fd, slices.first[skip..]) catch {};
-                            if (slices.second.len > 0) {
-                                _ = posix.write(self.clients.items[idx].fd, slices.second) catch {};
-                            }
+                            writeSlices(self.clients.items[idx].fd, slices.first[skip..], slices.second);
                         } else {
                             // Skip all of first slice, skip part of second
                             const skip_second = skip - slices.first.len;
                             _ = posix.write(self.clients.items[idx].fd, slices.second[skip_second..]) catch {};
                         }
-                        log.info("sent last {}KB of {}KB scrollback", .{ max_initial_scrollback / 1024, total_len / 1024 });
+                        log.debug("sent last {}KB of {}KB scrollback", .{ max_initial_scrollback / 1024, total_len / 1024 });
+                    }
+
+                    // Restore cursor visibility state after scrollback
+                    if (!self.cursor_visible) {
+                        _ = posix.write(self.clients.items[idx].fd, "\x1b[?25l") catch {};
+                        log.debug("restored hidden cursor state", .{});
                     }
                 }
             },
@@ -615,12 +654,7 @@ pub const Master = struct {
             },
             .redraw => {
                 const slices = self.scrollback.slices();
-                if (slices.first.len > 0) {
-                    _ = posix.write(self.clients.items[idx].fd, slices.first) catch {};
-                }
-                if (slices.second.len > 0) {
-                    _ = posix.write(self.clients.items[idx].fd, slices.second) catch {};
-                }
+                writeSlices(self.clients.items[idx].fd, slices.first, slices.second);
             },
             .request_scrollback => {
                 // Client requests old scrollback (everything before the 16KB initial send)
@@ -652,23 +686,22 @@ pub const Master = struct {
                         _ = posix.write(self.clients.items[idx].fd, slices.first[0..old_len]) catch {};
                     } else {
                         // Old scrollback spans first slice + part of second
-                        if (slices.first.len > 0) {
-                            _ = posix.write(self.clients.items[idx].fd, slices.first) catch {};
-                        }
                         const second_len = old_len - slices.first.len;
-                        _ = posix.write(self.clients.items[idx].fd, slices.second[0..second_len]) catch {};
+                        writeSlices(self.clients.items[idx].fd, slices.first, slices.second[0..second_len]);
                     }
-                    log.info("scrollback request: sent {}KB of old scrollback", .{old_len / 1024});
+                    log.debug("scrollback request: sent {}KB of old scrollback", .{old_len / 1024});
                 }
             },
         }
     }
 
-    /// Scan data for alternate screen escape sequences and update state
-    /// Looks for: ESC[?1049h (enter), ESC[?1049l (exit), ESC[?47h/l (older variant)
-    fn updateAlternateScreenState(self: *Master, data: []const u8) void {
+    /// Scan data for terminal mode escape sequences and update state
+    /// Tracks:
+    /// - Alternate screen: ESC[?1049h/l, ESC[?47h/l
+    /// - Cursor visibility (DECTCEM): ESC[?25h/l
+    fn updateTerminalModeState(self: *Master, data: []const u8) void {
         // Look for escape sequences in the data
-        // We need to find ESC [ ? followed by 1049 or 47, then h or l
+        // We need to find ESC [ ? followed by a number, then h or l
         var i: usize = 0;
         while (i < data.len) {
             // Look for ESC (0x1B)
@@ -686,13 +719,22 @@ pub const Master = struct {
                         }
                         // Check for h (set) or l (reset) and matching number
                         if (j < data.len) {
-                            if ((num == 1049 or num == 47)) {
-                                if (data[j] == 'h') {
-                                    self.in_alternate_screen = true;
-                                    log.info("entered alternate screen (mode {})", .{num});
-                                } else if (data[j] == 'l') {
-                                    self.in_alternate_screen = false;
-                                    log.info("exited alternate screen (mode {})", .{num});
+                            const is_set = data[j] == 'h';
+                            const is_reset = data[j] == 'l';
+
+                            if (is_set or is_reset) {
+                                switch (num) {
+                                    // Alternate screen modes
+                                    1049, 47 => {
+                                        self.in_alternate_screen = is_set;
+                                        log.debug("{s} alternate screen (mode {})", .{ if (is_set) "entered" else "exited", num });
+                                    },
+                                    // Cursor visibility (DECTCEM)
+                                    25 => {
+                                        self.cursor_visible = is_set;
+                                        log.debug("cursor {s} (DECTCEM)", .{if (is_set) "shown" else "hidden"});
+                                    },
+                                    else => {},
                                 }
                             }
                         }

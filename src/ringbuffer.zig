@@ -261,3 +261,103 @@ test "ring buffer replay" {
     try buf.replay(output.writer(testing.allocator));
     try testing.expectEqualStrings("test data!", output.items);
 }
+
+// Edge case tests for OOB safety
+test "ring buffer empty" {
+    const buf = RingBuffer(10){};
+    try testing.expectEqual(@as(usize, 0), buf.size());
+    const s = buf.slices();
+    try testing.expectEqual(@as(usize, 0), s.first.len);
+    try testing.expectEqual(@as(usize, 0), s.second.len);
+}
+
+test "ring buffer exact capacity" {
+    var buf = RingBuffer(10){};
+    buf.write("1234567890"); // Exactly 10 bytes
+    try testing.expectEqual(@as(usize, 10), buf.size());
+
+    const s = buf.slices();
+    var result: [10]u8 = undefined;
+    @memcpy(result[0..s.first.len], s.first);
+    @memcpy(result[s.first.len..][0..s.second.len], s.second);
+    try testing.expectEqualStrings("1234567890", &result);
+}
+
+test "ring buffer single byte writes" {
+    var buf = RingBuffer(5){};
+    buf.write("a");
+    buf.write("b");
+    buf.write("c");
+    buf.write("d");
+    buf.write("e");
+    buf.write("f"); // Should wrap, push out 'a'
+
+    try testing.expectEqual(@as(usize, 5), buf.size());
+
+    const s = buf.slices();
+    var result: [5]u8 = undefined;
+    @memcpy(result[0..s.first.len], s.first);
+    @memcpy(result[s.first.len..][0..s.second.len], s.second);
+    try testing.expectEqualStrings("bcdef", &result);
+}
+
+test "ring buffer massive overflow" {
+    var buf = RingBuffer(5){};
+    // Write way more than capacity
+    buf.write("this is a very long string that exceeds capacity by a lot");
+
+    try testing.expectEqual(@as(usize, 5), buf.size());
+
+    const s = buf.slices();
+    // Should contain last 5 bytes: "a lot"
+    var result: [5]u8 = undefined;
+    @memcpy(result[0..s.first.len], s.first);
+    @memcpy(result[s.first.len..][0..s.second.len], s.second);
+    try testing.expectEqualStrings("a lot", &result);
+}
+
+test "ring buffer clear and reuse" {
+    var buf = RingBuffer(10){};
+    buf.write("hello");
+    buf.clear();
+    try testing.expectEqual(@as(usize, 0), buf.size());
+
+    buf.write("world");
+    try testing.expectEqual(@as(usize, 5), buf.size());
+    const s = buf.slices();
+    try testing.expectEqualStrings("world", s.first);
+}
+
+test "dynamic ring buffer edge cases" {
+    var buf = try DynamicRingBuffer.init(testing.allocator, 8);
+    defer buf.deinit();
+
+    // Empty state
+    try testing.expectEqual(@as(usize, 0), buf.size());
+
+    // Fill exactly
+    buf.write("12345678");
+    try testing.expectEqual(@as(usize, 8), buf.size());
+
+    // Overflow by 1
+    buf.write("9");
+    try testing.expectEqual(@as(usize, 8), buf.size());
+
+    const s = buf.slices();
+    var result: [8]u8 = undefined;
+    @memcpy(result[0..s.first.len], s.first);
+    @memcpy(result[s.first.len..][0..s.second.len], s.second);
+    try testing.expectEqualStrings("23456789", &result);
+}
+
+test "dynamic ring buffer zero-length write" {
+    var buf = try DynamicRingBuffer.init(testing.allocator, 8);
+    defer buf.deinit();
+
+    buf.write("");
+    try testing.expectEqual(@as(usize, 0), buf.size());
+
+    buf.write("test");
+    buf.write("");
+    try testing.expectEqual(@as(usize, 4), buf.size());
+}

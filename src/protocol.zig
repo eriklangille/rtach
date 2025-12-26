@@ -245,3 +245,90 @@ test "packet reader" {
     try testing.expect(result.packet != null);
     try testing.expectEqualStrings("test", result.packet.?.getPayload());
 }
+
+// Edge case tests for OOB safety
+test "packet with max payload size" {
+    var data: [MAX_PAYLOAD_SIZE]u8 = undefined;
+    for (&data, 0..) |*b, i| b.* = @intCast(i % 256);
+
+    const pkt = Packet.init(.push, &data);
+    try testing.expectEqual(@as(u8, MAX_PAYLOAD_SIZE), pkt.header.len);
+    try testing.expectEqual(@as(usize, MAX_PAYLOAD_SIZE), pkt.getPayload().len);
+}
+
+test "packet with data larger than max truncates" {
+    var data: [MAX_PAYLOAD_SIZE + 100]u8 = undefined;
+    for (&data, 0..) |*b, i| b.* = @intCast(i % 256);
+
+    const pkt = Packet.init(.push, &data);
+    // Should truncate to MAX_PAYLOAD_SIZE
+    try testing.expectEqual(@as(u8, MAX_PAYLOAD_SIZE), pkt.header.len);
+}
+
+test "packet reader partial header" {
+    var reader = PacketReader{};
+
+    // Feed only 1 byte of header (need 2)
+    const partial: [1]u8 = .{@intFromEnum(MessageType.push)};
+    const result = reader.feed(&partial);
+    try testing.expectEqual(@as(usize, 0), result.consumed);
+    try testing.expect(result.packet == null);
+}
+
+test "packet reader partial payload" {
+    var reader = PacketReader{};
+
+    // Create packet with 10 byte payload
+    const pkt = Packet.init(.push, "0123456789");
+    const full_data = pkt.serialize();
+
+    // Feed header + partial payload (only 5 of 10 bytes)
+    const partial = full_data[0..7]; // 2 header + 5 payload
+    const result1 = reader.feed(partial);
+    try testing.expectEqual(@as(usize, 7), result1.consumed);
+    try testing.expect(result1.packet == null);
+
+    // Feed remaining
+    const result2 = reader.feed(full_data[7..]);
+    try testing.expectEqual(@as(usize, 5), result2.consumed);
+    try testing.expect(result2.packet != null);
+    try testing.expectEqualStrings("0123456789", result2.packet.?.getPayload());
+}
+
+test "packet reader multiple packets in one feed" {
+    var reader = PacketReader{};
+
+    const pkt1 = Packet.init(.push, "abc");
+    const pkt2 = Packet.init(.push, "xyz");
+
+    // Concatenate two packets
+    var combined: [20]u8 = undefined;
+    const data1 = pkt1.serialize();
+    const data2 = pkt2.serialize();
+    @memcpy(combined[0..data1.len], data1);
+    @memcpy(combined[data1.len..][0..data2.len], data2);
+
+    // First feed should get first packet
+    const result1 = reader.feed(combined[0 .. data1.len + data2.len]);
+    try testing.expect(result1.packet != null);
+    try testing.expectEqualStrings("abc", result1.packet.?.getPayload());
+
+    // Feed remaining should get second packet
+    const result2 = reader.feed(combined[result1.consumed .. data1.len + data2.len]);
+    try testing.expect(result2.packet != null);
+    try testing.expectEqualStrings("xyz", result2.packet.?.getPayload());
+}
+
+test "getClientId with short payload" {
+    var pkt = Packet{
+        .header = .{ .type = .attach, .len = 5 }, // Too short for client ID
+    };
+    try testing.expect(pkt.getClientId() == null);
+}
+
+test "getWinsize with short payload" {
+    var pkt = Packet{
+        .header = .{ .type = .winch, .len = 2 }, // Too short for Winsize
+    };
+    try testing.expect(pkt.getWinsize() == null);
+}
