@@ -1,9 +1,10 @@
-import { describe, test, expect, beforeEach, afterEach } from "bun:test";
+import { describe, test, expect, beforeEach, afterEach, afterAll } from "bun:test";
 import { spawn } from "bun";
 import {
   RTACH_BIN,
   uniqueSocketPath,
   cleanupSocket,
+  cleanupAll,
   socketExists,
   waitForSocket,
   startDetachedMaster,
@@ -13,6 +14,7 @@ import {
   writeToProc,
   killAndWait,
   connectRawSocket,
+  connectRawSocketWithUpgrade,
   sendAttachPacket,
   sendScrollbackPageRequest,
   waitForScrollbackPageResponse,
@@ -20,6 +22,7 @@ import {
 } from "./helpers";
 
 describe("rtach CLI", () => {
+  afterEach(cleanupAll);
   test("shows help with --help", async () => {
     const proc = spawn([RTACH_BIN, "--help"], {
       stdout: "pipe",
@@ -34,12 +37,12 @@ describe("rtach CLI", () => {
 
     // Help may go to stdout or stderr depending on implementation
     const output = stdout + stderr;
-    expect(output).toContain("rtach - terminal session manager");
+    expect(output).toContain("rtach - persistent terminal sessions with scrollback");
     expect(output).toContain("Usage:");
-    expect(output).toContain("-A <socket>");
-    expect(output).toContain("-a <socket>");
-    expect(output).toContain("-c <socket>");
-    expect(output).toContain("-n <socket>");
+    expect(output).toContain("-A");
+    expect(output).toContain("-a");
+    expect(output).toContain("-c");
+    expect(output).toContain("-n");
   });
 
   test("shows help with -h", async () => {
@@ -55,7 +58,7 @@ describe("rtach CLI", () => {
     await proc.exited;
 
     const output = stdout + stderr;
-    expect(output).toContain("rtach - terminal session manager");
+    expect(output).toContain("rtach - persistent terminal sessions with scrollback");
   });
 
   test("fails without socket path", async () => {
@@ -64,11 +67,16 @@ describe("rtach CLI", () => {
       stderr: "pipe",
     });
 
-    const stderr = await new Response(proc.stderr).text();
+    const [stdout, stderr] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+    ]);
     const exitCode = await proc.exited;
 
     expect(exitCode).toBe(1);
-    expect(stderr).toContain("socket path required");
+    // Error message may go to stdout or stderr depending on implementation
+    const output = stdout + stderr;
+    expect(output).toContain("missing socket path");
   });
 });
 
@@ -79,9 +87,7 @@ describe("rtach session creation", () => {
     socketPath = uniqueSocketPath();
   });
 
-  afterEach(() => {
-    cleanupSocket(socketPath);
-  });
+  afterEach(cleanupAll);
 
   test("creates socket with -n (detached)", async () => {
     const proc = spawn([RTACH_BIN, "-n", socketPath, "/bin/cat"], {
@@ -138,10 +144,7 @@ describe("rtach attach/detach", () => {
     master = await startDetachedMaster(socketPath, "/bin/cat");
   });
 
-  afterEach(async () => {
-    await killAndWait(master, 9);
-    cleanupSocket(socketPath);
-  });
+  afterEach(cleanupAll);
 
   test("client can attach with -a", async () => {
     // connectAndWait verifies connection by echo test
@@ -195,10 +198,7 @@ describe("rtach scrollback", () => {
     master = await startDetachedMaster(socketPath, "/bin/cat", 4096);
   });
 
-  afterEach(async () => {
-    await killAndWait(master, 9);
-    cleanupSocket(socketPath);
-  });
+  afterEach(cleanupAll);
 
   test("new client receives scrollback on attach", async () => {
     // Client 1 sends data with unique marker
@@ -263,10 +263,7 @@ describe("rtach window size", () => {
     master = await startDetachedMaster(socketPath, "/bin/sh");
   });
 
-  afterEach(async () => {
-    await killAndWait(master, 9);
-    cleanupSocket(socketPath);
-  });
+  afterEach(cleanupAll);
 
   test("client can query terminal size via stty", async () => {
     const client = connectClient(socketPath, { noDetachChar: true });
@@ -290,9 +287,7 @@ describe("rtach session persistence", () => {
     socketPath = uniqueSocketPath();
   });
 
-  afterEach(() => {
-    cleanupSocket(socketPath);
-  });
+  afterEach(cleanupAll);
 
   test("session survives client disconnect", async () => {
     const master = await startDetachedMaster(socketPath, "/bin/sh");
@@ -367,9 +362,7 @@ describe("rtach command execution", () => {
     socketPath = uniqueSocketPath();
   });
 
-  afterEach(() => {
-    cleanupSocket(socketPath);
-  });
+  afterEach(cleanupAll);
 
   test("shell receives input and produces output", async () => {
     const master = await startDetachedMaster(socketPath, "/bin/sh");
@@ -412,9 +405,7 @@ describe("rtach stress tests", () => {
     socketPath = uniqueSocketPath();
   });
 
-  afterEach(() => {
-    cleanupSocket(socketPath);
-  });
+  afterEach(cleanupAll);
 
   test("rapid client connect/disconnect (bounds safety)", async () => {
     // This test exercises the client array management code
@@ -495,7 +486,7 @@ describe("rtach paginated scrollback", () => {
 
   test("request_scrollback_page returns metadata and data", async () => {
     // Connect via raw socket and write data directly
-    rawConn = await connectRawSocket(socketPath);
+    rawConn = await connectRawSocketWithUpgrade(socketPath);
     sendAttachPacket(rawConn, "paginated-test");
 
     // Wait for connection to establish and initial scrollback
@@ -528,7 +519,7 @@ describe("rtach paginated scrollback", () => {
   });
 
   test("paginated scrollback returns correct offsets", async () => {
-    rawConn = await connectRawSocket(socketPath);
+    rawConn = await connectRawSocketWithUpgrade(socketPath);
     sendAttachPacket(rawConn, "offset-test");
     await Bun.sleep(100);
 
@@ -571,7 +562,7 @@ describe("rtach paginated scrollback", () => {
   });
 
   test("paginated scrollback handles offset beyond end", async () => {
-    rawConn = await connectRawSocket(socketPath);
+    rawConn = await connectRawSocketWithUpgrade(socketPath);
     sendAttachPacket(rawConn, "beyond-end-test");
     await Bun.sleep(100);
 
@@ -597,7 +588,7 @@ describe("rtach paginated scrollback", () => {
   });
 
   test("paginated scrollback accumulates full buffer", async () => {
-    rawConn = await connectRawSocket(socketPath);
+    rawConn = await connectRawSocketWithUpgrade(socketPath);
     sendAttachPacket(rawConn, "large-buffer-test");
     await Bun.sleep(100);
 
@@ -642,7 +633,7 @@ describe("rtach paginated scrollback", () => {
   });
 
   test("paginated scrollback data contains written content", async () => {
-    rawConn = await connectRawSocket(socketPath);
+    rawConn = await connectRawSocketWithUpgrade(socketPath);
     sendAttachPacket(rawConn, "content-test");
     await Bun.sleep(100);
 

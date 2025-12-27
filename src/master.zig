@@ -40,6 +40,52 @@ fn writeSlices(fd: posix.fd_t, first: []const u8, second: []const u8) void {
     }
 }
 
+/// Write framed data to client: [ResponseHeader][data]
+/// Uses writev for atomic header+data write in single syscall
+fn writeFramed(fd: posix.fd_t, response_type: Protocol.ResponseType, data: []const u8) void {
+    if (data.len == 0) return;
+
+    const header = Protocol.ResponseHeader{
+        .type = response_type,
+        .len = @intCast(data.len),
+    };
+
+    var iov = [2]posix.iovec_const{
+        .{ .base = header.toBytes().ptr, .len = Protocol.ResponseHeader.WIRE_SIZE },
+        .{ .base = data.ptr, .len = data.len },
+    };
+
+    _ = posix.writev(fd, &iov) catch {};
+}
+
+/// Write framed data using ring buffer slices: [ResponseHeader][first][second]
+/// Uses writev for atomic write in single syscall
+fn writeFramedSlices(fd: posix.fd_t, response_type: Protocol.ResponseType, first: []const u8, second: []const u8) void {
+    const total_len = first.len + second.len;
+    if (total_len == 0) return;
+
+    const header = Protocol.ResponseHeader{
+        .type = response_type,
+        .len = @intCast(total_len),
+    };
+
+    var iov: [3]posix.iovec_const = undefined;
+    var iov_len: usize = 1;
+
+    iov[0] = .{ .base = header.toBytes().ptr, .len = Protocol.ResponseHeader.WIRE_SIZE };
+
+    if (first.len > 0) {
+        iov[iov_len] = .{ .base = first.ptr, .len = first.len };
+        iov_len += 1;
+    }
+    if (second.len > 0) {
+        iov[iov_len] = .{ .base = second.ptr, .len = second.len };
+        iov_len += 1;
+    }
+
+    _ = posix.writev(fd, iov[0..iov_len]) catch {};
+}
+
 // Terminal ioctl constants
 fn getTIOCSWINSZ() c_int {
     const val: u32 = switch (@import("builtin").os.tag) {
@@ -69,6 +115,7 @@ const ClientConn = struct {
     stream: xev.Stream,
     reader: Protocol.PacketReader = .{},
     attached: bool = false,
+    framed_mode: bool = false, // After upgrade, client input is parsed as packets
     client_id: ?[Protocol.CLIENT_ID_SIZE]u8 = null, // Unique client identifier
     completion: xev.Completion = .{},
     read_buf: [512]u8 = undefined,
@@ -419,10 +466,10 @@ pub const Master = struct {
         // Store in scrollback
         self.scrollback.write(data);
 
-        // Forward to all attached clients
+        // Forward to all attached clients (framed)
         for (self.clients.items) |client| {
             if (client.attached) {
-                _ = posix.write(client.fd, data) catch {};
+                writeFramed(client.fd, .terminal_data, data);
             }
         }
 
@@ -505,19 +552,29 @@ pub const Master = struct {
     fn sendCommandToClients(self: *Master, cmd: []const u8) void {
         log.info("sending command to clients: {s}", .{cmd});
 
-        // Build response header + command data
-        const header = Protocol.ResponseHeader{
-            .type = .command,
-            .len = @intCast(cmd.len),
-        };
-
-        // Send to all attached clients
+        // Send to all attached clients (framed)
         for (self.clients.items) |client| {
             if (client.attached) {
-                _ = posix.write(client.fd, header.toBytes()) catch continue;
-                _ = posix.write(client.fd, cmd) catch continue;
+                writeFramed(client.fd, .command, cmd);
             }
         }
+    }
+
+    /// Send handshake to client after attach
+    fn sendHandshake(client_fd: posix.fd_t) void {
+        const handshake = Protocol.Handshake{};
+        const header = Protocol.ResponseHeader{
+            .type = .handshake,
+            .len = Protocol.Handshake.WIRE_SIZE,
+        };
+
+        var iov = [2]posix.iovec_const{
+            .{ .base = header.toBytes().ptr, .len = Protocol.ResponseHeader.WIRE_SIZE },
+            .{ .base = handshake.toBytes().ptr, .len = Protocol.Handshake.WIRE_SIZE },
+        };
+
+        _ = posix.writev(client_fd, &iov) catch {};
+        log.info("sent handshake to client fd={}", .{client_fd});
     }
 
     fn acceptCallback(
@@ -595,6 +652,10 @@ pub const Master = struct {
 
         log.info("client connected fd={}", .{client_fd});
 
+        // Send handshake immediately so client knows rtach is running
+        // This allows client to detect rtach and send upgrade packet
+        sendHandshake(client_fd);
+
         // Set up read for this client using Stream abstraction
         client.stream.read(
             loop,
@@ -660,20 +721,58 @@ pub const Master = struct {
             return .disarm;
         }
 
-        // Process packets
-        var offset: usize = 0;
-        while (offset < n) {
-            const feed_result = client.reader.feed(client.read_buf[offset..n]);
-            offset += feed_result.consumed;
+        // Handle based on framed_mode
+        if (client.framed_mode) {
+            // Framed mode: parse input as packets
+            var offset: usize = 0;
+            while (offset < n) {
+                const feed_result = client.reader.feed(client.read_buf[offset..n]);
+                offset += feed_result.consumed;
 
-            if (feed_result.packet) |pkt| {
-                self.handleClientPacket(idx, pkt) catch {
-                    self.removeClient(idx);
-                    return .disarm;
+                if (feed_result.packet) |pkt| {
+                    self.handleClientPacket(idx, pkt) catch {
+                        self.removeClient(idx);
+                        return .disarm;
+                    };
+                }
+
+                if (feed_result.consumed == 0) break;
+            }
+        } else {
+            // Raw mode: forward input to PTY, but watch for upgrade packet
+            // Upgrade packet is [type=7, len=0] = 2 bytes
+            var data = client.read_buf[0..n];
+
+            // Check if data starts with upgrade packet [7, 0]
+            if (data.len >= 2 and data[0] == @intFromEnum(Protocol.MessageType.upgrade) and data[1] == 0) {
+                // Upgrade detected! Switch to framed mode
+                client.framed_mode = true;
+                log.info("client {} upgraded to framed mode (detected in raw stream)", .{idx});
+
+                // Process remaining data (if any) as framed packets
+                if (data.len > 2) {
+                    var offset: usize = 0;
+                    const remaining = data[2..];
+                    while (offset < remaining.len) {
+                        const feed_result = client.reader.feed(remaining[offset..]);
+                        offset += feed_result.consumed;
+
+                        if (feed_result.packet) |pkt| {
+                            self.handleClientPacket(idx, pkt) catch {
+                                self.removeClient(idx);
+                                return .disarm;
+                            };
+                        }
+
+                        if (feed_result.consumed == 0) break;
+                    }
+                }
+            } else {
+                // Not upgrade - forward to PTY as raw input
+                _ = posix.write(self.pty_master, data) catch |err| {
+                    log.warn("failed to write to PTY: {}", .{err});
                 };
             }
-
-            if (feed_result.consumed == 0) break;
         }
 
         // Re-arm client read
@@ -720,14 +819,22 @@ pub const Master = struct {
                 log.info("client {} attached (client_id: {}, alt_screen: {})", .{ idx, if (client_id != null) @as(u64, @bitCast(client_id.?[0..8].*)) else 0, self.in_alternate_screen });
                 self.clients.items[idx].attached = true;
 
+                // Handshake already sent on connect, now send scrollback
+
                 // Skip sending scrollback if in alternate screen mode (vim, less, Claude Code, etc.)
                 // The TUI app will redraw itself when it receives SIGWINCH
                 // Sending old scrollback would corrupt the display
                 if (self.in_alternate_screen) {
                     log.info("skipping scrollback (alternate screen active)", .{});
+                    // Switch client to alternate screen mode so it knows to interpret
+                    // the following TUI content correctly. Without this, the client's
+                    // terminal emulator thinks it's on the normal screen and scrolling
+                    // behaves incorrectly (e.g., shows "@" artifacts in Claude Code).
+                    writeFramed(self.clients.items[idx].fd, .terminal_data, "\x1b[?1049h");
+                    log.debug("sent alternate screen switch", .{});
                     // Restore cursor visibility state - TUI apps typically hide the cursor
                     if (!self.cursor_visible) {
-                        _ = posix.write(self.clients.items[idx].fd, "\x1b[?25l") catch {};
+                        writeFramed(self.clients.items[idx].fd, .terminal_data, "\x1b[?25l");
                         log.debug("restored hidden cursor state", .{});
                     }
                 } else {
@@ -739,25 +846,25 @@ pub const Master = struct {
                     const total_len = slices.first.len + slices.second.len;
 
                     if (total_len <= max_initial_scrollback) {
-                        // Small buffer - send all in one syscall
-                        writeSlices(self.clients.items[idx].fd, slices.first, slices.second);
+                        // Small buffer - send all in one syscall (framed)
+                        writeFramedSlices(self.clients.items[idx].fd, .terminal_data, slices.first, slices.second);
                     } else {
-                        // Large buffer - only send the tail
+                        // Large buffer - only send the tail (framed)
                         const skip = total_len - max_initial_scrollback;
                         if (skip < slices.first.len) {
                             // Skip part of first slice, send rest of first + all of second
-                            writeSlices(self.clients.items[idx].fd, slices.first[skip..], slices.second);
+                            writeFramedSlices(self.clients.items[idx].fd, .terminal_data, slices.first[skip..], slices.second);
                         } else {
                             // Skip all of first slice, skip part of second
                             const skip_second = skip - slices.first.len;
-                            _ = posix.write(self.clients.items[idx].fd, slices.second[skip_second..]) catch {};
+                            writeFramed(self.clients.items[idx].fd, .terminal_data, slices.second[skip_second..]);
                         }
                         log.debug("sent last {}KB of {}KB scrollback", .{ max_initial_scrollback / 1024, total_len / 1024 });
                     }
 
                     // Restore cursor visibility state after scrollback
                     if (!self.cursor_visible) {
-                        _ = posix.write(self.clients.items[idx].fd, "\x1b[?25l") catch {};
+                        writeFramed(self.clients.items[idx].fd, .terminal_data, "\x1b[?25l");
                         log.debug("restored hidden cursor state", .{});
                     }
                 }
@@ -798,11 +905,23 @@ pub const Master = struct {
             },
             .redraw => {
                 const slices = self.scrollback.slices();
-                writeSlices(self.clients.items[idx].fd, slices.first, slices.second);
+                writeFramedSlices(self.clients.items[idx].fd, .terminal_data, slices.first, slices.second);
             },
             .request_scrollback => {
                 // Client requests old scrollback (everything before the 16KB initial send)
                 // LEGACY: sends all old scrollback at once - use request_scrollback_page instead
+
+                // Skip if alternate screen is active
+                if (self.in_alternate_screen) {
+                    log.info("scrollback request: skipping (alternate screen active)", .{});
+                    const header = Protocol.ResponseHeader{
+                        .type = .scrollback,
+                        .len = 0,
+                    };
+                    _ = posix.write(self.clients.items[idx].fd, header.toBytes()) catch {};
+                    return;
+                }
+
                 const max_initial: usize = 16 * 1024;
                 const slices = self.scrollback.slices();
                 const total_len = slices.first.len + slices.second.len;
@@ -839,6 +958,25 @@ pub const Master = struct {
             },
             .request_scrollback_page => {
                 // Paginated scrollback request - returns a chunk with metadata
+                // Skip if alternate screen is active (vim, less, Claude Code, etc.)
+                // These apps manage their own display and scrollback is irrelevant
+                if (self.in_alternate_screen) {
+                    log.info("scrollback_page: skipping (alternate screen active)", .{});
+                    // Send empty response so client knows we're done
+                    const header = Protocol.ResponseHeader{
+                        .type = .scrollback_page,
+                        .len = Protocol.ScrollbackPageMeta.WIRE_SIZE,
+                    };
+                    const meta = Protocol.ScrollbackPageMeta{
+                        .total_len = 0,
+                        .offset = 0,
+                    };
+                    const client_fd = self.clients.items[idx].fd;
+                    _ = posix.write(client_fd, header.toBytes()) catch {};
+                    _ = posix.write(client_fd, meta.toBytes()) catch {};
+                    return;
+                }
+
                 const payload = pkt.getPayload();
                 if (payload.len < Protocol.ScrollbackPageRequest.WIRE_SIZE) {
                     log.warn("scrollback_page request too short: {} bytes", .{payload.len});
@@ -885,6 +1023,12 @@ pub const Master = struct {
                     to_send,
                     total_len,
                 });
+            },
+            .upgrade => {
+                // Client signals it will now frame all input
+                // Switch to framed mode - parse all subsequent input as packets
+                self.clients.items[idx].framed_mode = true;
+                log.info("client {} upgraded to framed mode", .{idx});
             },
         }
     }

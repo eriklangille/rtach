@@ -18,18 +18,30 @@ pub const MessageType = enum(u8) {
     request_scrollback = 5,
     /// Request a page of scrollback (paginated, with offset and limit)
     request_scrollback_page = 6,
+    /// Upgrade to framed protocol mode (client signals it will frame all input)
+    upgrade = 7,
 };
 
 /// Response types for master → client protocol.
-/// Used for framed responses that need length prefixes.
+/// ALL data from rtach to client is framed: [type: 1][len: 4][payload]
 pub const ResponseType = enum(u8) {
+    /// Terminal data (PTY output) - forward to terminal display
+    terminal_data = 0,
     /// Old scrollback data (prepend to current screen) - LEGACY
     scrollback = 1,
     /// Command from server-side scripts (e.g., "open;3000" to open web tab)
     command = 2,
     /// Paginated scrollback data with metadata (total size, offset)
     scrollback_page = 3,
+    /// Protocol handshake (sent immediately after attach)
+    handshake = 255,
 };
+
+/// Response header size (type: 1 byte + len: 4 bytes)
+pub const RESPONSE_HEADER_SIZE: usize = 5;
+
+/// Handshake payload size (magic: 4 + version_major: 1 + version_minor: 1 + flags: 2)
+pub const HANDSHAKE_SIZE: usize = 8;
 
 /// Request payload for request_scrollback_page
 /// Wire format: exactly 8 bytes
@@ -58,6 +70,39 @@ pub const ScrollbackPageMeta = packed struct {
 
     pub fn toBytes(self: *const ScrollbackPageMeta) *const [WIRE_SIZE]u8 {
         return @ptrCast(self);
+    }
+};
+
+/// Handshake sent immediately after client attaches
+/// Identifies rtach protocol and version for compatibility checking
+/// Wire format: exactly 8 bytes
+pub const Handshake = packed struct {
+    /// Magic bytes "RTCH" (0x48435452 in little-endian)
+    magic: u32 = 0x48435452,
+    /// Protocol version major (2 for framed protocol)
+    version_major: u8 = 2,
+    /// Protocol version minor
+    version_minor: u8 = 0,
+    /// Reserved for future flags
+    flags: u16 = 0,
+
+    pub const WIRE_SIZE = 8;
+    pub const MAGIC: u32 = 0x48435452; // "RTCH"
+
+    pub fn toBytes(self: *const Handshake) *const [WIRE_SIZE]u8 {
+        return @ptrCast(self);
+    }
+
+    /// Parse handshake from wire bytes
+    pub fn parse(bytes: []const u8) ?Handshake {
+        if (bytes.len < WIRE_SIZE) return null;
+        const ptr: *const [WIRE_SIZE]u8 = @ptrCast(bytes.ptr);
+        return std.mem.bytesAsValue(Handshake, ptr).*;
+    }
+
+    /// Check if handshake has valid magic
+    pub fn isValid(self: *const Handshake) bool {
+        return self.magic == MAGIC;
     }
 };
 
@@ -161,6 +206,15 @@ pub const Packet = struct {
         return .{
             .header = .{
                 .type = .redraw,
+                .len = 0,
+            },
+        };
+    }
+
+    pub fn initUpgrade() Packet {
+        return .{
+            .header = .{
+                .type = .upgrade,
                 .len = 0,
             },
         };
@@ -458,4 +512,53 @@ test "ResponseType scrollback_page value" {
 
 test "MessageType request_scrollback_page value" {
     try testing.expectEqual(@as(u8, 6), @intFromEnum(MessageType.request_scrollback_page));
+}
+
+test "ResponseType terminal_data value" {
+    try testing.expectEqual(@as(u8, 0), @intFromEnum(ResponseType.terminal_data));
+}
+
+test "ResponseType handshake value" {
+    try testing.expectEqual(@as(u8, 255), @intFromEnum(ResponseType.handshake));
+}
+
+test "Handshake wire size and serialization" {
+    try testing.expectEqual(@as(usize, 8), Handshake.WIRE_SIZE);
+
+    const handshake = Handshake{};
+    const bytes = handshake.toBytes();
+    try testing.expectEqual(@as(usize, 8), bytes.len);
+    // Magic "RTCH" in little-endian: 0x48435452
+    try testing.expectEqual(@as(u8, 0x52), bytes[0]); // 'R'
+    try testing.expectEqual(@as(u8, 0x54), bytes[1]); // 'T'
+    try testing.expectEqual(@as(u8, 0x43), bytes[2]); // 'C'
+    try testing.expectEqual(@as(u8, 0x48), bytes[3]); // 'H'
+    // version_major = 2, version_minor = 0
+    try testing.expectEqual(@as(u8, 2), bytes[4]);
+    try testing.expectEqual(@as(u8, 0), bytes[5]);
+    // flags = 0
+    try testing.expectEqual(@as(u8, 0), bytes[6]);
+    try testing.expectEqual(@as(u8, 0), bytes[7]);
+}
+
+test "Handshake magic constant" {
+    try testing.expectEqual(@as(u32, 0x48435452), Handshake.MAGIC);
+}
+
+test "MessageType upgrade value" {
+    try testing.expectEqual(@as(u8, 7), @intFromEnum(MessageType.upgrade));
+}
+
+test "upgrade packet format" {
+    // Upgrade packet is [type=7, len=0]
+    const pkt = Packet{
+        .header = .{ .type = .upgrade, .len = 0 },
+    };
+    try testing.expectEqual(MessageType.upgrade, pkt.header.type);
+    try testing.expectEqual(@as(u8, 0), pkt.header.len);
+
+    const data = pkt.serialize();
+    try testing.expectEqual(@as(usize, 2), data.len);
+    try testing.expectEqual(@as(u8, 7), data[0]); // type
+    try testing.expectEqual(@as(u8, 0), data[1]); // len
 }

@@ -7,10 +7,83 @@ import { Socket } from "net";
 // Path to rtach binary
 export const RTACH_BIN = join(import.meta.dir, "../zig-out/bin/rtach");
 
-// Generate unique socket path
+// ============================================================================
+// Process Registry - tracks all spawned processes for cleanup on test failure
+// ============================================================================
+const spawnedProcesses = new Set<Subprocess>();
+const spawnedSockets = new Set<string>();
+
+// Track a process for cleanup
+export function trackProcess(proc: Subprocess): Subprocess {
+  spawnedProcesses.add(proc);
+  proc.exited.then(() => spawnedProcesses.delete(proc)).catch(() => spawnedProcesses.delete(proc));
+  return proc;
+}
+
+// Track a socket path for cleanup
+export function trackSocket(socketPath: string): string {
+  spawnedSockets.add(socketPath);
+  return socketPath;
+}
+
+// Find child PIDs of a process (macOS)
+function getChildPids(parentPid: number): number[] {
+  try {
+    const result = spawnSync(["pgrep", "-P", parentPid.toString()]);
+    const output = result.stdout.toString().trim();
+    if (!output) return [];
+    return output.split("\n").map((s) => parseInt(s, 10)).filter((n) => !isNaN(n));
+  } catch {
+    return [];
+  }
+}
+
+// Kill all tracked processes and clean up sockets - call in afterEach
+export async function cleanupAll(): Promise<void> {
+  const killPromises: Promise<unknown>[] = [];
+  const allPidsToKill: number[] = [];
+
+  // Collect all PIDs including children
+  for (const proc of spawnedProcesses) {
+    allPidsToKill.push(proc.pid);
+    // Get child processes (rtach spawns /bin/cat, /bin/sh, etc.)
+    const children = getChildPids(proc.pid);
+    allPidsToKill.push(...children);
+    // Also get grandchildren
+    for (const child of children) {
+      allPidsToKill.push(...getChildPids(child));
+    }
+  }
+
+  // Kill all collected PIDs
+  for (const pid of allPidsToKill) {
+    try {
+      process.kill(pid, 9);
+    } catch {
+      // Process may already be dead
+    }
+  }
+
+  // Wait for tracked processes to exit
+  for (const proc of spawnedProcesses) {
+    killPromises.push(proc.exited.catch(() => {}));
+  }
+  spawnedProcesses.clear();
+
+  await Promise.all(killPromises);
+
+  for (const socketPath of spawnedSockets) {
+    cleanupSocket(socketPath);
+  }
+  spawnedSockets.clear();
+}
+
+// Generate unique socket path (auto-tracked for cleanup)
 export function uniqueSocketPath(): string {
   const id = Math.random().toString(36).substring(2, 10);
-  return join(tmpdir(), `rtach-test-${id}.sock`);
+  const socketPath = join(tmpdir(), `rtach-test-${id}.sock`);
+  trackSocket(socketPath);
+  return socketPath;
 }
 
 // Clean up socket file
@@ -49,7 +122,7 @@ export async function waitForSocket(
   return false;
 }
 
-// Start rtach master in detached mode
+// Start rtach master in detached mode (auto-tracked for cleanup)
 export async function startDetachedMaster(
   socketPath: string,
   command: string = "/bin/cat",
@@ -65,6 +138,7 @@ export async function startDetachedMaster(
     stdout: "pipe",
     stderr: "pipe",
   });
+  trackProcess(proc);
 
   // Wait for socket to be created
   const ready = await waitForSocket(socketPath);
@@ -76,7 +150,7 @@ export async function startDetachedMaster(
   return proc;
 }
 
-// Connect to rtach as a client (returns stdin/stdout streams)
+// Connect to rtach as a client (auto-tracked for cleanup)
 export function connectClient(
   socketPath: string,
   options: {
@@ -97,11 +171,13 @@ export function connectClient(
     args.push("-r", options.redrawMethod);
   }
 
-  return spawn([RTACH_BIN, ...args], {
+  const proc = spawn([RTACH_BIN, ...args], {
     stdin: "pipe",
     stdout: "pipe",
     stderr: "pipe",
   });
+  trackProcess(proc);
+  return proc;
 }
 
 // Read from subprocess stdout with timeout
@@ -398,13 +474,21 @@ export const MessageType = {
   REDRAW: 4,
   REQUEST_SCROLLBACK: 5,
   REQUEST_SCROLLBACK_PAGE: 6,
+  UPGRADE: 7,
 } as const;
 
 export const ResponseType = {
+  TERMINAL_DATA: 0,
   SCROLLBACK: 1,
   COMMAND: 2,
   SCROLLBACK_PAGE: 3,
+  HANDSHAKE: 255,
 } as const;
+
+// Protocol constants
+export const RESPONSE_HEADER_SIZE = 5;
+export const HANDSHAKE_SIZE = 8;
+export const HANDSHAKE_MAGIC = 0x48435452; // "RTCH"
 
 // Raw socket connection to rtach master
 export interface RawRtachConnection {
@@ -433,6 +517,50 @@ export function connectRawSocket(socketPath: string): Promise<RawRtachConnection
       resolve(conn);
     });
   });
+}
+
+// Wait for handshake and send upgrade packet
+export async function handleProtocolUpgrade(
+  conn: RawRtachConnection,
+  timeoutMs: number = 5000
+): Promise<void> {
+  const startTime = Date.now();
+  const handshakeFrameSize = RESPONSE_HEADER_SIZE + HANDSHAKE_SIZE;
+
+  // Wait for handshake frame
+  while (Date.now() - startTime < timeoutMs) {
+    if (conn.dataBuffer.length >= handshakeFrameSize) {
+      const type = conn.dataBuffer[0];
+      const len = conn.dataBuffer.readUInt32LE(1);
+
+      if (type === ResponseType.HANDSHAKE && len === HANDSHAKE_SIZE) {
+        // Parse and validate handshake
+        const magic = conn.dataBuffer.readUInt32LE(RESPONSE_HEADER_SIZE);
+        if (magic === HANDSHAKE_MAGIC) {
+          // Remove handshake from buffer
+          conn.dataBuffer = conn.dataBuffer.subarray(handshakeFrameSize);
+
+          // Send upgrade packet: [type=7][len=0]
+          const upgradePacket = Buffer.from([MessageType.UPGRADE, 0]);
+          conn.socket.write(upgradePacket);
+          return;
+        }
+      }
+    }
+    await Bun.sleep(10);
+  }
+
+  throw new Error("Timeout waiting for handshake");
+}
+
+// Connect and perform protocol upgrade
+export async function connectRawSocketWithUpgrade(
+  socketPath: string,
+  timeoutMs: number = 5000
+): Promise<RawRtachConnection> {
+  const conn = await connectRawSocket(socketPath);
+  await handleProtocolUpgrade(conn, timeoutMs);
+  return conn;
 }
 
 // Send attach packet with client_id

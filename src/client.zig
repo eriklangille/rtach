@@ -23,6 +23,7 @@ pub const Client = struct {
     socket_fd: posix.fd_t = -1,
     orig_termios: ?std.c.termios = null,
     running: bool = true,
+    stdin_framed: bool = false, // True after iOS sends upgrade packet
 
     pub fn init(allocator: std.mem.Allocator, options: ClientOptions) !*Client {
         const self = try allocator.create(Client);
@@ -60,7 +61,7 @@ pub const Client = struct {
         addr.path[path_len] = 0;
 
         try posix.connect(self.socket_fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr)));
-        log.info("connected to {s}", .{self.options.socket_path});
+        // Note: Don't log here - stderr goes to SSH channel and corrupts the framed protocol
     }
 
     fn setupRawTerminal(self: *Client) !void {
@@ -118,10 +119,73 @@ pub const Client = struct {
         }
     }
 
+    /// Wait for handshake from server and send upgrade packet
+    fn handleProtocolUpgrade(self: *Client) !void {
+        // Handshake frame: [type=255][len=8 LE][payload=8 bytes] = 13 bytes total
+        const handshake_frame_size = Protocol.RESPONSE_HEADER_SIZE + Protocol.HANDSHAKE_SIZE;
+        var buf: [handshake_frame_size]u8 = undefined;
+        var received: usize = 0;
+
+        // Read handshake frame with timeout (using poll)
+        var poll_fds = [_]posix.pollfd{
+            .{ .fd = self.socket_fd, .events = posix.POLL.IN, .revents = 0 },
+        };
+
+        while (received < handshake_frame_size) {
+            // Poll with 5 second timeout
+            const ready = posix.poll(&poll_fds, 5000) catch |err| {
+                if (err == error.Interrupted) continue;
+                return err;
+            };
+
+            if (ready == 0) {
+                // Timeout - no handshake received, maybe old server version
+                log.warn("No handshake received, proceeding without upgrade", .{});
+                return;
+            }
+
+            if (poll_fds[0].revents & posix.POLL.IN != 0) {
+                const n = try posix.read(self.socket_fd, buf[received..]);
+                if (n == 0) return error.ConnectionClosed;
+                received += n;
+            }
+
+            if (poll_fds[0].revents & (posix.POLL.HUP | posix.POLL.ERR) != 0) {
+                return error.ConnectionClosed;
+            }
+        }
+
+        // Validate handshake frame
+        const resp_type = buf[0];
+        const resp_len = std.mem.readInt(u32, buf[1..5], .little);
+
+        if (resp_type != @intFromEnum(Protocol.ResponseType.handshake) or resp_len != Protocol.HANDSHAKE_SIZE) {
+            log.warn("Invalid handshake frame: type={}, len={}", .{ resp_type, resp_len });
+            return;
+        }
+
+        // Parse handshake payload
+        const handshake = Protocol.Handshake.parse(buf[Protocol.RESPONSE_HEADER_SIZE..]);
+        if (handshake) |h| {
+            if (h.isValid()) {
+                // Send upgrade packet to master (via Unix socket)
+                const upgrade_pkt = Protocol.Packet.initUpgrade();
+                _ = try posix.write(self.socket_fd, upgrade_pkt.serialize());
+
+                // Relay handshake to stdout so iOS client can see it
+                // iOS connects via SSH to us, needs to do its own upgrade
+                _ = try posix.write(STDOUT_FILENO, buf[0..handshake_frame_size]);
+            }
+        }
+    }
+
     pub fn run(self: *Client) !void {
         // Setup raw terminal
         try self.setupRawTerminal();
         errdefer self.restoreTerminal();
+
+        // Wait for handshake from server and send upgrade
+        try self.handleProtocolUpgrade();
 
         // Send attach message with optional client_id
         const client_id_ptr: ?*const [Protocol.CLIENT_ID_SIZE]u8 = if (self.options.client_id) |*id| id else null;
@@ -212,22 +276,71 @@ pub const Client = struct {
         const n = try posix.read(STDIN_FILENO, &buf);
         if (n == 0) return true;
 
-        // Check for detach character
-        if (self.options.detach_char) |detach_char| {
-            for (buf[0..n]) |c| {
-                if (c == detach_char) {
-                    return true; // Detach
-                }
+        var data = buf[0..n];
+
+        // Check for upgrade packet from iOS if not already in framed mode
+        if (!self.stdin_framed) {
+            if (data.len >= 2 and data[0] == @intFromEnum(Protocol.MessageType.upgrade) and data[1] == 0) {
+                // iOS sent upgrade, switch to framed stdin parsing
+                self.stdin_framed = true;
+                data = data[2..]; // Skip upgrade packet
+                if (data.len == 0) return false;
             }
         }
 
-        // Send to master
-        var offset: usize = 0;
-        while (offset < n) {
-            const chunk_size = @min(n - offset, Protocol.MAX_PAYLOAD_SIZE);
-            const pkt = Protocol.Packet.init(.push, buf[offset..][0..chunk_size]);
-            _ = try posix.write(self.socket_fd, pkt.serialize());
-            offset += chunk_size;
+        if (self.stdin_framed) {
+            // Parse framed packets from iOS
+            var offset: usize = 0;
+            while (offset + 2 <= data.len) {
+                const pkt_type = data[offset];
+                const pkt_len = data[offset + 1];
+
+                if (offset + 2 + pkt_len > data.len) break; // Incomplete packet
+
+                if (pkt_type == @intFromEnum(Protocol.MessageType.push)) {
+                    // Forward push payload to master
+                    const payload = data[offset + 2 ..][0..pkt_len];
+                    if (payload.len > 0) {
+                        const pkt = Protocol.Packet.init(.push, payload);
+                        _ = try posix.write(self.socket_fd, pkt.serialize());
+                    }
+                } else if (pkt_type == @intFromEnum(Protocol.MessageType.winch)) {
+                    // Forward winch to master
+                    if (pkt_len == 8) {
+                        const payload = data[offset + 2 ..][0..8];
+                        const pkt = Protocol.Packet.initWinch(.{
+                            .rows = std.mem.readInt(u16, payload[0..2], .little),
+                            .cols = std.mem.readInt(u16, payload[2..4], .little),
+                            .xpixel = std.mem.readInt(u16, payload[4..6], .little),
+                            .ypixel = std.mem.readInt(u16, payload[6..8], .little),
+                        });
+                        _ = try posix.write(self.socket_fd, pkt.serialize());
+                    }
+                } else if (pkt_type == @intFromEnum(Protocol.MessageType.detach)) {
+                    return true; // Detach
+                }
+                // Other packet types: ignore for now
+
+                offset += 2 + pkt_len;
+            }
+        } else {
+            // Raw mode: check for detach character and forward to master
+            if (self.options.detach_char) |detach_char| {
+                for (data) |c| {
+                    if (c == detach_char) {
+                        return true; // Detach
+                    }
+                }
+            }
+
+            // Send to master as push packets
+            var offset: usize = 0;
+            while (offset < data.len) {
+                const chunk_size = @min(data.len - offset, Protocol.MAX_PAYLOAD_SIZE);
+                const pkt = Protocol.Packet.init(.push, data[offset..][0..chunk_size]);
+                _ = try posix.write(self.socket_fd, pkt.serialize());
+                offset += chunk_size;
+            }
         }
 
         return false;

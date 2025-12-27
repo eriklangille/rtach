@@ -23,8 +23,11 @@ pub const Protocol = @import("protocol.zig");
 /// 1.8.3 - Performance: ReleaseFast, writev for scrollback, debug logs in hot paths
 /// 1.8.4 - Explicit SIGWINCH to process group on window size change (fixes TUI redraw)
 /// 1.9.0 - Command pipe: scripts write to $RTACH_CMD_FD to send commands to Clauntty
-/// 2.0.0 - Paginated scrollback (request_scrollback_page) to prevent iOS watchdog kills
-pub const version = "2.0.0";
+/// 2.0.0 - Framed protocol: ALL data from rtach is now framed [type][len][payload]
+///         Adds handshake on attach with magic "RTCH" and protocol version.
+///         Fixes race conditions where terminal data was misinterpreted as protocol headers.
+/// 2.0.1 - Send alternate screen escape sequence on reconnect (fixes "@" artifact in Claude Code)
+pub const version = "2.0.3";
 
 pub const std_options: std.Options = .{
     .log_level = .info,
@@ -48,33 +51,38 @@ const Args = struct {
     };
 };
 
-pub fn main() !void {
+pub fn main() void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const args = try parseArgs(allocator);
+    const args = parseArgs(allocator) catch {
+        // Don't print to stderr - it goes to SSH and corrupts protocol
+        std.process.exit(1);
+    };
 
+    // Note: We catch all errors silently because stderr goes to the SSH channel
+    // and would corrupt the framed protocol. Exit codes indicate success/failure.
     switch (args.mode) {
         .create => {
             // Create new session and attach
-            try createAndAttach(allocator, args, false);
+            createAndAttach(allocator, args, false) catch std.process.exit(1);
         },
         .create_or_attach => {
             // Try to attach, create if doesn't exist
             if (socketExists(args.socket_path)) {
-                try attach(allocator, args);
+                attach(allocator, args) catch std.process.exit(1);
             } else {
-                try createAndAttach(allocator, args, false);
+                createAndAttach(allocator, args, false) catch std.process.exit(1);
             }
         },
         .attach => {
             // Attach only, fail if doesn't exist
-            try attach(allocator, args);
+            attach(allocator, args) catch std.process.exit(1);
         },
         .create_detached => {
             // Create detached (master only, no client)
-            try createAndAttach(allocator, args, true);
+            createAndAttach(allocator, args, true) catch std.process.exit(1);
         },
     }
 }
@@ -236,7 +244,8 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
     }
 
     if (!found_socket or result.socket_path.len == 0) {
-        std.debug.print("Error: socket path required\n\n", .{});
+        const stdout = std.posix.STDOUT_FILENO;
+        _ = std.posix.write(stdout, "rtach: missing socket path\n") catch {};
         printUsage();
         std.process.exit(1);
     }
@@ -246,30 +255,30 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
 
 fn printUsage() void {
     const usage =
-        \\rtach - terminal session manager with scrollback
+        \\rtach - persistent terminal sessions with scrollback
         \\
         \\Usage: rtach [options] <socket> [command]
         \\
-        \\Modes:
-        \\  -A <socket>    Create session or attach if exists (default)
-        \\  -a <socket>    Attach to existing session only
-        \\  -c <socket>    Create new session and attach
-        \\  -n <socket>    Create new session, don't attach (detached)
-        \\
         \\Options:
-        \\  -e <char>      Set detach character (default: ^\)
-        \\  -E             Disable detach character
-        \\  -r <method>    Redraw on attach: none, ctrl_l, winch
-        \\  -s <bytes>     Scrollback buffer size (default: 1048576)
-        \\  -h, --help     Show this help
+        \\  -c          Create new session and attach
+        \\  -A          Create if needed, attach (default)
+        \\  -a          Attach to existing session
+        \\  -n          Create detached (no attach)
+        \\  -e CHAR     Set detach character (default: ^\)
+        \\  -E          Disable detach character
+        \\  -r METHOD   Redraw method: none, ctrl_l, winch
+        \\  -s SIZE     Scrollback buffer size in bytes (default: 1MB)
+        \\  -C UUID     Client ID for deduplication
+        \\  -v          Print version
+        \\  -h          Print this help
         \\
         \\Examples:
-        \\  rtach -A /tmp/session bash
-        \\  rtach -a /tmp/session
-        \\  rtach -A /tmp/claude -s 4194304 claude
+        \\  rtach -A ~/.rtach/session $SHELL
+        \\  rtach -a ~/.rtach/session
         \\
     ;
-    std.debug.print("{s}", .{usage});
+    const stdout = std.posix.STDOUT_FILENO;
+    _ = std.posix.write(stdout, usage) catch {};
 }
 
 test {
