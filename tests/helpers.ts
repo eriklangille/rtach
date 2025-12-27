@@ -2,6 +2,7 @@ import { spawn, spawnSync, type Subprocess } from "bun";
 import { unlinkSync, existsSync, statSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
+import { Socket } from "net";
 
 // Path to rtach binary
 export const RTACH_BIN = join(import.meta.dir, "../zig-out/bin/rtach");
@@ -382,4 +383,179 @@ export function calculateStats(values: number[]): Stats {
     p95: percentile(95),
     p99: percentile(99),
   };
+}
+
+// ============================================================================
+// Raw Socket Protocol Helpers (for testing protocol messages directly)
+// ============================================================================
+
+// Protocol message types
+export const MessageType = {
+  PUSH: 0,
+  ATTACH: 1,
+  DETACH: 2,
+  WINCH: 3,
+  REDRAW: 4,
+  REQUEST_SCROLLBACK: 5,
+  REQUEST_SCROLLBACK_PAGE: 6,
+} as const;
+
+export const ResponseType = {
+  SCROLLBACK: 1,
+  COMMAND: 2,
+  SCROLLBACK_PAGE: 3,
+} as const;
+
+// Raw socket connection to rtach master
+export interface RawRtachConnection {
+  socket: Socket;
+  dataBuffer: Buffer;
+  close: () => void;
+}
+
+// Connect to rtach socket directly (bypassing CLI)
+export function connectRawSocket(socketPath: string): Promise<RawRtachConnection> {
+  return new Promise((resolve, reject) => {
+    const socket = new Socket();
+    const conn: RawRtachConnection = {
+      socket,
+      dataBuffer: Buffer.alloc(0),
+      close: () => socket.destroy(),
+    };
+
+    socket.on("data", (data) => {
+      conn.dataBuffer = Buffer.concat([conn.dataBuffer, data]);
+    });
+
+    socket.on("error", reject);
+
+    socket.connect(socketPath, () => {
+      resolve(conn);
+    });
+  });
+}
+
+// Send attach packet with client_id
+export function sendAttachPacket(conn: RawRtachConnection, clientId: string = "test-client"): void {
+  // Attach packet: [type=1][len][cols:2][rows:2][client_id...]
+  const clientIdBytes = Buffer.from(clientId, "utf8");
+  const len = 4 + clientIdBytes.length; // 2 cols + 2 rows + client_id
+  const packet = Buffer.alloc(2 + len);
+  packet[0] = MessageType.ATTACH;
+  packet[1] = len;
+  packet.writeUInt16LE(80, 2); // cols
+  packet.writeUInt16LE(24, 4); // rows
+  clientIdBytes.copy(packet, 6);
+  conn.socket.write(packet);
+}
+
+// Send request_scrollback_page packet
+export function sendScrollbackPageRequest(
+  conn: RawRtachConnection,
+  offset: number,
+  limit: number
+): void {
+  // Packet: [type=6][len=8][offset:4 LE][limit:4 LE]
+  const packet = Buffer.alloc(10);
+  packet[0] = MessageType.REQUEST_SCROLLBACK_PAGE;
+  packet[1] = 8; // payload length
+  packet.writeUInt32LE(offset, 2);
+  packet.writeUInt32LE(limit, 6);
+  conn.socket.write(packet);
+}
+
+// Send legacy request_scrollback packet
+export function sendScrollbackRequest(conn: RawRtachConnection): void {
+  // Packet: [type=5][len=0]
+  const packet = Buffer.from([MessageType.REQUEST_SCROLLBACK, 0]);
+  conn.socket.write(packet);
+}
+
+// Parse response header (5 bytes: type + 4-byte length)
+export interface ResponseHeader {
+  type: number;
+  length: number;
+}
+
+export function parseResponseHeader(data: Buffer): ResponseHeader | null {
+  if (data.length < 5) return null;
+  return {
+    type: data[0],
+    length: data.readUInt32LE(1),
+  };
+}
+
+// Parse scrollback_page metadata (8 bytes: total_len + offset)
+export interface ScrollbackPageMeta {
+  totalLen: number;
+  offset: number;
+}
+
+export function parseScrollbackPageMeta(data: Buffer): ScrollbackPageMeta | null {
+  if (data.length < 8) return null;
+  return {
+    totalLen: data.readUInt32LE(0),
+    offset: data.readUInt32LE(4),
+  };
+}
+
+// Wait for scrollback_page response and parse it
+export async function waitForScrollbackPageResponse(
+  conn: RawRtachConnection,
+  timeoutMs: number = 5000
+): Promise<{ meta: ScrollbackPageMeta; data: Buffer }> {
+  const startTime = Date.now();
+
+  while (Date.now() - startTime < timeoutMs) {
+    // Need at least 5 bytes for header
+    if (conn.dataBuffer.length >= 5) {
+      const header = parseResponseHeader(conn.dataBuffer);
+      if (header && header.type === ResponseType.SCROLLBACK_PAGE) {
+        // Need header (5) + full response (header.length)
+        const totalNeeded = 5 + header.length;
+        if (conn.dataBuffer.length >= totalNeeded) {
+          // Extract response
+          const responseData = conn.dataBuffer.subarray(5, totalNeeded);
+          // Remove processed data from buffer
+          conn.dataBuffer = conn.dataBuffer.subarray(totalNeeded);
+
+          // Parse metadata (first 8 bytes of response)
+          const meta = parseScrollbackPageMeta(responseData);
+          if (!meta) throw new Error("Failed to parse scrollback page metadata");
+
+          // Remaining is scrollback data
+          const scrollbackData = responseData.subarray(8);
+          return { meta, data: scrollbackData };
+        }
+      }
+    }
+    await Bun.sleep(10);
+  }
+
+  throw new Error("Timeout waiting for scrollback_page response");
+}
+
+// Wait for legacy scrollback response
+export async function waitForScrollbackResponse(
+  conn: RawRtachConnection,
+  timeoutMs: number = 5000
+): Promise<Buffer> {
+  const startTime = Date.now();
+
+  while (Date.now() - startTime < timeoutMs) {
+    if (conn.dataBuffer.length >= 5) {
+      const header = parseResponseHeader(conn.dataBuffer);
+      if (header && header.type === ResponseType.SCROLLBACK) {
+        const totalNeeded = 5 + header.length;
+        if (conn.dataBuffer.length >= totalNeeded) {
+          const data = conn.dataBuffer.subarray(5, totalNeeded);
+          conn.dataBuffer = conn.dataBuffer.subarray(totalNeeded);
+          return data;
+        }
+      }
+    }
+    await Bun.sleep(10);
+  }
+
+  throw new Error("Timeout waiting for scrollback response");
 }

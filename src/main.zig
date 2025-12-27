@@ -21,7 +21,10 @@ pub const Protocol = @import("protocol.zig");
 /// 1.8.1 - Remove OSC 133 from shell integration (caused resize bugs in Ghostty)
 /// 1.8.2 - Track and restore cursor visibility state on reconnect (fixes dual cursor in Claude Code)
 /// 1.8.3 - Performance: ReleaseFast, writev for scrollback, debug logs in hot paths
-pub const version = "1.8.3";
+/// 1.8.4 - Explicit SIGWINCH to process group on window size change (fixes TUI redraw)
+/// 1.9.0 - Command pipe: scripts write to $RTACH_CMD_FD to send commands to Clauntty
+/// 2.0.0 - Paginated scrollback (request_scrollback_page) to prevent iOS watchdog kills
+pub const version = "2.0.0";
 
 pub const std_options: std.Options = .{
     .log_level = .info,

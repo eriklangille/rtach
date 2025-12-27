@@ -199,6 +199,45 @@ pub const DynamicRingBuffer = struct {
             try writer.writeAll(s.second);
         }
     }
+
+    /// Get a range of data starting at `offset` with length up to `len`.
+    /// Offset 0 is the oldest data in the buffer.
+    /// Returns up to two slices due to ring buffer wrap-around.
+    pub fn sliceRange(
+        self: *const DynamicRingBuffer,
+        offset: usize,
+        len: usize,
+    ) struct { first: []const u8, second: []const u8 } {
+        if (len == 0 or offset >= self.len) {
+            return .{ .first = &.{}, .second = &.{} };
+        }
+
+        const actual_len = @min(len, self.len - offset);
+        const s = self.slices();
+
+        if (offset < s.first.len) {
+            // Start is in first slice
+            const first_avail = s.first.len - offset;
+            if (actual_len <= first_avail) {
+                // Entirely within first slice
+                return .{ .first = s.first[offset..][0..actual_len], .second = &.{} };
+            } else {
+                // Spans both slices
+                const second_len = actual_len - first_avail;
+                return .{
+                    .first = s.first[offset..],
+                    .second = s.second[0..second_len],
+                };
+            }
+        } else {
+            // Start is in second slice
+            const second_offset = offset - s.first.len;
+            return .{
+                .first = s.second[second_offset..][0..actual_len],
+                .second = &.{},
+            };
+        }
+    }
 };
 
 // Tests
@@ -360,4 +399,90 @@ test "dynamic ring buffer zero-length write" {
     buf.write("test");
     buf.write("");
     try testing.expectEqual(@as(usize, 4), buf.size());
+}
+
+test "sliceRange basic" {
+    var buf = try DynamicRingBuffer.init(testing.allocator, 100);
+    defer buf.deinit();
+
+    buf.write("0123456789"); // 10 bytes
+
+    // Get first 5 bytes
+    const r1 = buf.sliceRange(0, 5);
+    try testing.expectEqualStrings("01234", r1.first);
+    try testing.expectEqual(@as(usize, 0), r1.second.len);
+
+    // Get middle 5 bytes
+    const r2 = buf.sliceRange(3, 5);
+    try testing.expectEqualStrings("34567", r2.first);
+    try testing.expectEqual(@as(usize, 0), r2.second.len);
+
+    // Get last 5 bytes
+    const r3 = buf.sliceRange(5, 5);
+    try testing.expectEqualStrings("56789", r3.first);
+    try testing.expectEqual(@as(usize, 0), r3.second.len);
+}
+
+test "sliceRange with wrap-around" {
+    var buf = try DynamicRingBuffer.init(testing.allocator, 10);
+    defer buf.deinit();
+
+    // Fill buffer and wrap around
+    buf.write("ABCDEFGHIJ"); // 10 bytes, fills buffer
+    buf.write("12345"); // 5 more bytes, wraps around
+
+    // Buffer now contains: "12345FGHIJ" (oldest) -> "12345" at end
+    // Actually: oldest is FGHIJ, newest is 12345
+    // Total content in order: FGHIJ12345
+
+    try testing.expectEqual(@as(usize, 10), buf.size());
+
+    // Get first 5 bytes (oldest: FGHIJ)
+    const r1 = buf.sliceRange(0, 5);
+    var result1: [5]u8 = undefined;
+    @memcpy(result1[0..r1.first.len], r1.first);
+    @memcpy(result1[r1.first.len..][0..r1.second.len], r1.second);
+    try testing.expectEqualStrings("FGHIJ", &result1);
+
+    // Get last 5 bytes (newest: 12345)
+    const r2 = buf.sliceRange(5, 5);
+    var result2: [5]u8 = undefined;
+    @memcpy(result2[0..r2.first.len], r2.first);
+    @memcpy(result2[r2.first.len..][0..r2.second.len], r2.second);
+    try testing.expectEqualStrings("12345", &result2);
+
+    // Get range spanning wrap point
+    const r3 = buf.sliceRange(3, 4);
+    var result3: [4]u8 = undefined;
+    @memcpy(result3[0..r3.first.len], r3.first);
+    @memcpy(result3[r3.first.len..][0..r3.second.len], r3.second);
+    try testing.expectEqualStrings("IJ12", &result3);
+}
+
+test "sliceRange edge cases" {
+    var buf = try DynamicRingBuffer.init(testing.allocator, 10);
+    defer buf.deinit();
+
+    buf.write("hello");
+
+    // Empty range
+    const r1 = buf.sliceRange(0, 0);
+    try testing.expectEqual(@as(usize, 0), r1.first.len);
+    try testing.expectEqual(@as(usize, 0), r1.second.len);
+
+    // Offset beyond buffer
+    const r2 = buf.sliceRange(100, 5);
+    try testing.expectEqual(@as(usize, 0), r2.first.len);
+    try testing.expectEqual(@as(usize, 0), r2.second.len);
+
+    // Request more than available (should clamp)
+    const r3 = buf.sliceRange(3, 100);
+    try testing.expectEqualStrings("lo", r3.first);
+    try testing.expectEqual(@as(usize, 0), r3.second.len);
+
+    // Empty buffer
+    buf.clear();
+    const r4 = buf.sliceRange(0, 5);
+    try testing.expectEqual(@as(usize, 0), r4.first.len);
+    try testing.expectEqual(@as(usize, 0), r4.second.len);
 }

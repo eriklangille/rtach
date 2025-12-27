@@ -12,6 +12,11 @@ import {
   waitForOutput,
   writeToProc,
   killAndWait,
+  connectRawSocket,
+  sendAttachPacket,
+  sendScrollbackPageRequest,
+  waitForScrollbackPageResponse,
+  type RawRtachConnection,
 } from "./helpers";
 
 describe("rtach CLI", () => {
@@ -465,5 +470,199 @@ describe("rtach stress tests", () => {
     verifyClient.kill(9);
     await verifyClient.exited;
     await killAndWait(master, 9);
+  });
+});
+
+describe("rtach paginated scrollback", () => {
+  let socketPath: string;
+  let master: ReturnType<typeof spawn>;
+  let rawConn: RawRtachConnection | null = null;
+
+  beforeEach(async () => {
+    socketPath = uniqueSocketPath();
+    // Use 64KB scrollback for pagination tests
+    master = await startDetachedMaster(socketPath, "/bin/cat", 64 * 1024);
+  });
+
+  afterEach(async () => {
+    if (rawConn) {
+      rawConn.close();
+      rawConn = null;
+    }
+    await killAndWait(master, 9);
+    cleanupSocket(socketPath);
+  });
+
+  test("request_scrollback_page returns metadata and data", async () => {
+    // Connect via raw socket and write data directly
+    rawConn = await connectRawSocket(socketPath);
+    sendAttachPacket(rawConn, "paginated-test");
+
+    // Wait for connection to establish and initial scrollback
+    await Bun.sleep(200);
+
+    // Write test data via raw socket (push message)
+    const testData = "A".repeat(100);
+    const pushPacket = Buffer.alloc(2 + testData.length);
+    pushPacket[0] = 0; // MessageType.PUSH
+    pushPacket[1] = testData.length;
+    Buffer.from(testData).copy(pushPacket, 2);
+    rawConn.socket.write(pushPacket);
+
+    // Wait for echo from cat
+    await Bun.sleep(300);
+    rawConn.dataBuffer = Buffer.alloc(0); // Clear buffer (discard echo)
+
+    // Request first page of scrollback
+    sendScrollbackPageRequest(rawConn, 0, 512);
+
+    const response = await waitForScrollbackPageResponse(rawConn);
+
+    // Verify metadata
+    expect(response.meta.totalLen).toBeGreaterThan(0);
+    expect(response.meta.offset).toBe(0);
+
+    // Verify we got data (up to 512 bytes requested)
+    expect(response.data.length).toBeLessThanOrEqual(512);
+    expect(response.data.length).toBeGreaterThan(0);
+  });
+
+  test("paginated scrollback returns correct offsets", async () => {
+    rawConn = await connectRawSocket(socketPath);
+    sendAttachPacket(rawConn, "offset-test");
+    await Bun.sleep(100);
+
+    // Write 2KB of data
+    const testData = "B".repeat(2000);
+    const pushPacket = Buffer.alloc(2 + testData.length);
+    pushPacket[0] = 0; // MessageType.PUSH
+    pushPacket[1] = 255; // Max single-byte length, will truncate but that's ok for test
+    Buffer.from(testData.slice(0, 255)).copy(pushPacket, 2);
+
+    // Write in chunks since push has 1-byte length
+    for (let i = 0; i < testData.length; i += 200) {
+      const chunk = testData.slice(i, i + 200);
+      const pkt = Buffer.alloc(2 + chunk.length);
+      pkt[0] = 0;
+      pkt[1] = chunk.length;
+      Buffer.from(chunk).copy(pkt, 2);
+      rawConn.socket.write(pkt);
+    }
+
+    await Bun.sleep(300);
+    rawConn.dataBuffer = Buffer.alloc(0);
+
+    // Request first 500 bytes
+    sendScrollbackPageRequest(rawConn, 0, 500);
+    const page1 = await waitForScrollbackPageResponse(rawConn);
+
+    expect(page1.meta.offset).toBe(0);
+    expect(page1.data.length).toBe(500);
+
+    // Request next 500 bytes
+    sendScrollbackPageRequest(rawConn, 500, 500);
+    const page2 = await waitForScrollbackPageResponse(rawConn);
+
+    expect(page2.meta.offset).toBe(500);
+    expect(page2.data.length).toBe(500);
+
+    // Total length should be consistent
+    expect(page1.meta.totalLen).toBe(page2.meta.totalLen);
+  });
+
+  test("paginated scrollback handles offset beyond end", async () => {
+    rawConn = await connectRawSocket(socketPath);
+    sendAttachPacket(rawConn, "beyond-end-test");
+    await Bun.sleep(100);
+
+    // Write small amount of data
+    const testData = "small data";
+    const pushPacket = Buffer.alloc(2 + testData.length);
+    pushPacket[0] = 0;
+    pushPacket[1] = testData.length;
+    Buffer.from(testData).copy(pushPacket, 2);
+    rawConn.socket.write(pushPacket);
+
+    await Bun.sleep(200);
+    rawConn.dataBuffer = Buffer.alloc(0);
+
+    // Request with offset way beyond total size
+    sendScrollbackPageRequest(rawConn, 100000, 500);
+    const response = await waitForScrollbackPageResponse(rawConn);
+
+    // Should return empty data but still have correct total
+    expect(response.meta.totalLen).toBeGreaterThan(0);
+    expect(response.meta.totalLen).toBeLessThan(100000);
+    expect(response.data.length).toBe(0);
+  });
+
+  test("paginated scrollback accumulates full buffer", async () => {
+    rawConn = await connectRawSocket(socketPath);
+    sendAttachPacket(rawConn, "large-buffer-test");
+    await Bun.sleep(100);
+
+    // Write 8KB of data in chunks
+    const totalBytes = 8000;
+    const chunkSize = 200;
+    for (let i = 0; i < totalBytes; i += chunkSize) {
+      const chunk = "X".repeat(Math.min(chunkSize, totalBytes - i));
+      const pkt = Buffer.alloc(2 + chunk.length);
+      pkt[0] = 0;
+      pkt[1] = chunk.length;
+      Buffer.from(chunk).copy(pkt, 2);
+      rawConn.socket.write(pkt);
+    }
+
+    await Bun.sleep(300);
+    rawConn.dataBuffer = Buffer.alloc(0);
+
+    // Request in pages and accumulate
+    let totalReceived = 0;
+    let offset = 0;
+    const pageSize = 1024;
+    let totalLen = 0;
+
+    while (true) {
+      sendScrollbackPageRequest(rawConn, offset, pageSize);
+      const response = await waitForScrollbackPageResponse(rawConn);
+
+      totalLen = response.meta.totalLen;
+      totalReceived += response.data.length;
+      offset += response.data.length;
+
+      if (response.data.length === 0 || offset >= totalLen) {
+        break;
+      }
+    }
+
+    // Should have received all scrollback data
+    expect(totalReceived).toBe(totalLen);
+    // cat echoes back, so we get 2x the data (sent + echo)
+    expect(totalLen).toBeGreaterThanOrEqual(totalBytes);
+  });
+
+  test("paginated scrollback data contains written content", async () => {
+    rawConn = await connectRawSocket(socketPath);
+    sendAttachPacket(rawConn, "content-test");
+    await Bun.sleep(100);
+
+    // Write unique marker
+    const marker = "UNIQUE_MARKER_12345";
+    const pushPacket = Buffer.alloc(2 + marker.length);
+    pushPacket[0] = 0;
+    pushPacket[1] = marker.length;
+    Buffer.from(marker).copy(pushPacket, 2);
+    rawConn.socket.write(pushPacket);
+
+    await Bun.sleep(200);
+    rawConn.dataBuffer = Buffer.alloc(0);
+
+    // Request all scrollback
+    sendScrollbackPageRequest(rawConn, 0, 64 * 1024);
+    const response = await waitForScrollbackPageResponse(rawConn);
+
+    // Verify data contains our marker
+    const dataStr = response.data.toString();
+    expect(dataStr).toContain(marker);
   });
 });

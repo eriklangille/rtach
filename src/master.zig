@@ -85,6 +85,16 @@ pub const Master = struct {
     pty_slave_path: [256]u8 = undefined,
     child_pid: posix.pid_t = 0,
 
+    // Command pipe - for scripts to send commands to Clauntty
+    // Write end passed to child as RTACH_CMD_FD, read end monitored by master
+    cmd_pipe_read: posix.fd_t = -1,
+    cmd_pipe_write: posix.fd_t = -1,
+    cmd_pipe_stream: xev.Stream = undefined,
+    cmd_pipe_completion: xev.Completion = .{},
+    cmd_pipe_buf: [512]u8 = undefined,
+    cmd_line_buf: [512]u8 = undefined, // Buffer for accumulating partial lines
+    cmd_line_len: usize = 0,
+
     // Unix socket (using TCP abstraction which works for any socket)
     socket_fd: posix.fd_t = -1,
     socket: xev.TCP = undefined,
@@ -134,6 +144,7 @@ pub const Master = struct {
             .scrollback = try RingBuffer.init(allocator, options.scrollback_size),
             .clients = .{},
             .loop = try xev.Loop.init(.{}),
+            .cmd_line_len = 0,
         };
 
         try self.createSocket();
@@ -208,10 +219,20 @@ pub const Master = struct {
         self.pty_master = master_fd;
         self.pty_stream = xev.Stream.initFd(master_fd);
 
+        // Create command pipe for scripts to send commands to Clauntty
+        // Use pipe2 with O_NONBLOCK - both ends non-blocking is fine
+        // (parent reads async via xev, child writes small commands that fit in pipe buffer)
+        const cmd_pipe = try posix.pipe2(.{ .NONBLOCK = true });
+        self.cmd_pipe_read = cmd_pipe[0];
+        self.cmd_pipe_write = cmd_pipe[1];
+
+        self.cmd_pipe_stream = xev.Stream.initFd(self.cmd_pipe_read);
+
         const pid = try posix.fork();
         if (pid == 0) {
             // Child process
             posix.close(master_fd);
+            posix.close(self.cmd_pipe_read); // Close read end in child
             _ = posix.setsid() catch {};
 
             const slave_fd = posix.openZ(
@@ -231,6 +252,11 @@ pub const Master = struct {
             posix.dup2(slave_fd, 1) catch {};
             posix.dup2(slave_fd, 2) catch {};
             if (slave_fd > 2) posix.close(slave_fd);
+
+            // Set RTACH_CMD_FD environment variable for scripts to send commands
+            var fd_buf: [16]u8 = undefined;
+            const fd_str = std.fmt.bufPrintZ(&fd_buf, "{}", .{self.cmd_pipe_write}) catch "3";
+            _ = setenv("RTACH_CMD_FD", fd_str, 1);
 
             // Deploy shell integration files
             ShellIntegration.deployIntegrationFiles() catch |err| {
@@ -282,13 +308,26 @@ pub const Master = struct {
         }
 
         self.child_pid = pid;
-        log.info("started child pid={} command={s}", .{ pid, self.options.command });
+
+        // Close write end in parent - only child writes to command pipe
+        posix.close(self.cmd_pipe_write);
+        self.cmd_pipe_write = -1;
+
+        log.info("started child pid={} command={s}, cmd_fd={}", .{ pid, self.options.command, self.cmd_pipe_read });
     }
 
     fn closePty(self: *Master) void {
         if (self.pty_master >= 0) {
             posix.close(self.pty_master);
             self.pty_master = -1;
+        }
+        if (self.cmd_pipe_read >= 0) {
+            posix.close(self.cmd_pipe_read);
+            self.cmd_pipe_read = -1;
+        }
+        if (self.cmd_pipe_write >= 0) {
+            posix.close(self.cmd_pipe_write);
+            self.cmd_pipe_write = -1;
         }
         if (self.child_pid > 0) {
             _ = posix.kill(self.child_pid, posix.SIG.TERM) catch {};
@@ -308,6 +347,18 @@ pub const Master = struct {
             self,
             ptyReadCallback,
         );
+
+        // Set up command pipe read (for scripts to send commands to clients)
+        if (self.cmd_pipe_read >= 0) {
+            self.cmd_pipe_stream.read(
+                &self.loop,
+                &self.cmd_pipe_completion,
+                .{ .slice = &self.cmd_pipe_buf },
+                Master,
+                self,
+                cmdPipeReadCallback,
+            );
+        }
 
         // Set up socket accept using TCP abstraction
         self.socket.accept(
@@ -385,6 +436,88 @@ pub const Master = struct {
             ptyReadCallback,
         );
         return .disarm;
+    }
+
+    fn cmdPipeReadCallback(
+        self_opt: ?*Master,
+        loop: *xev.Loop,
+        _: *xev.Completion,
+        _: xev.Stream,
+        _: xev.ReadBuffer,
+        result: xev.ReadError!usize,
+    ) xev.CallbackAction {
+        const self = self_opt orelse return .disarm;
+
+        const n = result catch |err| {
+            if (err == error.Again) {
+                // Re-arm command pipe read
+                self.cmd_pipe_stream.read(
+                    loop,
+                    &self.cmd_pipe_completion,
+                    .{ .slice = &self.cmd_pipe_buf },
+                    Master,
+                    self,
+                    cmdPipeReadCallback,
+                );
+                return .disarm;
+            }
+            log.warn("command pipe read error: {}", .{err});
+            return .disarm;
+        };
+
+        if (n == 0) {
+            // Pipe closed (child exited) - this is normal
+            log.debug("command pipe closed", .{});
+            return .disarm;
+        }
+
+        // Process incoming bytes, looking for newline-delimited commands
+        const data = self.cmd_pipe_buf[0..n];
+        for (data) |byte| {
+            if (byte == '\n') {
+                // Complete command - send to clients
+                if (self.cmd_line_len > 0) {
+                    self.sendCommandToClients(self.cmd_line_buf[0..self.cmd_line_len]);
+                    self.cmd_line_len = 0;
+                }
+            } else {
+                // Accumulate byte
+                if (self.cmd_line_len < self.cmd_line_buf.len) {
+                    self.cmd_line_buf[self.cmd_line_len] = byte;
+                    self.cmd_line_len += 1;
+                }
+            }
+        }
+
+        // Re-arm command pipe read
+        self.cmd_pipe_stream.read(
+            loop,
+            &self.cmd_pipe_completion,
+            .{ .slice = &self.cmd_pipe_buf },
+            Master,
+            self,
+            cmdPipeReadCallback,
+        );
+        return .disarm;
+    }
+
+    /// Send a command to all attached clients via protocol message
+    fn sendCommandToClients(self: *Master, cmd: []const u8) void {
+        log.info("sending command to clients: {s}", .{cmd});
+
+        // Build response header + command data
+        const header = Protocol.ResponseHeader{
+            .type = .command,
+            .len = @intCast(cmd.len),
+        };
+
+        // Send to all attached clients
+        for (self.clients.items) |client| {
+            if (client.attached) {
+                _ = posix.write(client.fd, header.toBytes()) catch continue;
+                _ = posix.write(client.fd, cmd) catch continue;
+            }
+        }
     }
 
     fn acceptCallback(
@@ -641,6 +774,7 @@ pub const Master = struct {
             },
             .winch => {
                 if (pkt.getWinsize()) |ws| {
+                    const size_changed = ws.cols != self.winsize.cols or ws.rows != self.winsize.rows;
                     self.winsize = ws;
                     const c_ws = posix.winsize{
                         .row = ws.rows,
@@ -649,7 +783,17 @@ pub const Master = struct {
                         .ypixel = ws.ypixel,
                     };
                     _ = std.c.ioctl(self.pty_master, getTIOCSWINSZ(), &c_ws);
-                    log.debug("winsize {}x{}", .{ ws.cols, ws.rows });
+
+                    // Explicitly send SIGWINCH to ensure the app redraws
+                    // TIOCSWINSZ should do this automatically, but it's not always reliable
+                    // Send to process GROUP (negative pid) so it reaches foreground apps like Claude Code
+                    if (size_changed and self.child_pid > 0) {
+                        // Send to process group (shell + all children including Claude Code)
+                        _ = std.c.kill(-self.child_pid, posix.SIG.WINCH);
+                        log.info("winsize {}x{} -> sent SIGWINCH to pgrp {}", .{ ws.cols, ws.rows, self.child_pid });
+                    } else {
+                        log.debug("winsize {}x{}", .{ ws.cols, ws.rows });
+                    }
                 }
             },
             .redraw => {
@@ -658,6 +802,7 @@ pub const Master = struct {
             },
             .request_scrollback => {
                 // Client requests old scrollback (everything before the 16KB initial send)
+                // LEGACY: sends all old scrollback at once - use request_scrollback_page instead
                 const max_initial: usize = 16 * 1024;
                 const slices = self.scrollback.slices();
                 const total_len = slices.first.len + slices.second.len;
@@ -669,7 +814,7 @@ pub const Master = struct {
                         .type = .scrollback,
                         .len = 0,
                     };
-                    _ = posix.write(self.clients.items[idx].fd, std.mem.asBytes(&header)) catch {};
+                    _ = posix.write(self.clients.items[idx].fd, header.toBytes()) catch {};
                     log.info("scrollback request: no additional data (all sent on attach)", .{});
                 } else {
                     // Send the OLD scrollback (everything before the last 16KB)
@@ -678,7 +823,7 @@ pub const Master = struct {
                         .type = .scrollback,
                         .len = @intCast(old_len),
                     };
-                    _ = posix.write(self.clients.items[idx].fd, std.mem.asBytes(&header)) catch {};
+                    _ = posix.write(self.clients.items[idx].fd, header.toBytes()) catch {};
 
                     // Send old scrollback data
                     if (old_len <= slices.first.len) {
@@ -691,6 +836,55 @@ pub const Master = struct {
                     }
                     log.debug("scrollback request: sent {}KB of old scrollback", .{old_len / 1024});
                 }
+            },
+            .request_scrollback_page => {
+                // Paginated scrollback request - returns a chunk with metadata
+                const payload = pkt.getPayload();
+                if (payload.len < Protocol.ScrollbackPageRequest.WIRE_SIZE) {
+                    log.warn("scrollback_page request too short: {} bytes", .{payload.len});
+                    return;
+                }
+
+                const req = Protocol.ScrollbackPageRequest.fromBytes(
+                    payload[0..Protocol.ScrollbackPageRequest.WIRE_SIZE],
+                );
+
+                const total_len: u32 = @intCast(self.scrollback.size());
+                const start: u32 = @min(req.offset, total_len);
+                const available = total_len - start;
+                const to_send: u32 = @min(available, req.limit);
+
+                // Build response header (includes metadata size + data size)
+                const response_len = Protocol.ScrollbackPageMeta.WIRE_SIZE + to_send;
+                const header = Protocol.ResponseHeader{
+                    .type = .scrollback_page,
+                    .len = @intCast(response_len),
+                };
+
+                // Build metadata
+                const meta = Protocol.ScrollbackPageMeta{
+                    .total_len = total_len,
+                    .offset = start,
+                };
+
+                const client_fd = self.clients.items[idx].fd;
+
+                // Send header + metadata
+                _ = posix.write(client_fd, header.toBytes()) catch {};
+                _ = posix.write(client_fd, meta.toBytes()) catch {};
+
+                // Send data slice using sliceRange helper
+                if (to_send > 0) {
+                    const range = self.scrollback.sliceRange(start, to_send);
+                    writeSlices(client_fd, range.first, range.second);
+                }
+
+                log.debug("scrollback_page: offset={} limit={} sent={} total={}", .{
+                    req.offset,
+                    req.limit,
+                    to_send,
+                    total_len,
+                });
             },
         }
     }

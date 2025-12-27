@@ -14,23 +14,67 @@ pub const MessageType = enum(u8) {
     winch = 3,
     /// Request screen redraw
     redraw = 4,
-    /// Request old scrollback (everything before the initial 16KB)
+    /// Request old scrollback (everything before the initial 16KB) - LEGACY
     request_scrollback = 5,
+    /// Request a page of scrollback (paginated, with offset and limit)
+    request_scrollback_page = 6,
 };
 
 /// Response types for master → client protocol.
 /// Used for framed responses that need length prefixes.
 pub const ResponseType = enum(u8) {
-    /// Old scrollback data (prepend to current screen)
+    /// Old scrollback data (prepend to current screen) - LEGACY
     scrollback = 1,
+    /// Command from server-side scripts (e.g., "open;3000" to open web tab)
+    command = 2,
+    /// Paginated scrollback data with metadata (total size, offset)
+    scrollback_page = 3,
+};
+
+/// Request payload for request_scrollback_page
+/// Wire format: exactly 8 bytes
+pub const ScrollbackPageRequest = packed struct {
+    /// Byte offset from START of scrollback (0 = oldest data)
+    offset: u32,
+    /// Maximum bytes to return in this page
+    limit: u32,
+
+    pub const WIRE_SIZE = 8;
+
+    pub fn fromBytes(bytes: *const [WIRE_SIZE]u8) ScrollbackPageRequest {
+        return @bitCast(bytes.*);
+    }
+};
+
+/// Response metadata for scrollback_page (sent after header, before data)
+/// Wire format: exactly 8 bytes
+pub const ScrollbackPageMeta = packed struct {
+    /// Total scrollback size available
+    total_len: u32,
+    /// Byte offset this chunk starts at
+    offset: u32,
+
+    pub const WIRE_SIZE = 8;
+
+    pub fn toBytes(self: *const ScrollbackPageMeta) *const [WIRE_SIZE]u8 {
+        return @ptrCast(self);
+    }
 };
 
 /// Response header for framed master → client messages
 /// Use packed to ensure no padding between type (1 byte) and len (4 bytes)
-/// Total size: exactly 5 bytes
+/// Wire format: exactly 5 bytes
 pub const ResponseHeader = packed struct {
     type: ResponseType,
     len: u32, // Length of following data (up to 4GB)
+
+    /// Wire format size (use this instead of @sizeOf which includes alignment padding)
+    pub const WIRE_SIZE = 5;
+
+    /// Get bytes for wire transmission (exactly 5 bytes)
+    pub fn toBytes(self: *const ResponseHeader) *const [WIRE_SIZE]u8 {
+        return @ptrCast(self);
+    }
 };
 
 /// Packet header - compatible with dtach
@@ -331,4 +375,87 @@ test "getWinsize with short payload" {
         .header = .{ .type = .winch, .len = 2 }, // Too short for Winsize
     };
     try testing.expect(pkt.getWinsize() == null);
+}
+
+test "ResponseType command value" {
+    try testing.expectEqual(@as(u8, 2), @intFromEnum(ResponseType.command));
+}
+
+test "ResponseType scrollback value" {
+    try testing.expectEqual(@as(u8, 1), @intFromEnum(ResponseType.scrollback));
+}
+
+test "ResponseHeader wire size is 5 bytes" {
+    try testing.expectEqual(@as(usize, 5), ResponseHeader.WIRE_SIZE);
+}
+
+test "ResponseHeader toBytes returns correct wire format" {
+    const header = ResponseHeader{
+        .type = .command,
+        .len = 12,
+    };
+    const bytes = header.toBytes();
+    try testing.expectEqual(@as(usize, 5), bytes.len);
+    try testing.expectEqual(@as(u8, 2), bytes[0]); // type = command
+    // Length is little-endian: 12 = 0x0C
+    try testing.expectEqual(@as(u8, 12), bytes[1]);
+    try testing.expectEqual(@as(u8, 0), bytes[2]);
+    try testing.expectEqual(@as(u8, 0), bytes[3]);
+    try testing.expectEqual(@as(u8, 0), bytes[4]);
+}
+
+test "ResponseHeader scrollback toBytes" {
+    const header = ResponseHeader{
+        .type = .scrollback,
+        .len = 0x12345678,
+    };
+    const bytes = header.toBytes();
+    try testing.expectEqual(@as(u8, 1), bytes[0]); // type = scrollback
+    // Length is little-endian: 0x12345678
+    try testing.expectEqual(@as(u8, 0x78), bytes[1]);
+    try testing.expectEqual(@as(u8, 0x56), bytes[2]);
+    try testing.expectEqual(@as(u8, 0x34), bytes[3]);
+    try testing.expectEqual(@as(u8, 0x12), bytes[4]);
+}
+
+test "ScrollbackPageRequest wire size and parsing" {
+    try testing.expectEqual(@as(usize, 8), ScrollbackPageRequest.WIRE_SIZE);
+
+    // Test parsing from bytes (little-endian)
+    const bytes = [8]u8{
+        0x00, 0x40, 0x00, 0x00, // offset = 16384 (0x4000)
+        0x00, 0x40, 0x00, 0x00, // limit = 16384 (0x4000)
+    };
+    const req = ScrollbackPageRequest.fromBytes(&bytes);
+    try testing.expectEqual(@as(u32, 16384), req.offset);
+    try testing.expectEqual(@as(u32, 16384), req.limit);
+}
+
+test "ScrollbackPageMeta wire size and serialization" {
+    try testing.expectEqual(@as(usize, 8), ScrollbackPageMeta.WIRE_SIZE);
+
+    const meta = ScrollbackPageMeta{
+        .total_len = 1048576, // 1MB = 0x100000
+        .offset = 16384, // 16KB = 0x4000
+    };
+    const bytes = meta.toBytes();
+    try testing.expectEqual(@as(usize, 8), bytes.len);
+    // total_len little-endian: 0x00100000
+    try testing.expectEqual(@as(u8, 0x00), bytes[0]);
+    try testing.expectEqual(@as(u8, 0x00), bytes[1]);
+    try testing.expectEqual(@as(u8, 0x10), bytes[2]);
+    try testing.expectEqual(@as(u8, 0x00), bytes[3]);
+    // offset little-endian: 0x00004000
+    try testing.expectEqual(@as(u8, 0x00), bytes[4]);
+    try testing.expectEqual(@as(u8, 0x40), bytes[5]);
+    try testing.expectEqual(@as(u8, 0x00), bytes[6]);
+    try testing.expectEqual(@as(u8, 0x00), bytes[7]);
+}
+
+test "ResponseType scrollback_page value" {
+    try testing.expectEqual(@as(u8, 3), @intFromEnum(ResponseType.scrollback_page));
+}
+
+test "MessageType request_scrollback_page value" {
+    try testing.expectEqual(@as(u8, 6), @intFromEnum(MessageType.request_scrollback_page));
 }
