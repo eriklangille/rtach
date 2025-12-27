@@ -480,8 +480,7 @@ describe("rtach paginated scrollback", () => {
       rawConn.close();
       rawConn = null;
     }
-    await killAndWait(master, 9);
-    cleanupSocket(socketPath);
+    await cleanupAll();
   });
 
   test("request_scrollback_page returns metadata and data", async () => {

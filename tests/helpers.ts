@@ -13,10 +13,23 @@ export const RTACH_BIN = join(import.meta.dir, "../zig-out/bin/rtach");
 const spawnedProcesses = new Set<Subprocess>();
 const spawnedSockets = new Set<string>();
 
+// Debug mode - set to true to see cleanup diagnostics
+const DEBUG_CLEANUP = true;
+
+function debugLog(...args: unknown[]) {
+  if (DEBUG_CLEANUP) {
+    console.log("[cleanup]", ...args);
+  }
+}
+
 // Track a process for cleanup
 export function trackProcess(proc: Subprocess): Subprocess {
   spawnedProcesses.add(proc);
-  proc.exited.then(() => spawnedProcesses.delete(proc)).catch(() => spawnedProcesses.delete(proc));
+  debugLog(`Tracking PID ${proc.pid}, total tracked: ${spawnedProcesses.size}`);
+  proc.exited.then(() => {
+    spawnedProcesses.delete(proc);
+    debugLog(`PID ${proc.pid} exited naturally, remaining: ${spawnedProcesses.size}`);
+  }).catch(() => spawnedProcesses.delete(proc));
   return proc;
 }
 
@@ -38,29 +51,64 @@ function getChildPids(parentPid: number): number[] {
   }
 }
 
+// Find all PIDs matching a pattern (safety net for untracked processes)
+function findProcessesByPattern(pattern: string): number[] {
+  try {
+    const result = spawnSync(["pgrep", "-f", pattern]);
+    const output = result.stdout.toString().trim();
+    if (!output) return [];
+    return output.split("\n").map((s) => parseInt(s, 10)).filter((n) => !isNaN(n));
+  } catch {
+    return [];
+  }
+}
+
 // Kill all tracked processes and clean up sockets - call in afterEach
 export async function cleanupAll(): Promise<void> {
+  debugLog(`cleanupAll called. Tracked processes: ${spawnedProcesses.size}, sockets: ${spawnedSockets.size}`);
+
   const killPromises: Promise<unknown>[] = [];
   const allPidsToKill: number[] = [];
 
+  // SAFETY NET: Find ALL rtach-test processes (catches untracked spawns)
+  const rtachTestPids = findProcessesByPattern("rtach-test");
+  if (rtachTestPids.length > 0) {
+    debugLog(`  Safety net: found ${rtachTestPids.length} rtach-test processes: ${rtachTestPids.join(", ")}`);
+    for (const pid of rtachTestPids) {
+      allPidsToKill.push(pid);
+      // Also get their children
+      const children = getChildPids(pid);
+      allPidsToKill.push(...children);
+    }
+  }
+
   // Collect all PIDs including children
   for (const proc of spawnedProcesses) {
+    debugLog(`  Processing tracked PID ${proc.pid}`);
     allPidsToKill.push(proc.pid);
     // Get child processes (rtach spawns /bin/cat, /bin/sh, etc.)
     const children = getChildPids(proc.pid);
+    debugLog(`    Children of ${proc.pid}: ${children.join(", ") || "none"}`);
     allPidsToKill.push(...children);
     // Also get grandchildren
     for (const child of children) {
-      allPidsToKill.push(...getChildPids(child));
+      const grandchildren = getChildPids(child);
+      if (grandchildren.length > 0) {
+        debugLog(`    Grandchildren of ${child}: ${grandchildren.join(", ")}`);
+      }
+      allPidsToKill.push(...grandchildren);
     }
   }
+
+  debugLog(`  Total PIDs to kill: ${allPidsToKill.length} - [${allPidsToKill.join(", ")}]`);
 
   // Kill all collected PIDs
   for (const pid of allPidsToKill) {
     try {
       process.kill(pid, 9);
-    } catch {
-      // Process may already be dead
+      debugLog(`  Killed PID ${pid}`);
+    } catch (e) {
+      debugLog(`  Failed to kill PID ${pid}: ${e}`);
     }
   }
 
@@ -71,11 +119,13 @@ export async function cleanupAll(): Promise<void> {
   spawnedProcesses.clear();
 
   await Promise.all(killPromises);
+  debugLog(`  All tracked processes exited`);
 
   for (const socketPath of spawnedSockets) {
     cleanupSocket(socketPath);
   }
   spawnedSockets.clear();
+  debugLog(`cleanupAll finished`);
 }
 
 // Generate unique socket path (auto-tracked for cleanup)
