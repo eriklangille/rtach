@@ -13,28 +13,64 @@ pub const ShellType = enum {
 /// Embedded shell integration scripts
 pub const bash_integration =
     \\# Clauntty Shell Integration for Bash (embedded in rtach)
-    \\# Minimal - just sets env var to indicate integration is active
+    \\# Sets terminal title to show current directory and running command
     \\[[ "$-" != *i* ]] && return
     \\[[ -n "$CLAUNTTY_SHELL_INTEGRATION" ]] && return
     \\export CLAUNTTY_SHELL_INTEGRATION=1
+    \\
+    \\# Set title before prompt (shows current directory)
+    \\__clauntty_prompt() {
+    \\    printf '\033]0;%s\007' "${PWD/#$HOME/~}"
+    \\}
+    \\PROMPT_COMMAND="__clauntty_prompt${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
+    \\
+    \\# Set title before command runs (shows the command)
+    \\__clauntty_preexec() {
+    \\    # Skip internal commands (prompts, completions)
+    \\    [[ "$1" == __clauntty_* ]] && return
+    \\    [[ "$1" == _* ]] && return
+    \\    printf '\033]0;%s\007' "$1"
+    \\}
+    \\trap '__clauntty_preexec "$BASH_COMMAND"' DEBUG
     \\
 ;
 
 pub const zsh_integration =
     \\# Clauntty Shell Integration for Zsh (embedded in rtach)
-    \\# Minimal - just sets env var to indicate integration is active
+    \\# Sets terminal title to show current directory and running command
     \\[[ -o interactive ]] || return
     \\[[ -n "$CLAUNTTY_SHELL_INTEGRATION" ]] && return
     \\export CLAUNTTY_SHELL_INTEGRATION=1
+    \\
+    \\# Set title before prompt (shows current directory)
+    \\__clauntty_precmd() {
+    \\    print -Pn '\033]0;%~\007'
+    \\}
+    \\precmd_functions+=(__clauntty_precmd)
+    \\
+    \\# Set title before command runs (shows the command)
+    \\__clauntty_preexec() {
+    \\    print -Pn '\033]0;%~: '"${1}\007"
+    \\}
+    \\preexec_functions+=(__clauntty_preexec)
     \\
 ;
 
 pub const fish_integration =
     \\# Clauntty Shell Integration for Fish (embedded in rtach)
-    \\# Minimal - just sets env var to indicate integration is active
+    \\# Sets terminal title to show current directory and running command
     \\status is-interactive; or exit
     \\set -q CLAUNTTY_SHELL_INTEGRATION; and exit
     \\set -gx CLAUNTTY_SHELL_INTEGRATION 1
+    \\
+    \\# Set title to current directory (fish_title is called automatically)
+    \\function fish_title
+    \\    if set -q argv[1]
+    \\        echo (prompt_pwd): $argv[1]
+    \\    else
+    \\        prompt_pwd
+    \\    end
+    \\end
     \\
 ;
 

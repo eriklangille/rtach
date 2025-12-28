@@ -184,8 +184,29 @@ pub const Master = struct {
     idle_timer_completion: xev.Completion = .{},
     idle_notified: bool = false, // Avoid sending duplicate idle notifications
 
+    // Terminal title from OSC 0/1/2 escape sequences
+    // Stored to .title file for session picker display
+    terminal_title: [256]u8 = undefined,
+    terminal_title_len: u8 = 0,
+    title_dirty: bool = false,
+    last_title_write_ns: i128 = 0,
+    // OSC parsing state (for sequences spanning multiple reads)
+    osc_state: OscParseState = .none,
+    osc_buf: [256]u8 = undefined,
+    osc_buf_len: u8 = 0,
+
+    const OscParseState = enum {
+        none, // Not in OSC sequence
+        got_esc, // Got ESC, waiting for ]
+        got_osc, // Got ESC ], waiting for 0/1/2
+        got_cmd, // Got 0/1/2, waiting for ;
+        in_title, // Collecting title bytes until BEL or ST
+        got_esc_in_title, // Got ESC while in title, checking for ST (\)
+    };
+
     const IDLE_THRESHOLD_NS: i128 = 2 * std.time.ns_per_s; // 2 seconds
     const IDLE_CHECK_INTERVAL_MS: u64 = 500; // Check every 500ms
+    const TITLE_WRITE_DEBOUNCE_NS: i128 = 500 * std.time.ns_per_ms; // 500ms
 
     pub fn init(allocator: std.mem.Allocator, options: MasterOptions) !*Master {
         const self = try allocator.create(Master);
@@ -491,6 +512,9 @@ pub const Master = struct {
         // Cursor visibility: ESC[?25h/l
         self.updateTerminalModeState(data);
 
+        // Parse OSC title sequences (OSC 0/1/2)
+        self.updateTerminalTitle(data);
+
         // Record timestamp for idle detection
         self.last_pty_write_ns = std.time.nanoTimestamp();
         self.idle_notified = false; // Reset - we have new output
@@ -585,6 +609,9 @@ pub const Master = struct {
             }
             self.idle_notified = true;
         }
+
+        // Write title to file if dirty (debounced)
+        self.writeTitleToFile();
 
         // Re-arm timer
         self.idle_timer.run(
@@ -1233,6 +1260,135 @@ pub const Master = struct {
             }
             i += 1;
         }
+    }
+
+    /// Parse OSC 0/1/2 title sequences from terminal data
+    /// OSC format: ESC ] N ; <title> (BEL | ST)
+    /// Where N is 0, 1, or 2, BEL is 0x07, ST is ESC \
+    /// Handles partial sequences across multiple PTY reads
+    fn updateTerminalTitle(self: *Master, data: []const u8) void {
+        for (data) |byte| {
+            switch (self.osc_state) {
+                .none => {
+                    if (byte == 0x1B) { // ESC
+                        self.osc_state = .got_esc;
+                    }
+                },
+                .got_esc => {
+                    if (byte == ']') { // OSC introducer
+                        log.debug("OSC: got ESC ]", .{});
+                        self.osc_state = .got_osc;
+                    } else {
+                        self.osc_state = .none;
+                    }
+                },
+                .got_osc => {
+                    // Looking for 0, 1, or 2 (title commands)
+                    if (byte == '0' or byte == '1' or byte == '2') {
+                        log.debug("OSC: got cmd {c}", .{byte});
+                        self.osc_state = .got_cmd;
+                    } else {
+                        log.debug("OSC: unexpected byte after ESC ]: 0x{x:0>2}", .{byte});
+                        self.osc_state = .none;
+                    }
+                },
+                .got_cmd => {
+                    if (byte == ';') {
+                        // Start collecting title
+                        log.debug("OSC: got semicolon, collecting title", .{});
+                        self.osc_state = .in_title;
+                        self.osc_buf_len = 0;
+                    } else {
+                        log.debug("OSC: expected semicolon but got 0x{x:0>2}", .{byte});
+                        self.osc_state = .none;
+                    }
+                },
+                .in_title => {
+                    if (byte == 0x07) { // BEL - end of title
+                        log.debug("OSC: got BEL, finishing title", .{});
+                        self.finishTitle();
+                        self.osc_state = .none;
+                    } else if (byte == 0x1B) { // ESC - might be start of ST
+                        log.debug("OSC: got ESC in title, checking for ST", .{});
+                        self.osc_state = .got_esc_in_title;
+                    } else if (self.osc_buf_len < self.osc_buf.len) {
+                        self.osc_buf[self.osc_buf_len] = byte;
+                        self.osc_buf_len += 1;
+                    }
+                    // If buffer full, keep collecting but don't store (truncate)
+                },
+                .got_esc_in_title => {
+                    if (byte == '\\') { // ST (String Terminator) = ESC \
+                        log.debug("OSC: got ST (ESC \\), finishing title", .{});
+                        self.finishTitle();
+                        self.osc_state = .none;
+                    } else if (byte == ']') {
+                        // New OSC starting, finish current and start new
+                        log.debug("OSC: new OSC starting, finishing current", .{});
+                        self.finishTitle();
+                        self.osc_state = .got_osc;
+                    } else {
+                        // Not ST, store the ESC and this byte as part of title
+                        log.debug("OSC: ESC not followed by ST, storing in title", .{});
+                        if (self.osc_buf_len < self.osc_buf.len) {
+                            self.osc_buf[self.osc_buf_len] = 0x1B;
+                            self.osc_buf_len += 1;
+                        }
+                        if (self.osc_buf_len < self.osc_buf.len) {
+                            self.osc_buf[self.osc_buf_len] = byte;
+                            self.osc_buf_len += 1;
+                        }
+                        self.osc_state = .in_title;
+                    }
+                },
+            }
+        }
+    }
+
+    /// Complete title parsing - copy to terminal_title and mark dirty
+    fn finishTitle(self: *Master) void {
+        if (self.osc_buf_len > 0) {
+            @memcpy(self.terminal_title[0..self.osc_buf_len], self.osc_buf[0..self.osc_buf_len]);
+            self.terminal_title_len = self.osc_buf_len;
+            self.title_dirty = true;
+            log.debug("title set: \"{s}\"", .{self.terminal_title[0..self.terminal_title_len]});
+        }
+    }
+
+    /// Write title to .title file (debounced, called from idle timer)
+    fn writeTitleToFile(self: *Master) void {
+        if (!self.title_dirty) return;
+
+        const now = std.time.nanoTimestamp();
+        if (now - self.last_title_write_ns < TITLE_WRITE_DEBOUNCE_NS) return;
+
+        // Construct title file path: socket_path + ".title"
+        var path_buf: [512]u8 = undefined;
+        const title_path = std.fmt.bufPrint(&path_buf, "{s}.title", .{self.options.socket_path}) catch return;
+
+        // Write atomically: write to .tmp, then rename
+        var tmp_path_buf: [512]u8 = undefined;
+        const tmp_path = std.fmt.bufPrint(&tmp_path_buf, "{s}.title.tmp", .{self.options.socket_path}) catch return;
+
+        const file = std.fs.createFileAbsolute(tmp_path, .{}) catch |err| {
+            log.warn("failed to create title file: {}", .{err});
+            return;
+        };
+        defer file.close();
+
+        file.writeAll(self.terminal_title[0..self.terminal_title_len]) catch |err| {
+            log.warn("failed to write title: {}", .{err});
+            return;
+        };
+
+        std.fs.renameAbsolute(tmp_path, title_path) catch |err| {
+            log.warn("failed to rename title file: {}", .{err});
+            return;
+        };
+
+        self.title_dirty = false;
+        self.last_title_write_ns = now;
+        log.info("wrote title to file: \"{s}\"", .{self.terminal_title[0..self.terminal_title_len]});
     }
 
     fn removeClient(self: *Master, idx: usize) void {

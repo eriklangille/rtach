@@ -36,7 +36,9 @@ pub const Protocol = @import("protocol.zig");
 /// 2.1.3 - Add PID to log prefix for multi-session debugging
 /// 2.1.4 - Fix: client.zig now forwards pause/resume packets to master
 /// 2.2.0 - Phase 2 network optimization complete: pause/resume/idle working
-pub const version = "2.2.0";
+/// 2.3.0 - OSC 0/1/2 title parsing: saves terminal title to .title file for session picker
+/// 2.4.0 - Shell integration: bash/zsh/fish set title to current directory and running command
+pub const version = "2.4.0";
 
 pub const std_options: std.Options = .{
     .log_level = .info,
