@@ -1,6 +1,6 @@
 .{
     .name = .rtach,
-    .version = "0.1.0",
+    .version = "0.2.0",
     .fingerprint = 0xe5c10360ef96ef33,
     .paths = .{""},
     .dependencies = .{

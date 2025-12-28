@@ -20,6 +20,10 @@ pub const MessageType = enum(u8) {
     request_scrollback_page = 6,
     /// Upgrade to framed protocol mode (client signals it will frame all input)
     upgrade = 7,
+    /// Pause terminal output streaming (client will buffer locally)
+    pause = 8,
+    /// Resume terminal output streaming (flush buffer and continue)
+    @"resume" = 9,
 };
 
 /// Response types for master → client protocol.
@@ -33,6 +37,8 @@ pub const ResponseType = enum(u8) {
     command = 2,
     /// Paginated scrollback data with metadata (total size, offset)
     scrollback_page = 3,
+    /// Shell is idle/waiting for input (sent after 2s of no PTY output)
+    idle = 4,
     /// Protocol handshake (sent immediately after attach)
     handshake = 255,
 };
@@ -215,6 +221,24 @@ pub const Packet = struct {
         return .{
             .header = .{
                 .type = .upgrade,
+                .len = 0,
+            },
+        };
+    }
+
+    pub fn initPause() Packet {
+        return .{
+            .header = .{
+                .type = .pause,
+                .len = 0,
+            },
+        };
+    }
+
+    pub fn initResume() Packet {
+        return .{
+            .header = .{
+                .type = .@"resume",
                 .len = 0,
             },
         };
@@ -560,5 +584,39 @@ test "upgrade packet format" {
     const data = pkt.serialize();
     try testing.expectEqual(@as(usize, 2), data.len);
     try testing.expectEqual(@as(u8, 7), data[0]); // type
+    try testing.expectEqual(@as(u8, 0), data[1]); // len
+}
+
+test "MessageType pause value" {
+    try testing.expectEqual(@as(u8, 8), @intFromEnum(MessageType.pause));
+}
+
+test "MessageType resume value" {
+    try testing.expectEqual(@as(u8, 9), @intFromEnum(MessageType.@"resume"));
+}
+
+test "ResponseType idle value" {
+    try testing.expectEqual(@as(u8, 4), @intFromEnum(ResponseType.idle));
+}
+
+test "pause packet format" {
+    const pkt = Packet.initPause();
+    try testing.expectEqual(MessageType.pause, pkt.header.type);
+    try testing.expectEqual(@as(u8, 0), pkt.header.len);
+
+    const data = pkt.serialize();
+    try testing.expectEqual(@as(usize, 2), data.len);
+    try testing.expectEqual(@as(u8, 8), data[0]); // type
+    try testing.expectEqual(@as(u8, 0), data[1]); // len
+}
+
+test "resume packet format" {
+    const pkt = Packet.initResume();
+    try testing.expectEqual(MessageType.@"resume", pkt.header.type);
+    try testing.expectEqual(@as(u8, 0), pkt.header.len);
+
+    const data = pkt.serialize();
+    try testing.expectEqual(@as(usize, 2), data.len);
+    try testing.expectEqual(@as(u8, 9), data[0]); // type
     try testing.expectEqual(@as(u8, 0), data[1]); // len
 }

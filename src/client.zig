@@ -318,8 +318,16 @@ pub const Client = struct {
                     }
                 } else if (pkt_type == @intFromEnum(Protocol.MessageType.detach)) {
                     return true; // Detach
+                } else if (pkt_type == @intFromEnum(Protocol.MessageType.pause)) {
+                    // Forward pause to master
+                    const pkt = Protocol.Packet.initPause();
+                    _ = try posix.write(self.socket_fd, pkt.serialize());
+                } else if (pkt_type == @intFromEnum(Protocol.MessageType.@"resume")) {
+                    // Forward resume to master
+                    const pkt = Protocol.Packet.initResume();
+                    _ = try posix.write(self.socket_fd, pkt.serialize());
                 }
-                // Other packet types: ignore for now
+                // Other packet types: ignore
 
                 offset += 2 + pkt_len;
             }

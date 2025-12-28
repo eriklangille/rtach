@@ -27,11 +27,50 @@ pub const Protocol = @import("protocol.zig");
 ///         Adds handshake on attach with magic "RTCH" and protocol version.
 ///         Fixes race conditions where terminal data was misinterpreted as protocol headers.
 /// 2.0.1 - Send alternate screen escape sequence on reconnect (fixes "@" artifact in Claude Code)
-pub const version = "2.0.3";
+/// 2.1.0 - Pause/resume/idle: Battery optimization for inactive tabs.
+///         New messages: pause(8), resume(9) from client; idle(4) from server.
+///         Paused clients don't receive streaming data; buffered output flushed on resume.
+///         Idle notification sent after 2s of no PTY output (enables background notifications).
+/// 2.1.1 - Debug logging to /tmp/rtach-debug.log
+/// 2.1.2 - More detailed packet reception and idle timer logging
+/// 2.1.3 - Add PID to log prefix for multi-session debugging
+/// 2.1.4 - Fix: client.zig now forwards pause/resume packets to master
+/// 2.2.0 - Phase 2 network optimization complete: pause/resume/idle working
+pub const version = "2.2.0";
 
 pub const std_options: std.Options = .{
     .log_level = .info,
+    .logFn = timestampedLog,
 };
+
+/// Custom log function that adds timestamp and PID prefix
+fn timestampedLog(
+    comptime level: std.log.Level,
+    comptime scope: @TypeOf(.EnumLiteral),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    const scope_prefix = if (scope == .default) "" else "(" ++ @tagName(scope) ++ ") ";
+    const level_prefix = switch (level) {
+        .err => "ERR ",
+        .warn => "WARN",
+        .info => "INFO",
+        .debug => "DBG ",
+    };
+
+    // Get current time for timestamp
+    const now_ns = std.time.nanoTimestamp();
+    const now_s = @divFloor(now_ns, std.time.ns_per_s);
+    const subsec_ms = @divFloor(@rem(now_ns, std.time.ns_per_s), std.time.ns_per_ms);
+
+    // Get process ID
+    const pid = std.os.linux.getpid();
+
+    // Write to stderr using posix.write (zig 0.15 compatible)
+    var buf: [4096]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, "[{d}.{d:0>3}][{d}] {s} {s}" ++ format ++ "\n", .{ now_s, subsec_ms, pid, level_prefix, scope_prefix } ++ args) catch return;
+    _ = std.posix.write(std.posix.STDERR_FILENO, msg) catch {};
+}
 
 const Args = struct {
     mode: Mode,
@@ -98,13 +137,19 @@ fn createAndAttach(allocator: std.mem.Allocator, args: Args, detached: bool) !vo
         // setsid() works here because child is not a process group leader
         _ = posix.setsid() catch {};
 
-        // Redirect stdin/stdout/stderr to /dev/null to fully detach from terminal
+        // Redirect stdin to /dev/null, but stderr to a log file for debugging
         const dev_null = posix.open("/dev/null", .{ .ACCMODE = .RDWR }, 0) catch null;
         if (dev_null) |null_fd| {
             posix.dup2(null_fd, posix.STDIN_FILENO) catch {};
             posix.dup2(null_fd, posix.STDOUT_FILENO) catch {};
-            posix.dup2(null_fd, posix.STDERR_FILENO) catch {};
             if (null_fd > 2) posix.close(null_fd);
+        }
+
+        // Open log file for stderr (debug logging)
+        const log_fd = posix.open("/tmp/rtach-debug.log", .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, 0o644) catch null;
+        if (log_fd) |fd| {
+            posix.dup2(fd, posix.STDERR_FILENO) catch {};
+            if (fd > 2) posix.close(fd);
         }
 
         var master = Master.init(allocator, .{

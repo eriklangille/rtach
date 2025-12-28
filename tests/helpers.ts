@@ -14,7 +14,7 @@ const spawnedProcesses = new Set<Subprocess>();
 const spawnedSockets = new Set<string>();
 
 // Debug mode - set to true to see cleanup diagnostics
-const DEBUG_CLEANUP = true;
+const DEBUG_CLEANUP = false;
 
 function debugLog(...args: unknown[]) {
   if (DEBUG_CLEANUP) {

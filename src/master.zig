@@ -120,6 +120,11 @@ const ClientConn = struct {
     completion: xev.Completion = .{},
     read_buf: [512]u8 = undefined,
     master: *Master = undefined,
+    /// When true, terminal output is not streamed to this client (battery optimization)
+    /// Scrollback continues to buffer, and data is flushed on resume
+    paused: bool = false,
+    /// Scrollback position when client was paused (used to flush buffered data on resume)
+    paused_scrollback_pos: usize = 0,
 };
 
 pub const Master = struct {
@@ -172,6 +177,16 @@ pub const Master = struct {
     // When false, cursor should be hidden (TUI apps like Claude Code hide the cursor)
     cursor_visible: bool = true,
 
+    // Idle detection for battery optimization
+    // When PTY has no output for IDLE_THRESHOLD_NS, send idle notification to paused clients
+    last_pty_write_ns: i128 = 0,
+    idle_timer: xev.Timer = undefined,
+    idle_timer_completion: xev.Completion = .{},
+    idle_notified: bool = false, // Avoid sending duplicate idle notifications
+
+    const IDLE_THRESHOLD_NS: i128 = 2 * std.time.ns_per_s; // 2 seconds
+    const IDLE_CHECK_INTERVAL_MS: u64 = 500; // Check every 500ms
+
     pub fn init(allocator: std.mem.Allocator, options: MasterOptions) !*Master {
         const self = try allocator.create(Master);
         errdefer allocator.destroy(self);
@@ -204,6 +219,7 @@ pub const Master = struct {
     }
 
     pub fn deinit(self: *Master) void {
+        self.idle_timer.deinit();
         self.loop.deinit();
         self.closeSocket();
         self.closePty();
@@ -416,6 +432,18 @@ pub const Master = struct {
             acceptCallback,
         );
 
+        // Set up idle detection timer (checks every 500ms)
+        self.idle_timer = try xev.Timer.init();
+        self.last_pty_write_ns = std.time.nanoTimestamp(); // Initialize to now
+        self.idle_timer.run(
+            &self.loop,
+            &self.idle_timer_completion,
+            IDLE_CHECK_INTERVAL_MS,
+            Master,
+            self,
+            idleTimerCallback,
+        );
+
         // Run the event loop
         try self.loop.run(.until_done);
 
@@ -463,12 +491,17 @@ pub const Master = struct {
         // Cursor visibility: ESC[?25h/l
         self.updateTerminalModeState(data);
 
+        // Record timestamp for idle detection
+        self.last_pty_write_ns = std.time.nanoTimestamp();
+        self.idle_notified = false; // Reset - we have new output
+
         // Store in scrollback
         self.scrollback.write(data);
 
-        // Forward to all attached clients (framed)
+        // Forward to all attached, non-paused clients (framed)
+        // Paused clients will receive buffered data when they resume
         for (self.clients.items) |client| {
-            if (client.attached) {
+            if (client.attached and !client.paused) {
                 writeFramed(client.fd, .terminal_data, data);
             }
         }
@@ -481,6 +514,86 @@ pub const Master = struct {
             Master,
             self,
             ptyReadCallback,
+        );
+        return .disarm;
+    }
+
+    fn idleTimerCallback(
+        self_opt: ?*Master,
+        loop: *xev.Loop,
+        _: *xev.Completion,
+        result: xev.Timer.RunError!void,
+    ) xev.CallbackAction {
+        const self = self_opt orelse return .disarm;
+
+        _ = result catch {
+            // Timer error - just re-arm
+            self.idle_timer.run(
+                loop,
+                &self.idle_timer_completion,
+                IDLE_CHECK_INTERVAL_MS,
+                Master,
+                self,
+                idleTimerCallback,
+            );
+            return .disarm;
+        };
+
+        // Check if we're idle (no PTY output for IDLE_THRESHOLD_NS)
+        const now = std.time.nanoTimestamp();
+        const elapsed = now - self.last_pty_write_ns;
+        const elapsed_ms = @divFloor(elapsed, std.time.ns_per_ms);
+
+        // Count attached and paused clients for debugging
+        var attached_count: usize = 0;
+        var paused_count: usize = 0;
+        for (self.clients.items) |client| {
+            if (client.attached) attached_count += 1;
+            if (client.paused) paused_count += 1;
+        }
+
+        // Only log when there's something interesting to report
+        if (elapsed >= IDLE_THRESHOLD_NS and !self.idle_notified and paused_count > 0) {
+            log.debug("idle check: elapsed={}ms, clients={}, attached={}, paused={}", .{
+                elapsed_ms,
+                self.clients.items.len,
+                attached_count,
+                paused_count,
+            });
+        }
+
+        if (elapsed >= IDLE_THRESHOLD_NS and !self.idle_notified) {
+            // Send idle notification to all paused clients
+            var sent_count: usize = 0;
+            for (self.clients.items) |client| {
+                if (client.attached and client.paused) {
+                    // Send empty idle response (just header, no payload)
+                    const header = Protocol.ResponseHeader{
+                        .type = .idle,
+                        .len = 0,
+                    };
+                    _ = posix.write(client.fd, header.toBytes()) catch {};
+                    sent_count += 1;
+                    log.info("sent idle to client fd={}", .{client.fd});
+                }
+            }
+
+            if (sent_count > 0) {
+                log.info("idle detected: notified {} paused clients", .{sent_count});
+            } else {
+                log.info("idle detected but no paused clients to notify", .{});
+            }
+            self.idle_notified = true;
+        }
+
+        // Re-arm timer
+        self.idle_timer.run(
+            loop,
+            &self.idle_timer_completion,
+            IDLE_CHECK_INTERVAL_MS,
+            Master,
+            self,
+            idleTimerCallback,
         );
         return .disarm;
     }
@@ -720,6 +833,14 @@ pub const Master = struct {
             self.removeClient(idx);
             return .disarm;
         }
+
+        // Log received bytes for debugging (debug level to reduce noise)
+        log.debug("client {} recv {} bytes, framed={}, first bytes: {any}", .{
+            idx,
+            n,
+            client.framed_mode,
+            client.read_buf[0..@min(n, 10)],
+        });
 
         // Handle based on framed_mode
         if (client.framed_mode) {
@@ -1029,6 +1150,37 @@ pub const Master = struct {
                 // Switch to framed mode - parse all subsequent input as packets
                 self.clients.items[idx].framed_mode = true;
                 log.info("client {} upgraded to framed mode", .{idx});
+            },
+            .pause => {
+                // Client requests to pause terminal output streaming (battery optimization)
+                // We continue to buffer in scrollback, but don't send to this client
+                const client = self.clients.items[idx];
+                if (!client.paused) {
+                    client.paused = true;
+                    client.paused_scrollback_pos = self.scrollback.size();
+                    log.info("client {} paused at scrollback pos {}", .{ idx, client.paused_scrollback_pos });
+                }
+            },
+            .@"resume" => {
+                // Client requests to resume terminal output streaming
+                // Send any buffered data since pause, then resume normal streaming
+                const client = self.clients.items[idx];
+                if (client.paused) {
+                    const current_pos = self.scrollback.size();
+                    const buffered = current_pos -| client.paused_scrollback_pos;
+
+                    if (buffered > 0) {
+                        // Send buffered data since pause
+                        const range = self.scrollback.sliceRange(client.paused_scrollback_pos, buffered);
+                        writeFramedSlices(client.fd, .terminal_data, range.first, range.second);
+                        log.info("client {} resumed: flushed {} bytes", .{ idx, buffered });
+                    } else {
+                        log.info("client {} resumed: no buffered data", .{idx});
+                    }
+
+                    client.paused = false;
+                    client.paused_scrollback_pos = 0;
+                }
             },
         }
     }
