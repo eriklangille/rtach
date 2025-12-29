@@ -85,6 +85,8 @@ pub fn build(b: *std.Build) void {
         .{ .name = "x86_64-linux-musl", .target = .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .musl } },
         .{ .name = "aarch64-linux-gnu", .target = .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .gnu } },
         .{ .name = "aarch64-linux-musl", .target = .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .musl } },
+        .{ .name = "x86_64-macos", .target = .{ .cpu_arch = .x86_64, .os_tag = .macos } },
+        .{ .name = "aarch64-macos", .target = .{ .cpu_arch = .aarch64, .os_tag = .macos } },
     };
 
     const cross_step = b.step("cross", "Build for all deployment targets");

@@ -338,9 +338,9 @@ pub const Master = struct {
             if (slave_fd > 2) posix.close(slave_fd);
 
             // Set RTACH_CMD_FD environment variable for scripts to send commands
-            var fd_buf: [16]u8 = undefined;
-            const fd_str = std.fmt.bufPrintZ(&fd_buf, "{}", .{self.cmd_pipe_write}) catch "3";
-            _ = setenv("RTACH_CMD_FD", fd_str, 1);
+            var fd_buf: [16:0]u8 = undefined;
+            _ = std.fmt.bufPrintZ(&fd_buf, "{}", .{self.cmd_pipe_write}) catch unreachable;
+            _ = setenv("RTACH_CMD_FD", &fd_buf, 1);
 
             // Deploy shell integration files
             ShellIntegration.deployIntegrationFiles() catch |err| {
@@ -587,10 +587,11 @@ pub const Master = struct {
         }
 
         if (elapsed >= IDLE_THRESHOLD_NS and !self.idle_notified) {
-            // Send idle notification to all paused clients
+            // Send idle notification to all attached clients
+            // Active clients need it for UI indicator, paused clients for pre-fetch trigger
             var sent_count: usize = 0;
             for (self.clients.items) |client| {
-                if (client.attached and client.paused) {
+                if (client.attached) {
                     // Send empty idle response (just header, no payload)
                     const header = Protocol.ResponseHeader{
                         .type = .idle,
@@ -598,14 +599,14 @@ pub const Master = struct {
                     };
                     _ = posix.write(client.fd, header.toBytes()) catch {};
                     sent_count += 1;
-                    log.info("sent idle to client fd={}", .{client.fd});
+                    log.info("sent idle to client fd={} (paused={})", .{ client.fd, client.paused });
                 }
             }
 
             if (sent_count > 0) {
-                log.info("idle detected: notified {} paused clients", .{sent_count});
+                log.info("idle detected: notified {} clients", .{sent_count});
             } else {
-                log.info("idle detected but no paused clients to notify", .{});
+                log.info("idle detected but no attached clients to notify", .{});
             }
             self.idle_notified = true;
         }
@@ -1015,6 +1016,17 @@ pub const Master = struct {
                         writeFramed(self.clients.items[idx].fd, .terminal_data, "\x1b[?25l");
                         log.debug("restored hidden cursor state", .{});
                     }
+                }
+
+                // Send idle notification if session is already idle
+                // This ensures clients that attach to an idle session get the notification
+                if (self.idle_notified) {
+                    const header = Protocol.ResponseHeader{
+                        .type = .idle,
+                        .len = 0,
+                    };
+                    _ = posix.write(self.clients.items[idx].fd, header.toBytes()) catch {};
+                    log.info("sent idle to newly attached client {} (session was already idle)", .{idx});
                 }
             },
             .detach => {
