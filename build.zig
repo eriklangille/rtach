@@ -91,6 +91,9 @@ pub fn build(b: *std.Build) void {
 
     const cross_step = b.step("cross", "Build for all deployment targets");
 
+    // Destination for iOS app resources
+    const clauntty_resources_path = "../clauntty/Clauntty/Resources/rtach/";
+
     for (cross_targets) |ct| {
         const resolved_target = b.resolveTargetQuery(ct.target);
 
@@ -114,5 +117,14 @@ pub fn build(b: *std.Build) void {
 
         const cross_install = b.addInstallArtifact(cross_exe, .{});
         cross_step.dependOn(&cross_install.step);
+
+        // Copy to clauntty resources directory
+        const copy_cmd = b.addSystemCommand(&.{
+            "cp",
+            b.fmt("zig-out/bin/rtach-{s}", .{ct.name}),
+            b.fmt("{s}rtach-{s}", .{ clauntty_resources_path, ct.name }),
+        });
+        copy_cmd.step.dependOn(&cross_install.step);
+        cross_step.dependOn(&copy_cmd.step);
     }
 }

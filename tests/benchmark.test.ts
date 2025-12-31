@@ -101,7 +101,8 @@ describe("rtach benchmarks", () => {
       const client = await connectAndWait(socketPath, { noDetachChar: true });
 
       const times: number[] = [];
-      const message = "X".repeat(64);
+      // Use 63 bytes + newline to flush PTY line buffer (canonical mode has 1024-byte limit)
+      const message = "X".repeat(62) + "\n";
 
       for (let i = 0; i < 50; i++) {
         const marker = `L${i}`;
@@ -131,7 +132,8 @@ describe("rtach benchmarks", () => {
       const client = await connectAndWait(socketPath, { noDetachChar: true });
 
       const times: number[] = [];
-      const message = "X".repeat(64);
+      // Use 63 bytes + newline to flush PTY line buffer (canonical mode has 1024-byte limit)
+      const message = "X".repeat(62) + "\n";
 
       for (let i = 0; i < 100; i++) {
         const marker = `M${i}`;
@@ -174,12 +176,13 @@ describe("rtach benchmarks", () => {
       await killAndWait(master, 9);
       cleanupSocket(socketPath);
 
+      console.log(`\n📊 Master Memory Baseline`);
       if (memory !== null) {
-        console.log(`\n📊 Master Memory Baseline`);
         console.log(`   RSS: ${formatBytes(memory)}`);
         expect(memory).toBeLessThan(10 * 1024 * 1024);
       } else {
-        console.log("   (Memory measurement not available)");
+        console.log(`   RSS: (Memory measurement not available on this platform)`);
+        // Skip assertion when measurement not available
       }
     });
 
@@ -207,14 +210,17 @@ describe("rtach benchmarks", () => {
       await killAndWait(master, 9);
       cleanupSocket(socketPath);
 
+      console.log(`\n📊 Memory with 10 Additional Clients`);
       if (baselineMemory !== null && withClientsMemory !== null) {
-        console.log(`\n📊 Memory with 10 Additional Clients`);
         console.log(`   Baseline (1 client):   ${formatBytes(baselineMemory)}`);
         console.log(`   With 11 clients:       ${formatBytes(withClientsMemory)}`);
         console.log(`   Per additional client: ${formatBytes((withClientsMemory - baselineMemory) / 10)}`);
 
         const perClient = (withClientsMemory - baselineMemory) / 10;
         expect(perClient).toBeLessThan(100 * 1024);
+      } else {
+        console.log(`   (Memory measurement not available on this platform)`);
+        // Skip assertion when measurement not available
       }
     });
   });

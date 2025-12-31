@@ -6,6 +6,7 @@ import {
   cleanupSocket,
   cleanupAll,
   socketExists,
+  fifoExists,
   waitForSocket,
   startDetachedMaster,
   connectClient,
@@ -19,6 +20,12 @@ import {
   sendScrollbackPageRequest,
   waitForScrollbackPageResponse,
   type RawRtachConnection,
+  // Protocol constants for raw mode tests
+  MessageType,
+  ResponseType,
+  RESPONSE_HEADER_SIZE,
+  HANDSHAKE_SIZE,
+  HANDSHAKE_MAGIC,
 } from "./helpers";
 
 describe("rtach CLI", () => {
@@ -654,5 +661,269 @@ describe("rtach paginated scrollback", () => {
     // Verify data contains our marker
     const dataStr = response.data.toString();
     expect(dataStr).toContain(marker);
+  });
+});
+
+describe("rtach command FIFO", () => {
+  let socketPath: string;
+  let master: ReturnType<typeof spawn>;
+
+  beforeEach(async () => {
+    socketPath = uniqueSocketPath();
+    master = await startDetachedMaster(socketPath, "/bin/cat");
+  });
+
+  afterEach(cleanupAll);
+
+  test("creates FIFO alongside socket", async () => {
+    // Socket should exist (verified by startDetachedMaster)
+    expect(socketExists(socketPath)).toBe(true);
+
+    // FIFO should also exist at {socket_path}.cmd
+    const fifoPath = `${socketPath}.cmd`;
+    expect(fifoExists(fifoPath)).toBe(true);
+  });
+
+  test("FIFO has correct permissions (0600)", async () => {
+    const fifoPath = `${socketPath}.cmd`;
+    const { statSync } = await import("fs");
+    const stat = statSync(fifoPath);
+    const mode = stat.mode & 0o777;
+    expect(mode).toBe(0o600);
+  });
+
+  test("FIFO receives commands and forwards to clients", async () => {
+    // Connect a client via raw socket with upgrade
+    const rawConn = await connectRawSocketWithUpgrade(socketPath);
+    sendAttachPacket(rawConn, "fifo-test-client");
+    await Bun.sleep(100);
+
+    // Clear any initial data
+    rawConn.dataBuffer = Buffer.alloc(0);
+
+    // Write a command to the FIFO
+    const fifoPath = `${socketPath}.cmd`;
+    const { writeFileSync } = await import("fs");
+    writeFileSync(fifoPath, "forward;8080\n");
+
+    // Wait for command response from server
+    const startTime = Date.now();
+    const timeoutMs = 2000;
+    let foundCommand = false;
+
+    while (Date.now() - startTime < timeoutMs) {
+      // Look for command response (type=2 is COMMAND)
+      if (rawConn.dataBuffer.length >= 5) {
+        const type = rawConn.dataBuffer[0];
+        const len = rawConn.dataBuffer.readUInt32LE(1);
+
+        if (type === 2 && rawConn.dataBuffer.length >= 5 + len) {
+          // Command response found
+          const cmdData = rawConn.dataBuffer.subarray(5, 5 + len);
+          const cmdStr = cmdData.toString();
+          if (cmdStr.includes("forward;8080")) {
+            foundCommand = true;
+            break;
+          }
+          // Consume this response and continue
+          rawConn.dataBuffer = rawConn.dataBuffer.subarray(5 + len);
+        } else if (rawConn.dataBuffer.length >= 5 + len) {
+          // Different response type, skip it
+          rawConn.dataBuffer = rawConn.dataBuffer.subarray(5 + len);
+        }
+      }
+      await Bun.sleep(50);
+    }
+
+    rawConn.close();
+    expect(foundCommand).toBe(true);
+  });
+
+  test("cleanup removes FIFO file", async () => {
+    const fifoPath = `${socketPath}.cmd`;
+
+    // Verify FIFO exists
+    expect(fifoExists(fifoPath)).toBe(true);
+
+    // Clean up
+    await killAndWait(master, 9);
+
+    // Give some time for cleanup
+    await Bun.sleep(100);
+
+    // FIFO should be removed (cleanupSocket handles this)
+    cleanupSocket(socketPath);
+    expect(fifoExists(fifoPath)).toBe(false);
+  });
+});
+
+describe("rtach raw mode (no upgrade)", () => {
+  let socketPath: string;
+  let master: ReturnType<typeof spawn>;
+
+  beforeEach(async () => {
+    socketPath = uniqueSocketPath();
+    master = await startDetachedMaster(socketPath, "/bin/cat");
+  });
+
+  afterEach(cleanupAll);
+
+  test("raw client receives unframed terminal data", async () => {
+    // Connect to socket directly
+    const rawConn = await connectRawSocket(socketPath);
+
+    // Wait for and consume handshake, but DO NOT send upgrade
+    const startTime = Date.now();
+    const handshakeFrameSize = RESPONSE_HEADER_SIZE + HANDSHAKE_SIZE;
+
+    while (Date.now() - startTime < 5000) {
+      if (rawConn.dataBuffer.length >= handshakeFrameSize) {
+        const type = rawConn.dataBuffer[0];
+        const len = rawConn.dataBuffer.readUInt32LE(1);
+
+        if (type === ResponseType.HANDSHAKE && len === HANDSHAKE_SIZE) {
+          // Parse and validate handshake
+          const magic = rawConn.dataBuffer.readUInt32LE(RESPONSE_HEADER_SIZE);
+          expect(magic).toBe(HANDSHAKE_MAGIC);
+
+          // Remove handshake from buffer - but DON'T send upgrade
+          rawConn.dataBuffer = rawConn.dataBuffer.subarray(handshakeFrameSize);
+          break;
+        }
+      }
+      await Bun.sleep(10);
+    }
+
+    // Send attach packet (without prior upgrade - this makes us a raw client)
+    sendAttachPacket(rawConn, "raw-test-client");
+    await Bun.sleep(100);
+
+    // Clear any scrollback data
+    rawConn.dataBuffer = Buffer.alloc(0);
+
+    // Send data through PTY - use a marker we can identify
+    const marker = `RAW_TEST_${Date.now()}`;
+    rawConn.socket.write(Buffer.from([MessageType.PUSH, marker.length, ...Buffer.from(marker)]));
+
+    // Wait for response - should be RAW terminal data (no framing header)
+    const timeoutMs = 2000;
+    const waitStart = Date.now();
+
+    while (Date.now() - waitStart < timeoutMs) {
+      if (rawConn.dataBuffer.length > 0) {
+        const dataStr = rawConn.dataBuffer.toString();
+
+        // Check if we got the marker in the response
+        if (dataStr.includes(marker)) {
+          // Verify it's NOT framed - first byte should NOT be 0 (terminal_data type)
+          // or if it is, the subsequent bytes shouldn't form a valid length header
+          // Actually, if it's raw, the first bytes should be our marker text directly
+          // A framed response would start with [0][length bytes][data]
+
+          // In raw mode, the data should be exactly what we sent (echo from cat)
+          // In framed mode, it would be [type=0][len=N][marker]
+
+          // The simplest check: if the data starts with our marker or contains it
+          // without a 5-byte header prefix, it's raw
+          const markerIndex = rawConn.dataBuffer.indexOf(marker);
+          expect(markerIndex).toBeGreaterThanOrEqual(0);
+
+          // For raw mode: the marker should be at the start (or very close)
+          // For framed mode: there would be a 5-byte header before it
+          // Since /bin/cat echoes back, we expect the marker relatively early
+          expect(markerIndex).toBeLessThan(10); // Raw mode - no header overhead
+
+          rawConn.close();
+          return;
+        }
+      }
+      await Bun.sleep(50);
+    }
+
+    rawConn.close();
+    throw new Error("Timeout waiting for raw response");
+  });
+
+  test("framed client receives framed terminal data", async () => {
+    // Connect with upgrade (framed mode) - for comparison
+    const rawConn = await connectRawSocketWithUpgrade(socketPath);
+    sendAttachPacket(rawConn, "framed-test-client");
+    await Bun.sleep(100);
+
+    // Clear any scrollback data
+    rawConn.dataBuffer = Buffer.alloc(0);
+
+    // Send data through PTY
+    const marker = `FRAMED_TEST_${Date.now()}`;
+    rawConn.socket.write(Buffer.from([MessageType.PUSH, marker.length, ...Buffer.from(marker)]));
+
+    // Wait for response - should be FRAMED (with header)
+    const timeoutMs = 2000;
+    const waitStart = Date.now();
+
+    while (Date.now() - waitStart < timeoutMs) {
+      if (rawConn.dataBuffer.length >= 5) {
+        const type = rawConn.dataBuffer[0];
+        const len = rawConn.dataBuffer.readUInt32LE(1);
+
+        // Should be terminal_data type (0)
+        if (type === 0 && rawConn.dataBuffer.length >= 5 + len) {
+          const data = rawConn.dataBuffer.subarray(5, 5 + len);
+          const dataStr = data.toString();
+
+          if (dataStr.includes(marker)) {
+            // Framed mode confirmed - data was wrapped with header
+            expect(type).toBe(0); // terminal_data
+            expect(len).toBeGreaterThan(0);
+            rawConn.close();
+            return;
+          }
+
+          // Consume this response
+          rawConn.dataBuffer = rawConn.dataBuffer.subarray(5 + len);
+        }
+      }
+      await Bun.sleep(50);
+    }
+
+    rawConn.close();
+    throw new Error("Timeout waiting for framed response");
+  });
+
+  test("raw client does not receive idle notifications", async () => {
+    // Connect as raw client (no upgrade)
+    const rawConn = await connectRawSocket(socketPath);
+
+    // Consume handshake without sending upgrade
+    const handshakeFrameSize = RESPONSE_HEADER_SIZE + HANDSHAKE_SIZE;
+    const startTime = Date.now();
+
+    while (Date.now() - startTime < 5000) {
+      if (rawConn.dataBuffer.length >= handshakeFrameSize) {
+        rawConn.dataBuffer = rawConn.dataBuffer.subarray(handshakeFrameSize);
+        break;
+      }
+      await Bun.sleep(10);
+    }
+
+    sendAttachPacket(rawConn, "raw-idle-test");
+    await Bun.sleep(100);
+    rawConn.dataBuffer = Buffer.alloc(0);
+
+    // Wait for idle timeout (2 seconds in master) plus some buffer
+    await Bun.sleep(3000);
+
+    // Raw client should NOT have received idle notification (type=4, len=0)
+    // Check if buffer contains idle header [4][0,0,0,0]
+    let foundIdle = false;
+    for (let i = 0; i < rawConn.dataBuffer.length - 4; i++) {
+      if (rawConn.dataBuffer[i] === 4 && rawConn.dataBuffer.readUInt32LE(i + 1) === 0) {
+        foundIdle = true;
+        break;
+      }
+    }
+
+    rawConn.close();
+    expect(foundIdle).toBe(false);
   });
 });

@@ -38,7 +38,9 @@ pub const Protocol = @import("protocol.zig");
 /// 2.2.0 - Phase 2 network optimization complete: pause/resume/idle working
 /// 2.3.0 - OSC 0/1/2 title parsing: saves terminal title to .title file for session picker
 /// 2.4.0 - Shell integration: bash/zsh/fish set title to current directory and running command
-pub const version = "2.4.0";
+/// 2.5.0 - FIFO command channel: RTACH_CMD_PIPE env var points to named FIFO for commands
+///         Scripts write to this path (works even when spawned by Claude Code which closes FDs)
+pub const version = "2.5.0";
 
 pub const std_options: std.Options = .{
     .log_level = .info,
@@ -65,8 +67,8 @@ fn timestampedLog(
     const now_s = @divFloor(now_ns, std.time.ns_per_s);
     const subsec_ms = @divFloor(@rem(now_ns, std.time.ns_per_s), std.time.ns_per_ms);
 
-    // Get process ID
-    const pid = std.os.linux.getpid();
+    // Get process ID (cross-platform)
+    const pid = std.c.getpid();
 
     // Write to stderr using posix.write (zig 0.15 compatible)
     var buf: [4096]u8 = undefined;

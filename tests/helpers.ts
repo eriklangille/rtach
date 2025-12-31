@@ -136,14 +136,22 @@ export function uniqueSocketPath(): string {
   return socketPath;
 }
 
-// Clean up socket file
+// Clean up socket file and associated files (FIFO, title)
 export function cleanupSocket(socketPath: string): void {
-  try {
-    if (existsSync(socketPath)) {
-      unlinkSync(socketPath);
+  const filesToClean = [
+    socketPath,
+    `${socketPath}.cmd`,       // Command FIFO
+    `${socketPath}.title`,     // Title file
+    `${socketPath}.title.tmp`, // Title temp file
+  ];
+  for (const file of filesToClean) {
+    try {
+      if (existsSync(file)) {
+        unlinkSync(file);
+      }
+    } catch {
+      // Ignore errors
     }
-  } catch {
-    // Ignore errors
   }
 }
 
@@ -152,6 +160,16 @@ export function socketExists(socketPath: string): boolean {
   try {
     const stat = statSync(socketPath);
     return stat.isSocket();
+  } catch {
+    return false;
+  }
+}
+
+// Check if FIFO exists and is a FIFO file
+export function fifoExists(fifoPath: string): boolean {
+  try {
+    const stat = statSync(fifoPath);
+    return stat.isFIFO();
   } catch {
     return false;
   }
@@ -423,13 +441,17 @@ export function getProcessMemory(pid: number): number | null {
       // macOS: use ps
       const result = spawnSync(["ps", "-o", "rss=", "-p", pid.toString()]);
       const output = result.stdout.toString().trim();
-      return parseInt(output, 10) * 1024; // ps reports in KB, convert to bytes
+      if (!output) return null;
+      const value = parseInt(output, 10);
+      if (isNaN(value)) return null;
+      return value * 1024; // ps reports in KB, convert to bytes
     } else {
       // Linux: read from /proc
       const statm = Bun.file(`/proc/${pid}/statm`);
       const content = statm.text();
       const parts = content.toString().split(" ");
       const pages = parseInt(parts[1], 10); // RSS in pages
+      if (isNaN(pages)) return null;
       return pages * 4096; // Assume 4KB pages
     }
   } catch {

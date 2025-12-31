@@ -102,6 +102,7 @@ extern "c" fn grantpt(fd: c_int) c_int;
 extern "c" fn unlockpt(fd: c_int) c_int;
 extern "c" fn ptsname(fd: c_int) ?[*:0]const u8;
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn mkfifo(path: [*:0]const u8, mode: posix.mode_t) c_int;
 
 pub const MasterOptions = struct {
     socket_path: []const u8,
@@ -137,13 +138,14 @@ pub const Master = struct {
     pty_slave_path: [256]u8 = undefined,
     child_pid: posix.pid_t = 0,
 
-    // Command pipe - for scripts to send commands to Clauntty
-    // Write end passed to child as RTACH_CMD_FD, read end monitored by master
-    cmd_pipe_read: posix.fd_t = -1,
-    cmd_pipe_write: posix.fd_t = -1,
-    cmd_pipe_stream: xev.Stream = undefined,
-    cmd_pipe_completion: xev.Completion = .{},
-    cmd_pipe_buf: [512]u8 = undefined,
+    // Command FIFO - for scripts to send commands to Clauntty
+    // FIFO path is {socket_path}.cmd, exposed as RTACH_CMD_PIPE env var
+    cmd_fifo_fd: posix.fd_t = -1,
+    cmd_fifo_path: [512]u8 = undefined,
+    cmd_fifo_path_len: usize = 0,
+    cmd_fifo_stream: xev.Stream = undefined,
+    cmd_fifo_completion: xev.Completion = .{},
+    cmd_fifo_buf: [512]u8 = undefined,
     cmd_line_buf: [512]u8 = undefined, // Buffer for accumulating partial lines
     cmd_line_len: usize = 0,
 
@@ -303,20 +305,49 @@ pub const Master = struct {
         self.pty_master = master_fd;
         self.pty_stream = xev.Stream.initFd(master_fd);
 
-        // Create command pipe for scripts to send commands to Clauntty
-        // Use pipe2 with O_NONBLOCK - both ends non-blocking is fine
-        // (parent reads async via xev, child writes small commands that fit in pipe buffer)
-        const cmd_pipe = try posix.pipe2(.{ .NONBLOCK = true });
-        self.cmd_pipe_read = cmd_pipe[0];
-        self.cmd_pipe_write = cmd_pipe[1];
+        // Create command FIFO for scripts to send commands to Clauntty
+        // FIFO path is {socket_path}.cmd - scripts write to this path via RTACH_CMD_PIPE env var
+        // This works even when subprocess FDs are closed (unlike inherited pipe FDs)
+        const fifo_path_slice = std.fmt.bufPrint(&self.cmd_fifo_path, "{s}.cmd", .{self.options.socket_path}) catch {
+            return error.FifoPathTooLong;
+        };
+        self.cmd_fifo_path_len = fifo_path_slice.len;
+        self.cmd_fifo_path[fifo_path_slice.len] = 0; // null-terminate for C functions
 
-        self.cmd_pipe_stream = xev.Stream.initFd(self.cmd_pipe_read);
+        // Get a null-terminated pointer for C functions
+        const fifo_path_z: [*:0]const u8 = @ptrCast(&self.cmd_fifo_path);
+
+        // Remove any existing FIFO
+        _ = std.c.unlink(fifo_path_z);
+
+        // Create FIFO with mode 0600
+        const mkfifo_result = mkfifo(fifo_path_z, 0o600);
+        if (mkfifo_result != 0) {
+            const err = std.c._errno().*;
+            log.err("mkfifo failed for path '{s}': errno={}", .{ self.cmd_fifo_path[0..self.cmd_fifo_path_len], err });
+            return error.MkfifoFailed;
+        }
+        log.info("created command FIFO at {s}", .{self.cmd_fifo_path[0..self.cmd_fifo_path_len]});
+
+        // Open FIFO with O_RDWR | O_NONBLOCK
+        // O_RDWR keeps at least one "writer" attached (ourselves), preventing immediate EOF
+        self.cmd_fifo_fd = posix.open(
+            self.cmd_fifo_path[0..self.cmd_fifo_path_len :0],
+            .{ .ACCMODE = .RDWR, .NONBLOCK = true },
+            0,
+        ) catch |err| {
+            log.err("failed to open command FIFO: {}", .{err});
+            _ = std.c.unlink(fifo_path_z);
+            return err;
+        };
+
+        self.cmd_fifo_stream = xev.Stream.initFd(self.cmd_fifo_fd);
 
         const pid = try posix.fork();
         if (pid == 0) {
             // Child process
             posix.close(master_fd);
-            posix.close(self.cmd_pipe_read); // Close read end in child
+            posix.close(self.cmd_fifo_fd); // Close parent's FIFO fd in child
             _ = posix.setsid() catch {};
 
             const slave_fd = posix.openZ(
@@ -337,10 +368,9 @@ pub const Master = struct {
             posix.dup2(slave_fd, 2) catch {};
             if (slave_fd > 2) posix.close(slave_fd);
 
-            // Set RTACH_CMD_FD environment variable for scripts to send commands
-            var fd_buf: [16:0]u8 = undefined;
-            _ = std.fmt.bufPrintZ(&fd_buf, "{}", .{self.cmd_pipe_write}) catch unreachable;
-            _ = setenv("RTACH_CMD_FD", &fd_buf, 1);
+            // Set RTACH_CMD_PIPE environment variable for scripts to send commands
+            // This is the path to the FIFO that scripts can write to
+            _ = setenv("RTACH_CMD_PIPE", fifo_path_z, 1);
 
             // Deploy shell integration files
             ShellIntegration.deployIntegrationFiles() catch |err| {
@@ -393,11 +423,7 @@ pub const Master = struct {
 
         self.child_pid = pid;
 
-        // Close write end in parent - only child writes to command pipe
-        posix.close(self.cmd_pipe_write);
-        self.cmd_pipe_write = -1;
-
-        log.info("started child pid={} command={s}, cmd_fd={}", .{ pid, self.options.command, self.cmd_pipe_read });
+        log.info("started child pid={} command={s}, fifo={s}", .{ pid, self.options.command, self.cmd_fifo_path[0..self.cmd_fifo_path_len] });
     }
 
     fn closePty(self: *Master) void {
@@ -405,13 +431,15 @@ pub const Master = struct {
             posix.close(self.pty_master);
             self.pty_master = -1;
         }
-        if (self.cmd_pipe_read >= 0) {
-            posix.close(self.cmd_pipe_read);
-            self.cmd_pipe_read = -1;
+        if (self.cmd_fifo_fd >= 0) {
+            posix.close(self.cmd_fifo_fd);
+            self.cmd_fifo_fd = -1;
         }
-        if (self.cmd_pipe_write >= 0) {
-            posix.close(self.cmd_pipe_write);
-            self.cmd_pipe_write = -1;
+        // Remove the FIFO file
+        if (self.cmd_fifo_path_len > 0) {
+            const fifo_path_z: [*:0]const u8 = @ptrCast(&self.cmd_fifo_path);
+            _ = std.c.unlink(fifo_path_z);
+            self.cmd_fifo_path_len = 0;
         }
         if (self.child_pid > 0) {
             _ = posix.kill(self.child_pid, posix.SIG.TERM) catch {};
@@ -432,15 +460,15 @@ pub const Master = struct {
             ptyReadCallback,
         );
 
-        // Set up command pipe read (for scripts to send commands to clients)
-        if (self.cmd_pipe_read >= 0) {
-            self.cmd_pipe_stream.read(
+        // Set up command FIFO read (for scripts to send commands to clients)
+        if (self.cmd_fifo_fd >= 0) {
+            self.cmd_fifo_stream.read(
                 &self.loop,
-                &self.cmd_pipe_completion,
-                .{ .slice = &self.cmd_pipe_buf },
+                &self.cmd_fifo_completion,
+                .{ .slice = &self.cmd_fifo_buf },
                 Master,
                 self,
-                cmdPipeReadCallback,
+                cmdFifoReadCallback,
             );
         }
 
@@ -522,11 +550,16 @@ pub const Master = struct {
         // Store in scrollback
         self.scrollback.write(data);
 
-        // Forward to all attached, non-paused clients (framed)
+        // Forward to all attached, non-paused clients
         // Paused clients will receive buffered data when they resume
         for (self.clients.items) |client| {
             if (client.attached and !client.paused) {
-                writeFramed(client.fd, .terminal_data, data);
+                if (client.framed_mode) {
+                    writeFramed(client.fd, .terminal_data, data);
+                } else {
+                    // Raw mode - send terminal data without framing
+                    _ = posix.write(client.fd, data) catch {};
+                }
             }
         }
 
@@ -587,11 +620,12 @@ pub const Master = struct {
         }
 
         if (elapsed >= IDLE_THRESHOLD_NS and !self.idle_notified) {
-            // Send idle notification to all attached clients
+            // Send idle notification to all attached framed clients
             // Active clients need it for UI indicator, paused clients for pre-fetch trigger
+            // Raw clients don't understand protocol headers (would see 5 bytes garbage)
             var sent_count: usize = 0;
             for (self.clients.items) |client| {
-                if (client.attached) {
+                if (client.attached and client.framed_mode) {
                     // Send empty idle response (just header, no payload)
                     const header = Protocol.ResponseHeader{
                         .type = .idle,
@@ -626,7 +660,7 @@ pub const Master = struct {
         return .disarm;
     }
 
-    fn cmdPipeReadCallback(
+    fn cmdFifoReadCallback(
         self_opt: ?*Master,
         loop: *xev.Loop,
         _: *xev.Completion,
@@ -638,29 +672,37 @@ pub const Master = struct {
 
         const n = result catch |err| {
             if (err == error.Again) {
-                // Re-arm command pipe read
-                self.cmd_pipe_stream.read(
+                // Re-arm command FIFO read
+                self.cmd_fifo_stream.read(
                     loop,
-                    &self.cmd_pipe_completion,
-                    .{ .slice = &self.cmd_pipe_buf },
+                    &self.cmd_fifo_completion,
+                    .{ .slice = &self.cmd_fifo_buf },
                     Master,
                     self,
-                    cmdPipeReadCallback,
+                    cmdFifoReadCallback,
                 );
                 return .disarm;
             }
-            log.warn("command pipe read error: {}", .{err});
+            log.warn("command FIFO read error: {}", .{err});
             return .disarm;
         };
 
         if (n == 0) {
-            // Pipe closed (child exited) - this is normal
-            log.debug("command pipe closed", .{});
+            // FIFO opened with O_RDWR shouldn't get EOF, but handle gracefully
+            // Re-arm to wait for more data
+            self.cmd_fifo_stream.read(
+                loop,
+                &self.cmd_fifo_completion,
+                .{ .slice = &self.cmd_fifo_buf },
+                Master,
+                self,
+                cmdFifoReadCallback,
+            );
             return .disarm;
         }
 
         // Process incoming bytes, looking for newline-delimited commands
-        const data = self.cmd_pipe_buf[0..n];
+        const data = self.cmd_fifo_buf[0..n];
         for (data) |byte| {
             if (byte == '\n') {
                 // Complete command - send to clients
@@ -677,14 +719,14 @@ pub const Master = struct {
             }
         }
 
-        // Re-arm command pipe read
-        self.cmd_pipe_stream.read(
+        // Re-arm command FIFO read
+        self.cmd_fifo_stream.read(
             loop,
-            &self.cmd_pipe_completion,
-            .{ .slice = &self.cmd_pipe_buf },
+            &self.cmd_fifo_completion,
+            .{ .slice = &self.cmd_fifo_buf },
             Master,
             self,
-            cmdPipeReadCallback,
+            cmdFifoReadCallback,
         );
         return .disarm;
     }
@@ -888,8 +930,7 @@ pub const Master = struct {
                 if (feed_result.consumed == 0) break;
             }
         } else {
-            // Raw mode: forward input to PTY, but watch for upgrade packet
-            // Upgrade packet is [type=7, len=0] = 2 bytes
+            // Raw mode: forward input to PTY, but watch for upgrade/attach packets
             var data = client.read_buf[0..n];
 
             // Check if data starts with upgrade packet [7, 0]
@@ -916,8 +957,26 @@ pub const Master = struct {
                         if (feed_result.consumed == 0) break;
                     }
                 }
+            } else if (data.len >= 2 and data[0] == @intFromEnum(Protocol.MessageType.attach)) {
+                // Attach packet in raw mode - process it (raw clients can still attach)
+                const payload_len = data[1];
+                const packet_len = 2 + @as(usize, payload_len);
+                if (data.len >= packet_len) {
+                    // Parse as attach packet using Packet.init
+                    const pkt = Protocol.Packet.init(.attach, data[2..packet_len]);
+                    self.handleClientPacket(idx, pkt) catch {
+                        self.removeClient(idx);
+                        return .disarm;
+                    };
+                    // Forward remaining data to PTY (if any)
+                    if (data.len > packet_len) {
+                        _ = posix.write(self.pty_master, data[packet_len..]) catch |err| {
+                            log.warn("failed to write to PTY: {}", .{err});
+                        };
+                    }
+                }
             } else {
-                // Not upgrade - forward to PTY as raw input
+                // Forward to PTY as raw input
                 _ = posix.write(self.pty_master, data) catch |err| {
                     log.warn("failed to write to PTY: {}", .{err});
                 };
