@@ -2,23 +2,9 @@
 
 A modern replacement for dtach, built with Zig and libxev for high-performance terminal session persistence with scrollback replay.
 
-## Motivation
+## Why rtach?
 
-**Problem**: When using SSH terminals (like Clauntty), network disconnects kill your session. dtach solves session persistence but has limitations:
-
-1. **No scrollback buffer** - On reattach, screen is blank until new output
-2. **Uses `select()`** - O(n) performance, outdated API
-3. **No cross-platform async I/O** - No kqueue/epoll/io_uring support
-
-**Solution**: rtach adds scrollback replay while using modern async I/O via libxev.
-
-## Goals
-
-1. **Drop-in dtach compatibility** - Same CLI flags, same behavior
-2. **Scrollback replay** - Buffer terminal output, replay on reattach
-3. **Modern I/O** - kqueue (macOS), epoll (Linux), io_uring (Linux 5.1+)
-4. **Easy cross-compilation** - Zig compiles to any target trivially
-5. **Full testability** - Integration tests validate dtach parity
+dtach provides session persistence but lacks scrollback replay and uses outdated `select()`. rtach adds scrollback buffer replay and modern async I/O (kqueue/epoll/io_uring) via libxev.
 
 ## Architecture
 
@@ -101,17 +87,10 @@ rtach is designed to be auto-deployed by Clauntty to remote servers:
 
 ## Testing
 
-Integration tests use Bun to validate:
-1. Session creation and persistence
-2. Detach/reattach cycle
-3. Scrollback buffer replay
-4. Window resize handling
-5. Multi-client attach
-6. Protocol handshake and upgrade
-
 ```bash
-# Run integration tests
-cd tests && bun test
+zig build test              # Unit tests
+zig build integration-test  # Functional tests (requires bun)
+zig build test-all          # Both
 ```
 
 ## Files
@@ -121,12 +100,13 @@ cd tests && bun test
 | `src/main.zig` | CLI entry point, argument parsing |
 | `src/master.zig` | Master process: PTY, socket, event loop |
 | `src/client.zig` | Client attach logic, terminal raw mode |
-| `src/ringbuffer.zig` | Scrollback storage |
 | `src/protocol.zig` | Packet format for client-master communication |
+| `src/ringbuffer.zig` | Scrollback storage |
+| `src/shell_integration.zig` | Shell integration for bash/zsh/fish |
 
 ## Protocol
 
-rtach 2.0 uses a framed protocol with handshake for reliable communication.
+rtach uses a framed protocol (v2.x) with handshake for reliable communication.
 
 ### Protocol Upgrade Flow
 
@@ -166,11 +146,13 @@ Client connects
 | 0 | `push` | Terminal input data |
 | 1 | `attach` | Client ID (16 bytes, optional) |
 | 2 | `detach` | None |
-| 3 | `winch` | rows (2B) + cols (2B) |
+| 3 | `winch` | rows (2B) + cols (2B) + xpixel (2B) + ypixel (2B) |
 | 4 | `redraw` | None |
 | 5 | `request_scrollback` | None (legacy) |
 | 6 | `request_scrollback_page` | offset (4B) + limit (4B) |
 | 7 | `upgrade` | None (switches to framed mode) |
+| 8 | `pause` | None (pause terminal output streaming) |
+| 9 | `resume` | None (resume terminal output streaming) |
 
 ### Server → Client Frames
 
@@ -187,6 +169,7 @@ Client connects
 | 1 | `scrollback` | Legacy scrollback data |
 | 2 | `command` | Command from scripts |
 | 3 | `scrollback_page` | meta (8B) + data |
+| 4 | `idle` | None (shell idle, sent after 2s of no PTY output) |
 | 255 | `handshake` | magic (4B) + version (2B) + flags (2B) |
 
 ### Handshake Format
@@ -204,24 +187,21 @@ Client connects
 
 ### Why Protocol Upgrade?
 
-The upgrade protocol solves a key problem: **the client may not know if rtach is running**.
-
-- If rtach is running: handshake is sent, client upgrades to framed mode
-- If rtach is NOT running (e.g., `--help`, error, or direct shell): raw output is passed through to terminal
-- Client scans incoming data for handshake pattern, forwarding non-handshake data as terminal output
-- This allows raw output (help text, errors) to be displayed before the session starts
+Upgrade allows raw output (help text, errors) to pass through before rtach starts, while enabling framed mode once handshake is received.
 
 ## Version History
 
 | Version | Changes |
 |---------|---------|
-| 2.0.1 | Protocol upgrade flow, framed terminal data |
-| 2.0.0 | Framed protocol with handshake |
-| 1.9.0 | Command pipe ($RTACH_CMD_FD) |
+| 2.5.x | FIFO command channel (RTACH_CMD_PIPE), multiline paste fix |
+| 2.4.0 | Shell integration (bash/zsh/fish title updates) |
+| 2.3.0 | OSC title parsing (.title file for session picker) |
+| 2.1.0 | Pause/resume/idle for battery optimization |
+| 2.0.x | Framed protocol with handshake |
+| 1.9.0 | Command pipe |
 | 1.8.x | Cursor visibility, SIGWINCH fixes |
 | 1.7.0 | Client ID for deduplication |
 | 1.6.x | Paginated scrollback |
-| 1.5.0 | Initial scrollback limit (16KB) |
 
 ## References
 

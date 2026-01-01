@@ -24,6 +24,10 @@ pub const Client = struct {
     orig_termios: ?std.c.termios = null,
     running: bool = true,
     stdin_framed: bool = false, // True after iOS sends upgrade packet
+    // Buffer for incomplete framed packets (when packet spans multiple reads)
+    // 4KB buffer handles packets up to ~16 max-size push packets
+    stdin_buffer: [4096]u8 = undefined,
+    stdin_buffered: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, options: ClientOptions) !*Client {
         const self = try allocator.create(Client);
@@ -272,11 +276,20 @@ pub const Client = struct {
     }
 
     fn handleStdin(self: *Client) !bool {
-        var buf: [256]u8 = undefined;
-        const n = try posix.read(STDIN_FILENO, &buf);
+        // Read into remaining space in stdin_buffer (after any buffered data)
+        const space_left = self.stdin_buffer.len - self.stdin_buffered;
+        if (space_left == 0) {
+            // Buffer full with incomplete data - shouldn't happen with 4KB buffer
+            log.warn("stdin_buffer full, discarding", .{});
+            self.stdin_buffered = 0;
+            return false;
+        }
+
+        const n = try posix.read(STDIN_FILENO, self.stdin_buffer[self.stdin_buffered..]);
         if (n == 0) return true;
 
-        var data = buf[0..n];
+        self.stdin_buffered += n;
+        var data = self.stdin_buffer[0..self.stdin_buffered];
 
         // Check for upgrade packet from iOS if not already in framed mode
         if (!self.stdin_framed) {
@@ -284,26 +297,37 @@ pub const Client = struct {
                 // iOS sent upgrade, switch to framed stdin parsing
                 self.stdin_framed = true;
                 data = data[2..]; // Skip upgrade packet
-                if (data.len == 0) return false;
+                // Update buffer to skip upgrade packet
+                if (data.len > 0) {
+                    std.mem.copyForwards(u8, &self.stdin_buffer, data);
+                    self.stdin_buffered = data.len;
+                    data = self.stdin_buffer[0..self.stdin_buffered];
+                } else {
+                    self.stdin_buffered = 0;
+                    return false;
+                }
             }
         }
 
         if (self.stdin_framed) {
             // Parse framed packets from iOS
             var offset: usize = 0;
+            var pkt_count: usize = 0;
             while (offset + 2 <= data.len) {
                 const pkt_type = data[offset];
                 const pkt_len = data[offset + 1];
+                const pkt_len_usize: usize = @as(usize, pkt_len);
 
-                if (offset + 2 + pkt_len > data.len) break; // Incomplete packet
+                if (offset + 2 + pkt_len_usize > data.len) {
+                    break; // Incomplete packet - wait for more data
+                }
 
+                pkt_count += 1;
                 if (pkt_type == @intFromEnum(Protocol.MessageType.push)) {
-                    // Forward push payload to master
-                    const payload = data[offset + 2 ..][0..pkt_len];
-                    if (payload.len > 0) {
-                        const pkt = Protocol.Packet.init(.push, payload);
-                        _ = try posix.write(self.socket_fd, pkt.serialize());
-                    }
+                    // Forward the raw packet (header + payload) to master
+                    const packet_size: usize = 2 + pkt_len_usize;
+                    const raw_packet = data[offset..][0..packet_size];
+                    _ = posix.write(self.socket_fd, raw_packet) catch return error.BrokenPipe;
                 } else if (pkt_type == @intFromEnum(Protocol.MessageType.winch)) {
                     // Forward winch to master
                     if (pkt_len == 8) {
@@ -317,6 +341,7 @@ pub const Client = struct {
                         _ = try posix.write(self.socket_fd, pkt.serialize());
                     }
                 } else if (pkt_type == @intFromEnum(Protocol.MessageType.detach)) {
+                    self.stdin_buffered = 0;
                     return true; // Detach
                 } else if (pkt_type == @intFromEnum(Protocol.MessageType.pause)) {
                     // Forward pause to master
@@ -328,14 +353,25 @@ pub const Client = struct {
                     _ = try posix.write(self.socket_fd, pkt.serialize());
                 }
                 // Other packet types: ignore
-
-                offset += 2 + pkt_len;
+                offset += 2 + pkt_len_usize;
             }
+
+            // Keep unprocessed data in buffer for next read
+            if (offset > 0 and offset < data.len) {
+                const remaining = data.len - offset;
+                std.mem.copyForwards(u8, &self.stdin_buffer, data[offset..]);
+                self.stdin_buffered = remaining;
+            } else if (offset >= data.len) {
+                // All data consumed
+                self.stdin_buffered = 0;
+            }
+            // If offset == 0 and we have incomplete data, keep it all buffered (stdin_buffered unchanged)
         } else {
             // Raw mode: check for detach character and forward to master
             if (self.options.detach_char) |detach_char| {
                 for (data) |c| {
                     if (c == detach_char) {
+                        self.stdin_buffered = 0;
                         return true; // Detach
                     }
                 }
@@ -349,6 +385,8 @@ pub const Client = struct {
                 _ = try posix.write(self.socket_fd, pkt.serialize());
                 offset += chunk_size;
             }
+            // Raw mode always consumes all data
+            self.stdin_buffered = 0;
         }
 
         return false;

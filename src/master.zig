@@ -927,7 +927,9 @@ pub const Master = struct {
                     };
                 }
 
-                if (feed_result.consumed == 0) break;
+                if (feed_result.consumed == 0) {
+                    break;
+                }
             }
         } else {
             // Raw mode: forward input to PTY, but watch for upgrade/attach packets

@@ -99,7 +99,7 @@ pub fn build(b: *std.Build) void {
 
         const cross_xev = b.dependency("libxev", .{
             .target = resolved_target,
-            .optimize = .ReleaseFast,
+            .optimize = optimize, // Use command-line optimize option
         });
 
         const cross_exe = b.addExecutable(.{
@@ -107,8 +107,8 @@ pub fn build(b: *std.Build) void {
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/main.zig"),
                 .target = resolved_target,
-                .optimize = .ReleaseFast,
-                .strip = true,
+                .optimize = optimize, // Use command-line optimize option
+                .strip = optimize != .Debug, // Only strip in release builds
                 .link_libc = true,
             }),
         });

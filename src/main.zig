@@ -40,7 +40,9 @@ pub const Protocol = @import("protocol.zig");
 /// 2.4.0 - Shell integration: bash/zsh/fish set title to current directory and running command
 /// 2.5.0 - FIFO command channel: RTACH_CMD_PIPE env var points to named FIFO for commands
 ///         Scripts write to this path (works even when spawned by Claude Code which closes FDs)
-pub const version = "2.5.0";
+/// 2.5.1 - Fix: client.zig stdin buffer increased from 256 to 4096 bytes, added partial packet buffering
+///         This fixes multiline paste where packets > 256 bytes were being dropped
+pub const version = "2.5.1";
 
 pub const std_options: std.Options = .{
     .log_level = .info,
