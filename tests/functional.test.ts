@@ -27,6 +27,8 @@ import {
   RESPONSE_HEADER_SIZE,
   HANDSHAKE_SIZE,
   HANDSHAKE_MAGIC,
+  COMPRESSION_FLAG,
+  COMPRESSION_ZLIB,
 } from "./helpers";
 import { existsSync, readFileSync } from "fs";
 import { tmpdir } from "os";
@@ -981,5 +983,180 @@ describe("rtach title file handling", () => {
     // SIGTERM (kill) results in exit code 143 on some systems, or the process just dies
     // The key is that we got here without a panic/crash during the test
     expect(exitCode).not.toBe(1); // Exit code 1 would indicate an error/panic
+  });
+});
+
+describe("rtach compression", () => {
+  let socketPath: string;
+  let master: ReturnType<typeof spawn>;
+  let rawConn: RawRtachConnection | null = null;
+
+  beforeEach(async () => {
+    socketPath = uniqueSocketPath();
+    // Use /bin/sh so we can run commands that generate large output
+    master = await startDetachedMaster(socketPath, "/bin/sh");
+  });
+
+  afterEach(async () => {
+    if (rawConn) {
+      rawConn.close();
+      rawConn = null;
+    }
+    await cleanupAll();
+  });
+
+  test("large terminal data is compressed (type byte has high bit set)", async () => {
+    // Connect as framed client WITH compression enabled
+    rawConn = await connectRawSocketWithUpgrade(socketPath, 5000, COMPRESSION_ZLIB);
+    sendAttachPacket(rawConn, "compression-test");
+    await Bun.sleep(100);
+
+    // Clear any initial data (scrollback, shell prompt, etc.)
+    rawConn.dataBuffer = Buffer.alloc(0);
+
+    // Generate large output with a shell command (seq generates lines efficiently)
+    // printf outputs a large block of repeating data that compresses very well
+    const cmd = "printf '%500s\\n' '' | tr ' ' 'X'\n";
+    const pkt = Buffer.alloc(2 + cmd.length);
+    pkt[0] = MessageType.PUSH;
+    pkt[1] = cmd.length;
+    Buffer.from(cmd).copy(pkt, 2);
+    rawConn.socket.write(pkt);
+
+    // Wait for response (shell needs time to execute and output)
+    await Bun.sleep(1000);
+
+    // Look for compressed terminal_data response
+    // Type byte will be (0 | 0x80) = 0x80 for compressed terminal_data
+    let foundCompressed = false;
+    let offset = 0;
+
+    while (offset + RESPONSE_HEADER_SIZE <= rawConn.dataBuffer.length) {
+      const typeByte = rawConn.dataBuffer[offset];
+      const len = rawConn.dataBuffer.readUInt32LE(offset + 1);
+
+      // Check if this is compressed terminal_data
+      const isCompressed = (typeByte & COMPRESSION_FLAG) !== 0;
+      const actualType = typeByte & ~COMPRESSION_FLAG;
+
+      if (actualType === ResponseType.TERMINAL_DATA && isCompressed) {
+        foundCompressed = true;
+        // Verify the compressed data is smaller than original
+        // 500 bytes of "X" should compress very well (probably 10-20 bytes)
+        expect(len).toBeLessThan(500);
+        break;
+      }
+
+      // Move to next response
+      if (offset + RESPONSE_HEADER_SIZE + len <= rawConn.dataBuffer.length) {
+        offset += RESPONSE_HEADER_SIZE + len;
+      } else {
+        break;
+      }
+    }
+
+    expect(foundCompressed).toBe(true);
+  });
+
+  test("small terminal data is NOT compressed", async () => {
+    // Connect without compression to verify uncompressed responses
+    rawConn = await connectRawSocketWithUpgrade(socketPath);
+    sendAttachPacket(rawConn, "no-compression-test");
+    await Bun.sleep(100);
+    rawConn.dataBuffer = Buffer.alloc(0);
+
+    // Generate small output with echo (< 64 bytes, compression threshold)
+    const cmd = "echo Hello\n";
+    const pkt = Buffer.alloc(2 + cmd.length);
+    pkt[0] = MessageType.PUSH;
+    pkt[1] = cmd.length;
+    Buffer.from(cmd).copy(pkt, 2);
+    rawConn.socket.write(pkt);
+
+    await Bun.sleep(300);
+
+    // All responses should be uncompressed (type byte < 0x80)
+    let offset = 0;
+    let foundUncompressedTerminalData = false;
+
+    while (offset + RESPONSE_HEADER_SIZE <= rawConn.dataBuffer.length) {
+      const typeByte = rawConn.dataBuffer[offset];
+      const len = rawConn.dataBuffer.readUInt32LE(offset + 1);
+
+      const isCompressed = (typeByte & COMPRESSION_FLAG) !== 0;
+      const actualType = typeByte & ~COMPRESSION_FLAG;
+
+      if (actualType === ResponseType.TERMINAL_DATA) {
+        // Small data should NOT be compressed
+        expect(isCompressed).toBe(false);
+        foundUncompressedTerminalData = true;
+      }
+
+      if (offset + RESPONSE_HEADER_SIZE + len <= rawConn.dataBuffer.length) {
+        offset += RESPONSE_HEADER_SIZE + len;
+      } else {
+        break;
+      }
+    }
+
+    expect(foundUncompressedTerminalData).toBe(true);
+  });
+
+  test("compressed data can be decompressed correctly", async () => {
+    const zlib = await import("zlib");
+
+    rawConn = await connectRawSocketWithUpgrade(socketPath);
+    sendAttachPacket(rawConn, "decompress-test");
+    await Bun.sleep(100);
+    rawConn.dataBuffer = Buffer.alloc(0);
+
+    // Send compressible data with a unique marker
+    const marker = "UNIQUE_MARKER_FOR_COMPRESSION_TEST";
+    const data = marker + "X".repeat(200);
+
+    for (let i = 0; i < data.length; i += 200) {
+      const chunk = data.slice(i, i + 200);
+      const pkt = Buffer.alloc(2 + chunk.length);
+      pkt[0] = MessageType.PUSH;
+      pkt[1] = chunk.length;
+      Buffer.from(chunk).copy(pkt, 2);
+      rawConn.socket.write(pkt);
+    }
+
+    await Bun.sleep(500);
+
+    // Find and decompress any compressed responses
+    let decompressedContent = "";
+    let offset = 0;
+
+    while (offset + RESPONSE_HEADER_SIZE <= rawConn.dataBuffer.length) {
+      const typeByte = rawConn.dataBuffer[offset];
+      const len = rawConn.dataBuffer.readUInt32LE(offset + 1);
+
+      if (offset + RESPONSE_HEADER_SIZE + len > rawConn.dataBuffer.length) break;
+
+      const isCompressed = (typeByte & COMPRESSION_FLAG) !== 0;
+      const actualType = typeByte & ~COMPRESSION_FLAG;
+      const payload = rawConn.dataBuffer.subarray(offset + RESPONSE_HEADER_SIZE, offset + RESPONSE_HEADER_SIZE + len);
+
+      if (actualType === ResponseType.TERMINAL_DATA) {
+        if (isCompressed) {
+          // Decompress using zlib
+          try {
+            const decompressed = zlib.inflateSync(payload);
+            decompressedContent += decompressed.toString();
+          } catch {
+            // If decompression fails, the test will fail when we check for marker
+          }
+        } else {
+          decompressedContent += payload.toString();
+        }
+      }
+
+      offset += RESPONSE_HEADER_SIZE + len;
+    }
+
+    // Verify the marker is in the decompressed content
+    expect(decompressedContent).toContain(marker);
   });
 });

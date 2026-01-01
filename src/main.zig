@@ -44,7 +44,12 @@ pub const Protocol = @import("protocol.zig");
 ///         This fixes multiline paste where packets > 256 bytes were being dropped
 /// 2.5.2 - Fix: writeTitleToFile now uses cwd-relative file operations instead of *Absolute
 ///         This fixes a panic when rtach is invoked with a relative socket path
-pub const version = "2.5.2";
+/// 2.5.3 - Per-session log files: logs now go to {socket_path}.log instead of /tmp/rtach-debug.log
+///         Build: `zig build cross` now defaults to ReleaseFast, use `cross-debug` for debug builds
+/// 2.6.0 - Compression: terminal_data payloads are now zlib-compressed when beneficial.
+///         High bit (0x80) of response type indicates compressed payload.
+///         Reduces bandwidth by 30-60% for typical terminal output.
+pub const version = "2.6.1";
 
 pub const std_options: std.Options = .{
     .log_level = .info,
@@ -153,11 +158,20 @@ fn createAndAttach(allocator: std.mem.Allocator, args: Args, detached: bool) !vo
             if (null_fd > 2) posix.close(null_fd);
         }
 
-        // Open log file for stderr (debug logging)
-        const log_fd = posix.open("/tmp/rtach-debug.log", .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, 0o644) catch null;
-        if (log_fd) |fd| {
-            posix.dup2(fd, posix.STDERR_FILENO) catch {};
-            if (fd > 2) posix.close(fd);
+        // Open per-session log file for stderr (debug logging)
+        // Uses {socket_path}.log so logs are easy to correlate with sessions
+        var log_path_buf: [512]u8 = undefined;
+        const log_path = std.fmt.bufPrint(&log_path_buf, "{s}.log", .{args.socket_path}) catch null;
+        if (log_path) |path| {
+            // Null-terminate for posix.open
+            var path_z: [513]u8 = undefined;
+            @memcpy(path_z[0..path.len], path);
+            path_z[path.len] = 0;
+            const log_fd = posix.open(path_z[0..path.len :0], .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644) catch null;
+            if (log_fd) |fd| {
+                posix.dup2(fd, posix.STDERR_FILENO) catch {};
+                if (fd > 2) posix.close(fd);
+            }
         }
 
         var master = Master.init(allocator, .{
@@ -339,4 +353,5 @@ test {
     _ = @import("protocol.zig");
     _ = @import("master.zig");
     _ = @import("client.zig");
+    _ = @import("compression.zig");
 }

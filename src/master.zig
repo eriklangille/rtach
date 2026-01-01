@@ -14,6 +14,7 @@ const posix = std.posix;
 const Protocol = @import("protocol.zig");
 const RingBuffer = @import("ringbuffer.zig").DynamicRingBuffer;
 const ShellIntegration = @import("shell_integration.zig");
+const compression = @import("compression.zig");
 
 const log = std.log.scoped(.master);
 
@@ -86,6 +87,60 @@ fn writeFramedSlices(fd: posix.fd_t, response_type: Protocol.ResponseType, first
     _ = posix.writev(fd, iov[0..iov_len]) catch {};
 }
 
+/// Thread-local buffers for compression
+/// Sized for scrollback which can be up to 16KB on initial connect
+threadlocal var compression_buf: [32768]u8 = undefined;
+threadlocal var concat_buf: [32768]u8 = undefined;
+
+/// Write framed data with optional compression.
+/// If compress=true, compresses data if it results in smaller output.
+/// Uses high bit of response type to indicate compression.
+fn writeFramedMaybeCompressed(fd: posix.fd_t, response_type: Protocol.ResponseType, data: []const u8, compress: bool) void {
+    if (data.len == 0) return;
+
+    var was_compressed: bool = false;
+    const output = if (compress)
+        compression.compressOrPassthrough(data, &compression_buf, &was_compressed)
+    else
+        data;
+
+    const type_byte = @intFromEnum(response_type);
+    const final_type: u8 = if (was_compressed) compression.setCompressed(type_byte) else type_byte;
+
+    // Build header with potentially modified type
+    var header_bytes: [Protocol.ResponseHeader.WIRE_SIZE]u8 = undefined;
+    header_bytes[0] = final_type;
+    std.mem.writeInt(u32, header_bytes[1..5], @intCast(output.len), .little);
+
+    var iov = [2]posix.iovec_const{
+        .{ .base = &header_bytes, .len = Protocol.ResponseHeader.WIRE_SIZE },
+        .{ .base = output.ptr, .len = output.len },
+    };
+
+    _ = posix.writev(fd, &iov) catch {};
+}
+
+/// Write framed slices with optional compression.
+/// Concatenates slices and compresses if beneficial (when compress=true).
+fn writeFramedSlicesMaybeCompressed(fd: posix.fd_t, response_type: Protocol.ResponseType, first: []const u8, second: []const u8, compress: bool) void {
+    const total_len = first.len + second.len;
+    if (total_len == 0) return;
+
+    // For small data or if we can't fit in buffer, fall back to uncompressed
+    if (!compress or total_len > concat_buf.len) {
+        writeFramedSlices(fd, response_type, first, second);
+        return;
+    }
+
+    // Concatenate slices into temp buffer
+    @memcpy(concat_buf[0..first.len], first);
+    @memcpy(concat_buf[first.len..][0..second.len], second);
+    const data = concat_buf[0..total_len];
+
+    // Try to compress
+    writeFramedMaybeCompressed(fd, response_type, data, true);
+}
+
 // Terminal ioctl constants
 fn getTIOCSWINSZ() c_int {
     const val: u32 = switch (@import("builtin").os.tag) {
@@ -117,6 +172,7 @@ const ClientConn = struct {
     reader: Protocol.PacketReader = .{},
     attached: bool = false,
     framed_mode: bool = false, // After upgrade, client input is parsed as packets
+    compression_enabled: bool = false, // Client requested zlib compression in upgrade
     client_id: ?[Protocol.CLIENT_ID_SIZE]u8 = null, // Unique client identifier
     completion: xev.Completion = .{},
     read_buf: [512]u8 = undefined,
@@ -555,7 +611,8 @@ pub const Master = struct {
         for (self.clients.items) |client| {
             if (client.attached and !client.paused) {
                 if (client.framed_mode) {
-                    writeFramed(client.fd, .terminal_data, data);
+                    // Use compression for PTY output streaming (if client requested it)
+                    writeFramedMaybeCompressed(client.fd, .terminal_data, data, client.compression_enabled);
                 } else {
                     // Raw mode - send terminal data without framing
                     _ = posix.write(client.fd, data) catch {};
@@ -935,28 +992,41 @@ pub const Master = struct {
             // Raw mode: forward input to PTY, but watch for upgrade/attach packets
             var data = client.read_buf[0..n];
 
-            // Check if data starts with upgrade packet [7, 0]
-            if (data.len >= 2 and data[0] == @intFromEnum(Protocol.MessageType.upgrade) and data[1] == 0) {
-                // Upgrade detected! Switch to framed mode
-                client.framed_mode = true;
-                log.info("client {} upgraded to framed mode (detected in raw stream)", .{idx});
+            // Check if data starts with upgrade packet [7, len, ...]
+            // len can be 0 (no compression) or 1+ (with compression type)
+            if (data.len >= 2 and data[0] == @intFromEnum(Protocol.MessageType.upgrade)) {
+                const payload_len = data[1];
+                const upgrade_packet_size: usize = 2 + @as(usize, payload_len);
 
-                // Process remaining data (if any) as framed packets
-                if (data.len > 2) {
-                    var offset: usize = 0;
-                    const remaining = data[2..];
-                    while (offset < remaining.len) {
-                        const feed_result = client.reader.feed(remaining[offset..]);
-                        offset += feed_result.consumed;
+                if (data.len >= upgrade_packet_size) {
+                    // Upgrade detected! Switch to framed mode
+                    client.framed_mode = true;
 
-                        if (feed_result.packet) |pkt| {
-                            self.handleClientPacket(idx, pkt) catch {
-                                self.removeClient(idx);
-                                return .disarm;
-                            };
+                    // Check for compression type in payload
+                    if (payload_len >= 1 and data[2] == Protocol.COMPRESSION_ZLIB) {
+                        client.compression_enabled = true;
+                        log.info("client {} upgraded to framed mode with compression (detected in raw stream)", .{idx});
+                    } else {
+                        log.info("client {} upgraded to framed mode (detected in raw stream)", .{idx});
+                    }
+
+                    // Process remaining data (if any) as framed packets
+                    if (data.len > upgrade_packet_size) {
+                        var offset: usize = 0;
+                        const remaining = data[upgrade_packet_size..];
+                        while (offset < remaining.len) {
+                            const feed_result = client.reader.feed(remaining[offset..]);
+                            offset += feed_result.consumed;
+
+                            if (feed_result.packet) |pkt| {
+                                self.handleClientPacket(idx, pkt) catch {
+                                    self.removeClient(idx);
+                                    return .disarm;
+                                };
+                            }
+
+                            if (feed_result.consumed == 0) break;
                         }
-
-                        if (feed_result.consumed == 0) break;
                     }
                 }
             } else if (data.len >= 2 and data[0] == @intFromEnum(Protocol.MessageType.attach)) {
@@ -1055,19 +1125,20 @@ pub const Master = struct {
                     const slices = self.scrollback.slices();
                     const total_len = slices.first.len + slices.second.len;
 
+                    const client = self.clients.items[idx];
                     if (total_len <= max_initial_scrollback) {
-                        // Small buffer - send all in one syscall (framed)
-                        writeFramedSlices(self.clients.items[idx].fd, .terminal_data, slices.first, slices.second);
+                        // Small buffer - send all in one syscall (framed, compressed if enabled)
+                        writeFramedSlicesMaybeCompressed(client.fd, .terminal_data, slices.first, slices.second, client.compression_enabled);
                     } else {
-                        // Large buffer - only send the tail (framed)
+                        // Large buffer - only send the tail (framed, compressed if enabled)
                         const skip = total_len - max_initial_scrollback;
                         if (skip < slices.first.len) {
                             // Skip part of first slice, send rest of first + all of second
-                            writeFramedSlices(self.clients.items[idx].fd, .terminal_data, slices.first[skip..], slices.second);
+                            writeFramedSlicesMaybeCompressed(client.fd, .terminal_data, slices.first[skip..], slices.second, client.compression_enabled);
                         } else {
                             // Skip all of first slice, skip part of second
                             const skip_second = skip - slices.first.len;
-                            writeFramed(self.clients.items[idx].fd, .terminal_data, slices.second[skip_second..]);
+                            writeFramedMaybeCompressed(client.fd, .terminal_data, slices.second[skip_second..], client.compression_enabled);
                         }
                         log.debug("sent last {}KB of {}KB scrollback", .{ max_initial_scrollback / 1024, total_len / 1024 });
                     }
@@ -1125,8 +1196,9 @@ pub const Master = struct {
                 }
             },
             .redraw => {
+                const client = self.clients.items[idx];
                 const slices = self.scrollback.slices();
-                writeFramedSlices(self.clients.items[idx].fd, .terminal_data, slices.first, slices.second);
+                writeFramedSlicesMaybeCompressed(client.fd, .terminal_data, slices.first, slices.second, client.compression_enabled);
             },
             .request_scrollback => {
                 // Client requests old scrollback (everything before the 16KB initial send)
@@ -1248,8 +1320,18 @@ pub const Master = struct {
             .upgrade => {
                 // Client signals it will now frame all input
                 // Switch to framed mode - parse all subsequent input as packets
-                self.clients.items[idx].framed_mode = true;
-                log.info("client {} upgraded to framed mode", .{idx});
+                const client = self.clients.items[idx];
+                client.framed_mode = true;
+
+                // Check for compression type in payload: [compression_type: 1 byte]
+                // 0x01 = zlib compression requested
+                const payload = pkt.getPayload();
+                if (payload.len >= 1 and payload[0] == Protocol.COMPRESSION_ZLIB) {
+                    client.compression_enabled = true;
+                    log.info("client {} upgraded to framed mode with compression", .{idx});
+                } else {
+                    log.info("client {} upgraded to framed mode (no compression)", .{idx});
+                }
             },
             .pause => {
                 // Client requests to pause terminal output streaming (battery optimization)
@@ -1272,7 +1354,7 @@ pub const Master = struct {
                     if (buffered > 0) {
                         // Send buffered data since pause
                         const range = self.scrollback.sliceRange(client.paused_scrollback_pos, buffered);
-                        writeFramedSlices(client.fd, .terminal_data, range.first, range.second);
+                        writeFramedSlicesMaybeCompressed(client.fd, .terminal_data, range.first, range.second, client.compression_enabled);
                         log.info("client {} resumed: flushed {} bytes", .{ idx, buffered });
                     } else {
                         log.info("client {} resumed: no buffered data", .{idx});

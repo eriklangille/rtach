@@ -172,7 +172,9 @@ pub const Client = struct {
         const handshake = Protocol.Handshake.parse(buf[Protocol.RESPONSE_HEADER_SIZE..]);
         if (handshake) |h| {
             if (h.isValid()) {
-                // Send upgrade packet to master (via Unix socket)
+                // DON'T send upgrade to master yet - wait for iOS to send its upgrade
+                // with compression preference, then forward that to master.
+                // For now, send basic upgrade so master switches to framed mode
                 const upgrade_pkt = Protocol.Packet.initUpgrade();
                 _ = try posix.write(self.socket_fd, upgrade_pkt.serialize());
 
@@ -292,19 +294,29 @@ pub const Client = struct {
         var data = self.stdin_buffer[0..self.stdin_buffered];
 
         // Check for upgrade packet from iOS if not already in framed mode
+        // Upgrade packet: [type=7][len=0 or 1][compression_type?]
         if (!self.stdin_framed) {
-            if (data.len >= 2 and data[0] == @intFromEnum(Protocol.MessageType.upgrade) and data[1] == 0) {
-                // iOS sent upgrade, switch to framed stdin parsing
-                self.stdin_framed = true;
-                data = data[2..]; // Skip upgrade packet
-                // Update buffer to skip upgrade packet
-                if (data.len > 0) {
-                    std.mem.copyForwards(u8, &self.stdin_buffer, data);
-                    self.stdin_buffered = data.len;
-                    data = self.stdin_buffer[0..self.stdin_buffered];
-                } else {
-                    self.stdin_buffered = 0;
-                    return false;
+            if (data.len >= 2 and data[0] == @intFromEnum(Protocol.MessageType.upgrade)) {
+                const payload_len = data[1];
+                const upgrade_packet_size: usize = 2 + @as(usize, payload_len);
+
+                if (data.len >= upgrade_packet_size) {
+                    // iOS sent upgrade, switch to framed stdin parsing
+                    self.stdin_framed = true;
+
+                    // Forward upgrade packet to master so it knows compression preference
+                    _ = posix.write(self.socket_fd, data[0..upgrade_packet_size]) catch {};
+
+                    data = data[upgrade_packet_size..]; // Skip upgrade packet
+                    // Update buffer to skip upgrade packet
+                    if (data.len > 0) {
+                        std.mem.copyForwards(u8, &self.stdin_buffer, data);
+                        self.stdin_buffered = data.len;
+                        data = self.stdin_buffer[0..self.stdin_buffered];
+                    } else {
+                        self.stdin_buffered = 0;
+                        return false;
+                    }
                 }
             }
         }

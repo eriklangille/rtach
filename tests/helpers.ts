@@ -3,6 +3,7 @@ import { unlinkSync, existsSync, statSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { Socket } from "net";
+import { inflateSync } from "zlib";
 
 // Path to rtach binary
 export const RTACH_BIN = join(import.meta.dir, "../zig-out/bin/rtach");
@@ -147,13 +148,14 @@ export function uniqueRelativeSocketPath(): { relativePath: string; absolutePath
   return { relativePath: filename, absolutePath };
 }
 
-// Clean up socket file and associated files (FIFO, title)
+// Clean up socket file and associated files (FIFO, title, log)
 export function cleanupSocket(socketPath: string): void {
   const filesToClean = [
     socketPath,
     `${socketPath}.cmd`,       // Command FIFO
     `${socketPath}.title`,     // Title file
     `${socketPath}.title.tmp`, // Title temp file
+    `${socketPath}.log`,       // Per-session log file
   ];
   for (const file of filesToClean) {
     try {
@@ -565,13 +567,17 @@ export const ResponseType = {
   SCROLLBACK: 1,
   COMMAND: 2,
   SCROLLBACK_PAGE: 3,
-  HANDSHAKE: 255,
+  IDLE: 4,
+  HANDSHAKE: 5,
 } as const;
 
 // Protocol constants
 export const RESPONSE_HEADER_SIZE = 5;
 export const HANDSHAKE_SIZE = 8;
 export const HANDSHAKE_MAGIC = 0x48435452; // "RTCH"
+export const COMPRESSION_FLAG = 0x80; // High bit indicates zlib compression
+export const COMPRESSION_NONE = 0x00;
+export const COMPRESSION_ZLIB = 0x01;
 
 // Raw socket connection to rtach master
 export interface RawRtachConnection {
@@ -603,9 +609,11 @@ export function connectRawSocket(socketPath: string): Promise<RawRtachConnection
 }
 
 // Wait for handshake and send upgrade packet
+// compressionType: 0x00 = none (default), 0x01 = zlib
 export async function handleProtocolUpgrade(
   conn: RawRtachConnection,
-  timeoutMs: number = 5000
+  timeoutMs: number = 5000,
+  compressionType: number = COMPRESSION_NONE
 ): Promise<void> {
   const startTime = Date.now();
   const handshakeFrameSize = RESPONSE_HEADER_SIZE + HANDSHAKE_SIZE;
@@ -623,9 +631,14 @@ export async function handleProtocolUpgrade(
           // Remove handshake from buffer
           conn.dataBuffer = conn.dataBuffer.subarray(handshakeFrameSize);
 
-          // Send upgrade packet: [type=7][len=0]
-          const upgradePacket = Buffer.from([MessageType.UPGRADE, 0]);
-          conn.socket.write(upgradePacket);
+          // Send upgrade packet: [type=7][len=0 or 1][compression_type?]
+          if (compressionType === COMPRESSION_NONE) {
+            const upgradePacket = Buffer.from([MessageType.UPGRADE, 0]);
+            conn.socket.write(upgradePacket);
+          } else {
+            const upgradePacket = Buffer.from([MessageType.UPGRADE, 1, compressionType]);
+            conn.socket.write(upgradePacket);
+          }
           return;
         }
       }
@@ -639,10 +652,11 @@ export async function handleProtocolUpgrade(
 // Connect and perform protocol upgrade
 export async function connectRawSocketWithUpgrade(
   socketPath: string,
-  timeoutMs: number = 5000
+  timeoutMs: number = 5000,
+  compressionType: number = COMPRESSION_NONE
 ): Promise<RawRtachConnection> {
   const conn = await connectRawSocket(socketPath);
-  await handleProtocolUpgrade(conn, timeoutMs);
+  await handleProtocolUpgrade(conn, timeoutMs, compressionType);
   return conn;
 }
 

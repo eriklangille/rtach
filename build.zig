@@ -10,6 +10,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Import zlib (compiled from source for cross-compilation support)
+    const zlib_dep = b.dependency("zlib", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
     // Main rtach executable
     const exe = b.addExecutable(.{
         .name = "rtach",
@@ -22,6 +28,7 @@ pub fn build(b: *std.Build) void {
     });
 
     exe.root_module.addImport("xev", xev_dep.module("xev"));
+    exe.linkLibrary(zlib_dep.artifact("z"));
     b.installArtifact(exe);
 
     // Run command
@@ -44,6 +51,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     test_exe.root_module.addImport("xev", xev_dep.module("xev"));
+    test_exe.linkLibrary(zlib_dep.artifact("z"));
 
     const run_unit_tests = b.addRunArtifact(test_exe);
     const test_step = b.step("test", "Run unit tests");
@@ -89,42 +97,59 @@ pub fn build(b: *std.Build) void {
         .{ .name = "aarch64-macos", .target = .{ .cpu_arch = .aarch64, .os_tag = .macos } },
     };
 
-    const cross_step = b.step("cross", "Build for all deployment targets");
+    const cross_step = b.step("cross", "Build ReleaseFast for all deployment targets");
+    const cross_debug_step = b.step("cross-debug", "Build Debug for all deployment targets");
 
     // Destination for iOS app resources
     const clauntty_resources_path = "../clauntty/Clauntty/Resources/rtach/";
 
-    for (cross_targets) |ct| {
-        const resolved_target = b.resolveTargetQuery(ct.target);
+    // Build both release and debug variants
+    const build_modes = [_]struct { step: *std.Build.Step, opt: std.builtin.OptimizeMode }{
+        .{ .step = cross_step, .opt = .ReleaseFast },
+        .{ .step = cross_debug_step, .opt = .Debug },
+    };
 
-        const cross_xev = b.dependency("libxev", .{
-            .target = resolved_target,
-            .optimize = optimize, // Use command-line optimize option
-        });
+    for (build_modes) |mode| {
+        for (cross_targets) |ct| {
+            const resolved_target = b.resolveTargetQuery(ct.target);
 
-        const cross_exe = b.addExecutable(.{
-            .name = b.fmt("rtach-{s}", .{ct.name}),
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("src/main.zig"),
+            const cross_xev = b.dependency("libxev", .{
                 .target = resolved_target,
-                .optimize = optimize, // Use command-line optimize option
-                .strip = optimize != .Debug, // Only strip in release builds
-                .link_libc = true,
-            }),
-        });
+                .optimize = mode.opt,
+            });
 
-        cross_exe.root_module.addImport("xev", cross_xev.module("xev"));
+            const cross_zlib = b.dependency("zlib", .{
+                .target = resolved_target,
+                .optimize = mode.opt,
+            });
 
-        const cross_install = b.addInstallArtifact(cross_exe, .{});
-        cross_step.dependOn(&cross_install.step);
+            const cross_exe = b.addExecutable(.{
+                .name = b.fmt("rtach-{s}", .{ct.name}),
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("src/main.zig"),
+                    .target = resolved_target,
+                    .optimize = mode.opt,
+                    .strip = mode.opt != .Debug, // Only strip in release builds
+                    .link_libc = true,
+                }),
+            });
 
-        // Copy to clauntty resources directory
-        const copy_cmd = b.addSystemCommand(&.{
-            "cp",
-            b.fmt("zig-out/bin/rtach-{s}", .{ct.name}),
-            b.fmt("{s}rtach-{s}", .{ clauntty_resources_path, ct.name }),
-        });
-        copy_cmd.step.dependOn(&cross_install.step);
-        cross_step.dependOn(&copy_cmd.step);
+            cross_exe.root_module.addImport("xev", cross_xev.module("xev"));
+            cross_exe.linkLibrary(cross_zlib.artifact("z"));
+
+            const cross_install = b.addInstallArtifact(cross_exe, .{});
+            mode.step.dependOn(&cross_install.step);
+
+            // Copy to clauntty resources directory (only for release builds)
+            if (mode.opt == .ReleaseFast) {
+                const copy_cmd = b.addSystemCommand(&.{
+                    "cp",
+                    b.fmt("zig-out/bin/rtach-{s}", .{ct.name}),
+                    b.fmt("{s}rtach-{s}", .{ clauntty_resources_path, ct.name }),
+                });
+                copy_cmd.step.dependOn(&cross_install.step);
+                mode.step.dependOn(&copy_cmd.step);
+            }
+        }
     }
 }

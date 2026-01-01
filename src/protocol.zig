@@ -28,6 +28,11 @@ pub const MessageType = enum(u8) {
 
 /// Response types for master → client protocol.
 /// ALL data from rtach to client is framed: [type: 1][len: 4][payload]
+///
+/// COMPRESSION: The high bit (0x80) of the type byte indicates zlib compression.
+/// When set, the payload is zlib-compressed and must be decompressed before use.
+/// Example: type=0x80 means compressed terminal_data (0x00 | 0x80)
+/// Use compression.isCompressed(type_byte) and compression.getResponseType(type_byte).
 pub const ResponseType = enum(u8) {
     /// Terminal data (PTY output) - forward to terminal display
     terminal_data = 0,
@@ -40,7 +45,7 @@ pub const ResponseType = enum(u8) {
     /// Shell is idle/waiting for input (sent after 2s of no PTY output)
     idle = 4,
     /// Protocol handshake (sent immediately after attach)
-    handshake = 255,
+    handshake = 5,
 };
 
 /// Response header size (type: 1 byte + len: 4 bytes)
@@ -147,6 +152,12 @@ pub const MAX_PAYLOAD_SIZE = 255;
 
 /// Client ID size (UUID = 16 bytes)
 pub const CLIENT_ID_SIZE = 16;
+
+/// Compression types for upgrade packet
+/// Upgrade payload: [compression_type: 1 byte]
+/// 0x00 = no compression, 0x01 = zlib
+pub const COMPRESSION_NONE: u8 = 0x00;
+pub const COMPRESSION_ZLIB: u8 = 0x01;
 
 /// Full packet structure
 pub const Packet = struct {
@@ -543,7 +554,7 @@ test "ResponseType terminal_data value" {
 }
 
 test "ResponseType handshake value" {
-    try testing.expectEqual(@as(u8, 255), @intFromEnum(ResponseType.handshake));
+    try testing.expectEqual(@as(u8, 5), @intFromEnum(ResponseType.handshake));
 }
 
 test "Handshake wire size and serialization" {
