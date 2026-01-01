@@ -1443,7 +1443,9 @@ pub const Master = struct {
         var tmp_path_buf: [512]u8 = undefined;
         const tmp_path = std.fmt.bufPrint(&tmp_path_buf, "{s}.title.tmp", .{self.options.socket_path}) catch return;
 
-        const file = std.fs.createFileAbsolute(tmp_path, .{}) catch |err| {
+        // Use cwd-relative file operations (handles both absolute and relative paths)
+        const cwd = std.fs.cwd();
+        const file = cwd.createFile(tmp_path, .{}) catch |err| {
             log.warn("failed to create title file: {}", .{err});
             return;
         };
@@ -1454,7 +1456,7 @@ pub const Master = struct {
             return;
         };
 
-        std.fs.renameAbsolute(tmp_path, title_path) catch |err| {
+        cwd.rename(tmp_path, title_path) catch |err| {
             log.warn("failed to rename title file: {}", .{err});
             return;
         };

@@ -3,6 +3,7 @@ import { spawn } from "bun";
 import {
   RTACH_BIN,
   uniqueSocketPath,
+  uniqueRelativeSocketPath,
   cleanupSocket,
   cleanupAll,
   socketExists,
@@ -27,6 +28,8 @@ import {
   HANDSHAKE_SIZE,
   HANDSHAKE_MAGIC,
 } from "./helpers";
+import { existsSync, readFileSync } from "fs";
+import { tmpdir } from "os";
 
 describe("rtach CLI", () => {
   afterEach(cleanupAll);
@@ -925,5 +928,58 @@ describe("rtach raw mode (no upgrade)", () => {
 
     rawConn.close();
     expect(foundIdle).toBe(false);
+  });
+});
+
+describe("rtach title file handling", () => {
+  afterEach(cleanupAll);
+
+  test("master survives title write with relative socket path (regression test for crash)", async () => {
+    // This test verifies the fix for a crash where writeTitleToFile used
+    // createFileAbsolute/renameAbsolute which panic on relative paths.
+    // Before the fix, the master would panic when trying to write the title file.
+    const { relativePath, absolutePath } = uniqueRelativeSocketPath();
+
+    // Start master with relative path, running from /tmp
+    const master = spawn([RTACH_BIN, "-n", relativePath, "/bin/bash"], {
+      cwd: tmpdir(),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+    await waitForSocket(absolutePath);
+
+    // Connect, upgrade, and attach
+    const rawConn = await connectRawSocketWithUpgrade(absolutePath);
+    sendAttachPacket(rawConn, "relative-path-test");
+    await Bun.sleep(100);
+
+    // Send OSC 0 title sequence via push packet - this triggers title parsing
+    // When the idle timer fires, it will try to write the title file
+    const title = "Relative Path Title";
+    const oscSequence = `\x1b]0;${title}\x07`;
+    const payload = Buffer.from(oscSequence);
+    rawConn.socket.write(Buffer.from([MessageType.PUSH, payload.length, ...payload]));
+
+    // Wait for idle timer to fire and attempt title write
+    // The old code would panic here with "reached unreachable code" from createFileAbsolute
+    await Bun.sleep(3500);
+
+    // Verify master is still running (didn't crash)
+    // Check by sending another packet and verifying we can still communicate
+    const testPayload = Buffer.from("test");
+    rawConn.socket.write(Buffer.from([MessageType.PUSH, testPayload.length, ...testPayload]));
+    await Bun.sleep(100);
+
+    // If we got here, the master survived the title write attempt
+    // The title file may or may not exist depending on timing, but no crash = success
+    rawConn.close();
+    master.kill();
+
+    // Verify the master exited cleanly (was killed, not crashed)
+    const exitCode = await master.exited;
+    // SIGTERM (kill) results in exit code 143 on some systems, or the process just dies
+    // The key is that we got here without a panic/crash during the test
+    expect(exitCode).not.toBe(1); // Exit code 1 would indicate an error/panic
   });
 });

@@ -136,6 +136,17 @@ export function uniqueSocketPath(): string {
   return socketPath;
 }
 
+// Create a unique socket path that is RELATIVE (for testing relative path handling)
+// Returns { relativePath, absolutePath } - use absolutePath for cleanup
+export function uniqueRelativeSocketPath(): { relativePath: string; absolutePath: string } {
+  const id = Math.random().toString(36).substring(2, 10);
+  const filename = `rtach-test-${id}.sock`;
+  // Use /tmp as the working directory, return just the filename as relative
+  const absolutePath = join(tmpdir(), filename);
+  trackSocket(absolutePath);
+  return { relativePath: filename, absolutePath };
+}
+
 // Clean up socket file and associated files (FIFO, title)
 export function cleanupSocket(socketPath: string): void {
   const filesToClean = [

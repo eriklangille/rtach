@@ -20,6 +20,15 @@ zig build cross             # Cross-compile all targets
 - `src/ringbuffer.zig` - Scrollback buffer
 - `src/shell_integration.zig` - Shell integration scripts
 
+## Version Bumping
+
+When releasing a new rtach version, update **both** files:
+
+1. `src/main.zig` - Update `pub const version = "X.Y.Z"`
+2. `../clauntty/Clauntty/Core/SSH/RtachDeployer.swift` - Update `static let expectedVersion = "X.Y.Z"`
+
+The iOS app uses the version to determine when to redeploy the binary to remote servers.
+
 ## Protocol (v2.5)
 
 - Magic: `RTCH` (0x48435452)

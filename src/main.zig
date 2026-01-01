@@ -42,7 +42,9 @@ pub const Protocol = @import("protocol.zig");
 ///         Scripts write to this path (works even when spawned by Claude Code which closes FDs)
 /// 2.5.1 - Fix: client.zig stdin buffer increased from 256 to 4096 bytes, added partial packet buffering
 ///         This fixes multiline paste where packets > 256 bytes were being dropped
-pub const version = "2.5.1";
+/// 2.5.2 - Fix: writeTitleToFile now uses cwd-relative file operations instead of *Absolute
+///         This fixes a panic when rtach is invoked with a relative socket path
+pub const version = "2.5.2";
 
 pub const std_options: std.Options = .{
     .log_level = .info,
