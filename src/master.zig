@@ -18,6 +18,74 @@ const compression = @import("compression.zig");
 
 const log = std.log.scoped(.master);
 
+// Global state for signal handling diagnostics
+var g_received_signal: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+var g_log_fd: std.atomic.Value(i32) = std.atomic.Value(i32).init(-1);
+
+fn signalHandler(sig: c_int) callconv(.c) void {
+    // Store the signal - will be logged when we can
+    g_received_signal.store(@intCast(sig), .release);
+
+    // Try to write directly to log file (signal-safe)
+    const fd = g_log_fd.load(.acquire);
+    if (fd >= 0) {
+        const msg = switch (sig) {
+            posix.SIG.TERM => "[SIGNAL] Received SIGTERM - terminating\n",
+            posix.SIG.INT => "[SIGNAL] Received SIGINT - interrupted\n",
+            posix.SIG.HUP => "[SIGNAL] Received SIGHUP - hangup\n",
+            posix.SIG.PIPE => "[SIGNAL] Received SIGPIPE - broken pipe\n",
+            posix.SIG.SEGV => "[SIGNAL] Received SIGSEGV - segmentation fault\n",
+            posix.SIG.BUS => "[SIGNAL] Received SIGBUS - bus error\n",
+            posix.SIG.ABRT => "[SIGNAL] Received SIGABRT - aborted\n",
+            else => "[SIGNAL] Received unknown signal\n",
+        };
+        _ = posix.write(fd, msg) catch {};
+    }
+
+    // For fatal signals, re-raise with default handler
+    if (sig == posix.SIG.SEGV or sig == posix.SIG.BUS or sig == posix.SIG.ABRT) {
+        // Reset to default and re-raise
+        var sa: posix.Sigaction = .{
+            .handler = .{ .handler = posix.SIG.DFL },
+            .mask = posix.sigemptyset(),
+            .flags = 0,
+        };
+        posix.sigaction(@intCast(sig), &sa, null);
+        _ = std.c.raise(sig);
+    }
+}
+
+fn setupSignalHandlers() void {
+    // Fatal signals - log diagnostics then crash
+    const fatal_signals = [_]u8{
+        posix.SIG.TERM,
+        posix.SIG.INT,
+        posix.SIG.SEGV,
+        posix.SIG.BUS,
+        posix.SIG.ABRT,
+    };
+
+    for (fatal_signals) |sig| {
+        var sa: posix.Sigaction = .{
+            .handler = .{ .handler = signalHandler },
+            .mask = posix.sigemptyset(),
+            .flags = posix.SA.RESETHAND, // One-shot for fatal signals
+        };
+        posix.sigaction(sig, &sa, null);
+    }
+
+    // Ignore SIGHUP - session daemon should survive terminal hangup
+    // Ignore SIGPIPE - handle EPIPE errors in write() instead
+    // Both are standard practice for daemons/network servers
+    var sa_ign: posix.Sigaction = .{
+        .handler = .{ .handler = posix.SIG.IGN },
+        .mask = posix.sigemptyset(),
+        .flags = 0,
+    };
+    posix.sigaction(posix.SIG.HUP, &sa_ign, null);
+    posix.sigaction(posix.SIG.PIPE, &sa_ign, null);
+}
+
 /// Write multiple slices in a single syscall using writev
 /// More efficient than multiple write() calls for ring buffer slices
 fn writeSlices(fd: posix.fd_t, first: []const u8, second: []const u8) void {
@@ -182,6 +250,9 @@ const ClientConn = struct {
     paused: bool = false,
     /// Scrollback position when client was paused (used to flush buffered data on resume)
     paused_scrollback_pos: usize = 0,
+    /// When true, fd has been closed and client will be destroyed when callback fires
+    /// Used for safe deferred destruction (e.g., when kicking duplicate clients)
+    pending_remove: bool = false,
 };
 
 pub const Master = struct {
@@ -252,6 +323,8 @@ pub const Master = struct {
     osc_state: OscParseState = .none,
     osc_buf: [256]u8 = undefined,
     osc_buf_len: u8 = 0,
+    // Heartbeat counter for diagnostic logging
+    heartbeat_counter: u32 = 0,
 
     const OscParseState = enum {
         none, // Not in OSC sequence
@@ -265,6 +338,7 @@ pub const Master = struct {
     const IDLE_THRESHOLD_NS: i128 = 2 * std.time.ns_per_s; // 2 seconds
     const IDLE_CHECK_INTERVAL_MS: u64 = 500; // Check every 500ms
     const TITLE_WRITE_DEBOUNCE_NS: i128 = 500 * std.time.ns_per_ms; // 500ms
+    const HEARTBEAT_INTERVAL_TICKS: u32 = 600; // Log heartbeat every 600 ticks (5 minutes at 500ms)
 
     pub fn init(allocator: std.mem.Allocator, options: MasterOptions) !*Master {
         const self = try allocator.create(Master);
@@ -305,7 +379,10 @@ pub const Master = struct {
         self.scrollback.deinit();
 
         for (self.clients.items) |client| {
-            posix.close(client.fd);
+            // Don't close fd if pending_remove - it was already closed
+            if (!client.pending_remove) {
+                posix.close(client.fd);
+            }
             self.allocator.destroy(client);
         }
         self.clients.deinit(self.allocator);
@@ -504,7 +581,12 @@ pub const Master = struct {
     }
 
     pub fn run(self: *Master) !void {
-        log.info("master running with xev, scrollback={}KB", .{self.options.scrollback_size / 1024});
+        // Set up signal handlers for diagnostic logging
+        setupSignalHandlers();
+        // Store stderr fd for signal handler to use (signal-safe writes)
+        g_log_fd.store(2, .release); // stderr = fd 2
+
+        log.info("master running with xev, scrollback={}KB, pid={}", .{ self.options.scrollback_size / 1024, std.c.getpid() });
 
         // Set up PTY read using Stream abstraction
         self.pty_stream.read(
@@ -609,6 +691,7 @@ pub const Master = struct {
         // Forward to all attached, non-paused clients
         // Paused clients will receive buffered data when they resume
         for (self.clients.items) |client| {
+            if (client.pending_remove) continue;
             if (client.attached and !client.paused) {
                 if (client.framed_mode) {
                     // Use compression for PTY output streaming (if client requested it)
@@ -640,7 +723,8 @@ pub const Master = struct {
     ) xev.CallbackAction {
         const self = self_opt orelse return .disarm;
 
-        _ = result catch {
+        _ = result catch |err| {
+            log.warn("idle timer error: {}", .{err});
             // Timer error - just re-arm
             self.idle_timer.run(
                 loop,
@@ -653,6 +737,16 @@ pub const Master = struct {
             return .disarm;
         };
 
+        // Heartbeat logging (every 5 minutes) - confirms master is still alive
+        self.heartbeat_counter += 1;
+        if (self.heartbeat_counter >= HEARTBEAT_INTERVAL_TICKS) {
+            self.heartbeat_counter = 0;
+            log.info("heartbeat: clients={}, scrollback={}KB", .{
+                self.clients.items.len,
+                self.scrollback.len / 1024,
+            });
+        }
+
         // Check if we're idle (no PTY output for IDLE_THRESHOLD_NS)
         const now = std.time.nanoTimestamp();
         const elapsed = now - self.last_pty_write_ns;
@@ -662,6 +756,7 @@ pub const Master = struct {
         var attached_count: usize = 0;
         var paused_count: usize = 0;
         for (self.clients.items) |client| {
+            if (client.pending_remove) continue;
             if (client.attached) attached_count += 1;
             if (client.paused) paused_count += 1;
         }
@@ -682,6 +777,7 @@ pub const Master = struct {
             // Raw clients don't understand protocol headers (would see 5 bytes garbage)
             var sent_count: usize = 0;
             for (self.clients.items) |client| {
+                if (client.pending_remove) continue;
                 if (client.attached and client.framed_mode) {
                     // Send empty idle response (just header, no payload)
                     const header = Protocol.ResponseHeader{
@@ -794,6 +890,7 @@ pub const Master = struct {
 
         // Send to all attached clients (framed)
         for (self.clients.items) |client| {
+            if (client.pending_remove) continue;
             if (client.attached) {
                 writeFramed(client.fd, .command, cmd);
             }
@@ -858,6 +955,7 @@ pub const Master = struct {
 
         // Create client state
         const client = self.allocator.create(ClientConn) catch {
+            log.err("failed to allocate ClientConn for fd={}", .{client_fd});
             posix.close(client_fd);
             // Re-arm accept
             self.socket.accept(
@@ -877,6 +975,7 @@ pub const Master = struct {
         };
 
         self.clients.append(self.allocator, client) catch {
+            log.err("failed to append client to list for fd={}", .{client_fd});
             self.allocator.destroy(client);
             posix.close(client_fd);
             // Re-arm accept
@@ -938,6 +1037,12 @@ pub const Master = struct {
         }
 
         const idx = client_idx orelse return .disarm;
+
+        // Check for deferred destruction (e.g., duplicate client was kicked)
+        if (client.pending_remove) {
+            self.removeClient(idx);
+            return .disarm;
+        }
 
         const n = result catch |err| {
             if (err == error.Again) {
@@ -1075,22 +1180,19 @@ pub const Master = struct {
 
                 // If client ID provided, kick any existing connection with same ID
                 if (client_id) |id| {
-                    var i: usize = 0;
-                    while (i < self.clients.items.len) {
-                        const other = self.clients.items[i];
-                        if (i != idx and other.client_id != null and std.mem.eql(u8, &other.client_id.?, &id)) {
-                            log.info("kicking duplicate client {} (same client_id as {})", .{ i, idx });
+                    for (self.clients.items) |other| {
+                        if (other != self.clients.items[idx] and
+                            !other.pending_remove and
+                            other.client_id != null and
+                            std.mem.eql(u8, &other.client_id.?, &id))
+                        {
+                            log.info("kicking duplicate client {} (same client_id as {})", .{ other.fd, idx });
+                            // Mark for deferred destruction - don't destroy immediately because
+                            // there may be an in-flight completion in the event loop that would
+                            // cause a use-after-free when it fires.
+                            other.pending_remove = true;
                             posix.close(other.fd);
-                            self.allocator.destroy(other);
-                            _ = self.clients.swapRemove(i);
-                            // Adjust idx if needed (swapRemove may have moved our client)
-                            if (idx == self.clients.items.len) {
-                                // Our client was swapped, now at position i
-                                return self.handleClientPacket(i, pkt);
-                            }
-                            // Don't increment i - check the swapped element
-                        } else {
-                            i += 1;
+                            // The read callback will clean up when it fires with an error
                         }
                     }
                     self.clients.items[idx].client_id = id;
@@ -1198,6 +1300,8 @@ pub const Master = struct {
             .redraw => {
                 const client = self.clients.items[idx];
                 const slices = self.scrollback.slices();
+                const total_len = slices.first.len + slices.second.len;
+                log.info("client {} redraw: sending {}KB scrollback", .{ idx, total_len / 1024 });
                 writeFramedSlicesMaybeCompressed(client.fd, .terminal_data, slices.first, slices.second, client.compression_enabled);
             },
             .request_scrollback => {
@@ -1362,6 +1466,19 @@ pub const Master = struct {
 
                     client.paused = false;
                     client.paused_scrollback_pos = 0;
+
+                    // Always send SIGWINCH on resume to trigger TUI repaint
+                    // This is needed because paused clients miss intermediate repaints
+                    // (e.g., Claude Code spinner/timer stops while tab is inactive)
+                    if (self.child_pid > 0) {
+                        _ = std.c.kill(-self.child_pid, posix.SIG.WINCH);
+                        log.info("client {} resume: sent SIGWINCH to pgrp {} ({}x{})", .{
+                            idx,
+                            self.child_pid,
+                            self.winsize.cols,
+                            self.winsize.rows,
+                        });
+                    }
                 }
             },
         }
@@ -1551,7 +1668,10 @@ pub const Master = struct {
     fn removeClient(self: *Master, idx: usize) void {
         const client = self.clients.items[idx];
         log.info("client {} disconnected", .{client.fd});
-        posix.close(client.fd);
+        // Don't close fd if pending_remove - it was already closed by kick logic
+        if (!client.pending_remove) {
+            posix.close(client.fd);
+        }
         self.allocator.destroy(client);
         _ = self.clients.swapRemove(idx);
     }

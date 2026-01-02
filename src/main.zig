@@ -49,7 +49,12 @@ pub const Protocol = @import("protocol.zig");
 /// 2.6.0 - Compression: terminal_data payloads are now zlib-compressed when beneficial.
 ///         High bit (0x80) of response type indicates compressed payload.
 ///         Reduces bandwidth by 30-60% for typical terminal output.
-pub const version = "2.6.1";
+/// 2.6.2 - Diagnostics: Added signal handlers, heartbeat logging, allocation failure logging.
+///         Signals (SIGTERM, SIGPIPE, SIGSEGV, etc.) now logged before process exit.
+///         Heartbeat logs every 5 minutes to confirm master is alive.
+/// 2.6.3 - Fix: Always send SIGWINCH on resume to trigger TUI repaint.
+///         Fixes frozen Claude Code after switching back to inactive tab.
+pub const version = "2.6.3";
 
 pub const std_options: std.Options = .{
     .log_level = .info,
