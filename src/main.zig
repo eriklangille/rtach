@@ -7,6 +7,7 @@ const client_mod = @import("client.zig");
 const Client = client_mod.Client;
 const ClientOptions = client_mod.ClientOptions;
 const RingBuffer = @import("ringbuffer.zig").RingBuffer;
+const picker_mod = @import("picker.zig");
 
 pub const Protocol = @import("protocol.zig");
 
@@ -57,7 +58,8 @@ pub const Protocol = @import("protocol.zig");
 /// 2.6.4 - Fix: Resume now uses a monotonic counter to flush buffered output correctly.
 /// 2.6.5 - Fix: Proxy client waits for iOS upgrade before upgrading master.
 /// 2.6.6 - Fix: Explicit proxy mode flag to avoid TTY detection mismatch.
-pub const version = "2.6.6";
+/// 2.7.0 - Interactive session picker: run 'rtach' with no args to select a session.
+pub const version = "2.7.0";
 
 pub const std_options: std.Options = .{
     .log_level = .info,
@@ -109,6 +111,7 @@ const Args = struct {
         create_or_attach, // -A: Create if needed, attach
         attach, // -a: Attach to existing
         create_detached, // -n: Create detached (no attach)
+        picker, // No args: show interactive session picker
     };
 };
 
@@ -125,6 +128,28 @@ pub fn main() void {
     // Note: We catch all errors silently because stderr goes to the SSH channel
     // and would corrupt the framed protocol. Exit codes indicate success/failure.
     switch (args.mode) {
+        .picker => {
+            // Interactive session picker
+            const result = picker_mod.showPicker(allocator) catch std.process.exit(1);
+            switch (result) {
+                .new_session => {
+                    // Generate new session ID and create
+                    const session_id = generateSessionId() catch std.process.exit(1);
+                    var new_args = args;
+                    new_args.socket_path = buildSessionPath(allocator, &session_id) catch std.process.exit(1);
+                    new_args.mode = .create_or_attach;
+                    createAndAttach(allocator, new_args, false) catch std.process.exit(1);
+                },
+                .existing => |session_id| {
+                    // Attach to existing session
+                    var new_args = args;
+                    new_args.socket_path = buildSessionPath(allocator, session_id) catch std.process.exit(1);
+                    new_args.mode = .attach;
+                    attach(allocator, new_args) catch std.process.exit(1);
+                },
+                .quit => std.process.exit(0),
+            }
+        },
         .create => {
             // Create new session and attach
             createAndAttach(allocator, args, false) catch std.process.exit(1);
@@ -221,6 +246,34 @@ fn attach(allocator: std.mem.Allocator, args: Args) !void {
 fn socketExists(path: []const u8) bool {
     const stat = std.fs.cwd().statFile(path) catch return false;
     return stat.kind == .unix_domain_socket;
+}
+
+/// Generate a new UUID-format session ID
+fn generateSessionId() ![36]u8 {
+    var uuid_bytes: [16]u8 = undefined;
+    std.crypto.random.bytes(&uuid_bytes);
+
+    // Set version (4) and variant bits
+    uuid_bytes[6] = (uuid_bytes[6] & 0x0f) | 0x40; // Version 4
+    uuid_bytes[8] = (uuid_bytes[8] & 0x3f) | 0x80; // Variant 1
+
+    // Format as UUID string with dashes
+    var result: [36]u8 = undefined;
+    _ = std.fmt.bufPrint(&result, "{x:0>8}-{x:0>4}-{x:0>4}-{x:0>4}-{x:0>12}", .{
+        std.mem.readInt(u32, uuid_bytes[0..4], .big),
+        std.mem.readInt(u16, uuid_bytes[4..6], .big),
+        std.mem.readInt(u16, uuid_bytes[6..8], .big),
+        std.mem.readInt(u16, uuid_bytes[8..10], .big),
+        std.mem.readInt(u48, uuid_bytes[10..16], .big),
+    }) catch unreachable;
+
+    return result;
+}
+
+/// Build full socket path from session ID
+fn buildSessionPath(allocator: std.mem.Allocator, session_id: []const u8) ![]const u8 {
+    const home = std.posix.getenv("HOME") orelse return error.NoHome;
+    return std.fmt.allocPrint(allocator, "{s}/.clauntty/sessions/{s}", .{ home, session_id });
 }
 
 /// Parse UUID string (with or without dashes) to 16-byte array
@@ -323,10 +376,8 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
     }
 
     if (!found_socket or result.socket_path.len == 0) {
-        const stdout = std.posix.STDOUT_FILENO;
-        _ = std.posix.write(stdout, "rtach: missing socket path\n") catch {};
-        printUsage();
-        std.process.exit(1);
+        // No socket path given - enter interactive picker mode
+        result.mode = .picker;
     }
 
     return result;
@@ -336,7 +387,9 @@ fn printUsage() void {
     const usage =
         \\rtach - persistent terminal sessions with scrollback
         \\
-        \\Usage: rtach [options] <socket> [command]
+        \\Usage: rtach [options] [socket] [command]
+        \\
+        \\If no socket is given, shows an interactive session picker.
         \\
         \\Options:
         \\  -c          Create new session and attach
@@ -353,6 +406,7 @@ fn printUsage() void {
         \\  -h          Print this help
         \\
         \\Examples:
+        \\  rtach                           # Interactive session picker
         \\  rtach -A ~/.rtach/session $SHELL
         \\  rtach -a ~/.rtach/session
         \\
@@ -367,4 +421,5 @@ test {
     _ = @import("master.zig");
     _ = @import("client.zig");
     _ = @import("compression.zig");
+    _ = @import("picker.zig");
 }
