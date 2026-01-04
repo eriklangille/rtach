@@ -248,8 +248,8 @@ const ClientConn = struct {
     /// When true, terminal output is not streamed to this client (battery optimization)
     /// Scrollback continues to buffer, and data is flushed on resume
     paused: bool = false,
-    /// Scrollback position when client was paused (used to flush buffered data on resume)
-    paused_scrollback_pos: usize = 0,
+    /// Total bytes written when client was paused (used to flush buffered data on resume)
+    paused_total_written: u64 = 0,
     /// When true, fd has been closed and client will be destroyed when callback fires
     /// Used for safe deferred destruction (e.g., when kicking duplicate clients)
     pending_remove: bool = false,
@@ -282,6 +282,8 @@ pub const Master = struct {
 
     // Scrollback buffer
     scrollback: RingBuffer,
+    /// Monotonic counter of total bytes written to scrollback
+    scrollback_total_written: u64 = 0,
 
     // Connected clients
     clients: std.ArrayListUnmanaged(*ClientConn) = .{},
@@ -687,6 +689,7 @@ pub const Master = struct {
 
         // Store in scrollback
         self.scrollback.write(data);
+        self.scrollback_total_written += @intCast(data.len);
 
         // Forward to all attached, non-paused clients
         // Paused clients will receive buffered data when they resume
@@ -1298,6 +1301,15 @@ pub const Master = struct {
                 }
             },
             .redraw => {
+                if (self.in_alternate_screen) {
+                    log.info("client {} redraw: skipping scrollback (alternate screen active)", .{idx});
+                    if (self.child_pid > 0) {
+                        _ = std.c.kill(-self.child_pid, posix.SIG.WINCH);
+                        log.info("client {} redraw: sent SIGWINCH to pgrp {}", .{ idx, self.child_pid });
+                    }
+                    return;
+                }
+
                 const client = self.clients.items[idx];
                 const slices = self.scrollback.slices();
                 const total_len = slices.first.len + slices.second.len;
@@ -1443,8 +1455,8 @@ pub const Master = struct {
                 const client = self.clients.items[idx];
                 if (!client.paused) {
                     client.paused = true;
-                    client.paused_scrollback_pos = self.scrollback.size();
-                    log.info("client {} paused at scrollback pos {}", .{ idx, client.paused_scrollback_pos });
+                    client.paused_total_written = self.scrollback_total_written;
+                    log.info("client {} paused at total_written {}", .{ idx, client.paused_total_written });
                 }
             },
             .@"resume" => {
@@ -1452,20 +1464,33 @@ pub const Master = struct {
                 // Send any buffered data since pause, then resume normal streaming
                 const client = self.clients.items[idx];
                 if (client.paused) {
-                    const current_pos = self.scrollback.size();
-                    const buffered = current_pos -| client.paused_scrollback_pos;
+                    const total_written = self.scrollback_total_written;
+                    const buffer_len: u64 = @intCast(self.scrollback.size());
+                    const oldest_available: u64 = if (total_written > buffer_len) total_written - buffer_len else 0;
+                    var start: u64 = client.paused_total_written;
 
-                    if (buffered > 0) {
-                        // Send buffered data since pause
-                        const range = self.scrollback.sliceRange(client.paused_scrollback_pos, buffered);
+                    if (start < oldest_available) {
+                        const dropped = oldest_available - start;
+                        log.warn("client {} resume: buffered output overwritten ({} bytes lost)", .{ idx, dropped });
+                        start = oldest_available;
+                    }
+
+                    const available = total_written - start;
+
+                    if (available > 0 and buffer_len > 0) {
+                        const len_to_send: u64 = @min(available, buffer_len);
+                        const offset = @as(usize, @intCast(start - oldest_available));
+                        const send_len = @as(usize, @intCast(len_to_send));
+                        // Send buffered data since pause (best-effort if buffer wrapped)
+                        const range = self.scrollback.sliceRange(offset, send_len);
                         writeFramedSlicesMaybeCompressed(client.fd, .terminal_data, range.first, range.second, client.compression_enabled);
-                        log.info("client {} resumed: flushed {} bytes", .{ idx, buffered });
+                        log.info("client {} resumed: flushed {} bytes", .{ idx, len_to_send });
                     } else {
                         log.info("client {} resumed: no buffered data", .{idx});
                     }
 
                     client.paused = false;
-                    client.paused_scrollback_pos = 0;
+                    client.paused_total_written = 0;
 
                     // Always send SIGWINCH on resume to trigger TUI repaint
                     // This is needed because paused clients miss intermediate repaints

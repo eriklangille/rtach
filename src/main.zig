@@ -54,7 +54,10 @@ pub const Protocol = @import("protocol.zig");
 ///         Heartbeat logs every 5 minutes to confirm master is alive.
 /// 2.6.3 - Fix: Always send SIGWINCH on resume to trigger TUI repaint.
 ///         Fixes frozen Claude Code after switching back to inactive tab.
-pub const version = "2.6.3";
+/// 2.6.4 - Fix: Resume now uses a monotonic counter to flush buffered output correctly.
+/// 2.6.5 - Fix: Proxy client waits for iOS upgrade before upgrading master.
+/// 2.6.6 - Fix: Explicit proxy mode flag to avoid TTY detection mismatch.
+pub const version = "2.6.6";
 
 pub const std_options: std.Options = .{
     .log_level = .info,
@@ -99,6 +102,7 @@ const Args = struct {
     detach_char: u8 = 0x1c, // Ctrl+\ by default
     scrollback_size: usize = 1024 * 1024, // 1MB default
     client_id: ?[Protocol.CLIENT_ID_SIZE]u8 = null, // Unique client identifier (UUID)
+    proxy_mode: bool = false,
 
     const Mode = enum {
         create, // -c: Create new session, attach to it
@@ -207,6 +211,7 @@ fn attach(allocator: std.mem.Allocator, args: Args) !void {
         .detach_char = if (args.no_detach_char) null else args.detach_char,
         .redraw_method = args.redraw_method,
         .client_id = args.client_id,
+        .proxy_mode = args.proxy_mode,
     });
     defer client.deinit();
 
@@ -294,6 +299,8 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
             }
         } else if (std.mem.eql(u8, arg, "-E")) {
             result.no_detach_char = true;
+        } else if (std.mem.eql(u8, arg, "--proxy")) {
+            result.proxy_mode = true;
         } else if (std.mem.eql(u8, arg, "-s")) {
             if (args_iter.next()) |size_str| {
                 result.scrollback_size = std.fmt.parseInt(usize, size_str, 10) catch 1024 * 1024;
@@ -338,6 +345,7 @@ fn printUsage() void {
         \\  -n          Create detached (no attach)
         \\  -e CHAR     Set detach character (default: ^\)
         \\  -E          Disable detach character
+        \\  --proxy     Proxy mode (forward handshake, wait for client upgrade)
         \\  -r METHOD   Redraw method: none, ctrl_l, winch
         \\  -s SIZE     Scrollback buffer size in bytes (default: 1MB)
         \\  -C UUID     Client ID for deduplication

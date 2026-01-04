@@ -238,6 +238,7 @@ export function connectClient(
     detachChar?: string;
     noDetachChar?: boolean;
     redrawMethod?: "none" | "ctrl_l" | "winch";
+    proxyMode?: boolean;
   } = {}
 ): Subprocess {
   const args = ["-a", socketPath];
@@ -250,6 +251,9 @@ export function connectClient(
 
   if (options.redrawMethod) {
     args.push("-r", options.redrawMethod);
+  }
+  if (options.proxyMode) {
+    args.push("--proxy");
   }
 
   const proc = spawn([RTACH_BIN, ...args], {

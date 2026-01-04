@@ -1,5 +1,5 @@
 import { describe, test, expect, beforeEach, afterEach, afterAll } from "bun:test";
-import { spawn } from "bun";
+import { spawn, type Subprocess } from "bun";
 import {
   RTACH_BIN,
   uniqueSocketPath,
@@ -32,6 +32,78 @@ import {
 } from "./helpers";
 import { existsSync, readFileSync } from "fs";
 import { tmpdir } from "os";
+
+type BinaryReaderState = {
+  reader: ReadableStreamDefaultReader<Uint8Array>;
+  buffer: Buffer;
+  pendingRead: Promise<ReadableStreamReadResult<Uint8Array>> | null;
+};
+
+const binaryReaders = new WeakMap<Subprocess, BinaryReaderState>();
+
+function getBinaryReader(proc: Subprocess): BinaryReaderState {
+  const existing = binaryReaders.get(proc);
+  if (existing) return existing;
+  const reader = proc.stdout?.getReader();
+  if (!reader) {
+    throw new Error("No stdout reader available");
+  }
+  const state: BinaryReaderState = {
+    reader,
+    buffer: Buffer.alloc(0),
+    pendingRead: null,
+  };
+  binaryReaders.set(proc, state);
+  return state;
+}
+
+async function readMore(state: BinaryReaderState, timeoutMs: number): Promise<boolean> {
+  if (!state.pendingRead) {
+    state.pendingRead = state.reader.read();
+  }
+
+  const timeoutPromise = new Promise<null>((resolve) =>
+    setTimeout(() => resolve(null), timeoutMs)
+  );
+
+  const result = await Promise.race([state.pendingRead, timeoutPromise]);
+  if (result === null) {
+    return false;
+  }
+
+  state.pendingRead = null;
+  if (result.done) {
+    throw new Error("stdout closed");
+  }
+
+  if (result.value) {
+    state.buffer = Buffer.concat([state.buffer, Buffer.from(result.value)]);
+  }
+  return true;
+}
+
+async function readFrame(
+  state: BinaryReaderState,
+  timeoutMs: number
+): Promise<{ type: number; payload: Buffer } | null> {
+  const endTime = Date.now() + timeoutMs;
+
+  while (Date.now() < endTime) {
+    if (state.buffer.length >= RESPONSE_HEADER_SIZE) {
+      const typeByte = state.buffer[0];
+      const len = state.buffer.readUInt32LE(1);
+      const total = RESPONSE_HEADER_SIZE + len;
+      if (state.buffer.length >= total) {
+        const payload = state.buffer.subarray(RESPONSE_HEADER_SIZE, total);
+        state.buffer = state.buffer.subarray(total);
+        return { type: typeByte, payload };
+      }
+    }
+    await readMore(state, 50);
+  }
+
+  return null;
+}
 
 describe("rtach CLI", () => {
   afterEach(cleanupAll);
@@ -278,7 +350,7 @@ describe("rtach window size", () => {
   afterEach(cleanupAll);
 
   test("client can query terminal size via stty", async () => {
-    const client = connectClient(socketPath, { noDetachChar: true });
+    const client = connectClient(socketPath, { noDetachChar: true, proxyMode: true });
 
     // Run stty size command
     await writeToProc(client, "stty size\n");
@@ -930,6 +1002,80 @@ describe("rtach raw mode (no upgrade)", () => {
 
     rawConn.close();
     expect(foundIdle).toBe(false);
+  });
+});
+
+describe("rtach proxy upgrade ordering", () => {
+  let socketPath: string;
+  let master: ReturnType<typeof spawn>;
+
+  beforeEach(async () => {
+    socketPath = uniqueSocketPath();
+    master = await startDetachedMaster(socketPath, "/bin/cat");
+  });
+
+  afterEach(cleanupAll);
+
+  test("proxy waits for upgrade before forwarding input", async () => {
+    const client = connectClient(socketPath, { noDetachChar: true });
+    const readerState = getBinaryReader(client);
+
+    const handshakeFrame = await readFrame(readerState, 5000);
+    expect(handshakeFrame).not.toBeNull();
+    if (!handshakeFrame) {
+      throw new Error("Missing handshake frame");
+    }
+
+    const handshakeType = handshakeFrame.type & ~COMPRESSION_FLAG;
+    expect(handshakeType).toBe(ResponseType.HANDSHAKE);
+    expect(handshakeFrame.payload.length).toBe(HANDSHAKE_SIZE);
+    const magic = handshakeFrame.payload.readUInt32LE(0);
+    expect(magic).toBe(HANDSHAKE_MAGIC);
+
+    // Send raw input before upgrade; it should be dropped.
+    if (!client.stdin) {
+      throw new Error("No stdin available");
+    }
+    client.stdin.write("PREUPGRADE_INPUT");
+    client.stdin.flush();
+    await readMore(readerState, 200);
+    expect(readerState.buffer.toString("utf8")).not.toContain("PREUPGRADE_INPUT");
+    readerState.buffer = Buffer.alloc(0);
+
+    // Send upgrade packet to switch to framed mode.
+    client.stdin.write(Buffer.from([MessageType.UPGRADE, 0]));
+    client.stdin.flush();
+    await Bun.sleep(50);
+
+    // Send framed push packet.
+    const marker = `PROXY_TEST_${Date.now()}`;
+    const payload = Buffer.from(marker);
+    const push = Buffer.alloc(2 + payload.length);
+    push[0] = MessageType.PUSH;
+    push[1] = payload.length;
+    payload.copy(push, 2);
+    client.stdin.write(push);
+    client.stdin.flush();
+
+    const deadline = Date.now() + 2000;
+    while (Date.now() < deadline) {
+      const frame = await readFrame(readerState, 200);
+      if (!frame) {
+        continue;
+      }
+      const frameType = frame.type & ~COMPRESSION_FLAG;
+      if (frameType === ResponseType.TERMINAL_DATA) {
+        if (frame.payload.toString("utf8").includes(marker)) {
+          client.kill(9);
+          await client.exited;
+          return;
+        }
+      }
+    }
+
+    client.kill(9);
+    await client.exited;
+    throw new Error("Timeout waiting for framed response after upgrade");
   });
 });
 

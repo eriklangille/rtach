@@ -15,6 +15,7 @@ pub const ClientOptions = struct {
     detach_char: ?u8 = 0x1c, // Ctrl+\ by default
     redraw_method: RedrawMethod = .none,
     client_id: ?[Protocol.CLIENT_ID_SIZE]u8 = null, // Unique client identifier
+    proxy_mode: bool = false,
 };
 
 pub const Client = struct {
@@ -24,6 +25,9 @@ pub const Client = struct {
     orig_termios: ?std.c.termios = null,
     running: bool = true,
     stdin_framed: bool = false, // True after iOS sends upgrade packet
+    stdin_is_tty: bool = false,
+    handshake_received: bool = false,
+    pending_post_upgrade_setup: bool = false,
     // Buffer for incomplete framed packets (when packet spans multiple reads)
     // 4KB buffer handles packets up to ~16 max-size push packets
     stdin_buffer: [4096]u8 = undefined,
@@ -69,7 +73,8 @@ pub const Client = struct {
     }
 
     fn setupRawTerminal(self: *Client) !void {
-        if (!posix.isatty(STDIN_FILENO)) {
+        self.stdin_is_tty = posix.isatty(STDIN_FILENO);
+        if (!self.stdin_is_tty) {
             return;
         }
 
@@ -172,16 +177,38 @@ pub const Client = struct {
         const handshake = Protocol.Handshake.parse(buf[Protocol.RESPONSE_HEADER_SIZE..]);
         if (handshake) |h| {
             if (h.isValid()) {
-                // DON'T send upgrade to master yet - wait for iOS to send its upgrade
-                // with compression preference, then forward that to master.
-                // For now, send basic upgrade so master switches to framed mode
-                const upgrade_pkt = Protocol.Packet.initUpgrade();
-                _ = try posix.write(self.socket_fd, upgrade_pkt.serialize());
+                self.handshake_received = true;
 
-                // Relay handshake to stdout so iOS client can see it
-                // iOS connects via SSH to us, needs to do its own upgrade
-                _ = try posix.write(STDOUT_FILENO, buf[0..handshake_frame_size]);
+                if (self.options.proxy_mode) {
+                    // Proxy mode: wait for iOS upgrade, only forward handshake to stdout
+                    _ = try posix.write(STDOUT_FILENO, buf[0..handshake_frame_size]);
+                } else {
+                    // CLI mode: upgrade master immediately, no handshake forwarded to stdout
+                    const upgrade_pkt = Protocol.Packet.initUpgrade();
+                    _ = try posix.write(self.socket_fd, upgrade_pkt.serialize());
+                }
             }
+        }
+    }
+
+    fn sendPostUpgradeSetup(self: *Client) !void {
+        const client_id_ptr: ?*const [Protocol.CLIENT_ID_SIZE]u8 = if (self.options.client_id) |*id| id else null;
+        const attach_pkt = Protocol.Packet.initAttach(client_id_ptr);
+        _ = try posix.write(self.socket_fd, attach_pkt.serialize());
+
+        try self.sendWindowSize();
+
+        // Handle redraw request if specified
+        switch (self.options.redraw_method) {
+            .ctrl_l => {
+                const pkt = Protocol.Packet.init(.push, "\x0c");
+                _ = try posix.write(self.socket_fd, pkt.serialize());
+            },
+            .winch => {
+                const pkt = Protocol.Packet.initRedraw();
+                _ = try posix.write(self.socket_fd, pkt.serialize());
+            },
+            .none => {},
         }
     }
 
@@ -193,27 +220,11 @@ pub const Client = struct {
         // Wait for handshake from server and send upgrade
         try self.handleProtocolUpgrade();
 
-        // Send attach message with optional client_id
-        const client_id_ptr: ?*const [Protocol.CLIENT_ID_SIZE]u8 = if (self.options.client_id) |*id| id else null;
-        const attach_pkt = Protocol.Packet.initAttach(client_id_ptr);
-        _ = try posix.write(self.socket_fd, attach_pkt.serialize());
-
-        // Send initial window size
-        try self.sendWindowSize();
-
-        // Handle redraw request if specified
-        switch (self.options.redraw_method) {
-            .ctrl_l => {
-                // Send Ctrl+L
-                const pkt = Protocol.Packet.init(.push, "\x0c");
-                _ = try posix.write(self.socket_fd, pkt.serialize());
-            },
-            .winch => {
-                // Send redraw request
-                const pkt = Protocol.Packet.initRedraw();
-                _ = try posix.write(self.socket_fd, pkt.serialize());
-            },
-            .none => {},
+        const defer_setup = self.options.proxy_mode and self.handshake_received;
+        if (defer_setup) {
+            self.pending_post_upgrade_setup = true;
+        } else {
+            try self.sendPostUpgradeSetup();
         }
 
         // Setup SIGWINCH handler
@@ -306,6 +317,10 @@ pub const Client = struct {
 
                     // Forward upgrade packet to master so it knows compression preference
                     _ = posix.write(self.socket_fd, data[0..upgrade_packet_size]) catch {};
+                    if (self.pending_post_upgrade_setup) {
+                        self.pending_post_upgrade_setup = false;
+                        self.sendPostUpgradeSetup() catch {};
+                    }
 
                     data = data[upgrade_packet_size..]; // Skip upgrade packet
                     // Update buffer to skip upgrade packet
@@ -317,7 +332,18 @@ pub const Client = struct {
                         self.stdin_buffered = 0;
                         return false;
                     }
+                } else if (self.options.proxy_mode and self.handshake_received) {
+                    // Wait for full upgrade packet before forwarding any input
+                    return false;
                 }
+            } else if (self.options.proxy_mode and self.handshake_received) {
+                if (data.len < 2) {
+                    // Possible start of upgrade packet - wait for more
+                    return false;
+                }
+                // Drop any non-upgrade bytes while waiting for iOS upgrade
+                self.stdin_buffered = 0;
+                return false;
             }
         }
 
