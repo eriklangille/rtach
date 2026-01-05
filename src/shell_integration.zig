@@ -154,6 +154,22 @@ pub fn deployIntegrationFiles() !void {
         try f.writeAll(content);
     }
 
+    // Zsh wrapper (zprofile in ZDOTDIR)
+    {
+        var file_path_buf: [512]u8 = undefined;
+        const file_path = try std.fmt.bufPrint(&file_path_buf, "{s}/.zprofile", .{dir_path});
+        const f = try std.fs.createFileAbsolute(file_path, .{});
+        defer f.close();
+
+        var content_buf: [1024]u8 = undefined;
+        const content = try std.fmt.bufPrint(&content_buf,
+            \\# Clauntty zprofile wrapper - sources user config
+            \\[ -f ~/.zprofile ] && . ~/.zprofile
+            \\
+        , .{});
+        try f.writeAll(content);
+    }
+
     // Zsh wrapper (zshrc in ZDOTDIR)
     {
         var file_path_buf: [512]u8 = undefined;
@@ -212,6 +228,7 @@ pub fn prepareShellArgs(
         var init_cmd: [1024:0]u8 = undefined;
         var rcfile_arg: [10:0]u8 = undefined;
         var init_cmd_arg: [16:0]u8 = undefined;
+        var login_arg: [3:0]u8 = undefined;
     };
 
     switch (shell_type) {
@@ -226,12 +243,14 @@ pub fn prepareShellArgs(
             setup.argc = 3;
         },
         .zsh => {
-            // For zsh, set ZDOTDIR to our integration directory
+            // For zsh, set ZDOTDIR to our integration directory and run as login shell
             _ = std.fmt.bufPrintZ(&S.zdotdir_name, "ZDOTDIR", .{}) catch unreachable;
             const zdotdir = std.fmt.bufPrintZ(&S.zdotdir_value, "{s}/.clauntty/shell-integration", .{home}) catch return error.PathTooLong;
+            _ = std.fmt.bufPrintZ(&S.login_arg, "-l", .{}) catch unreachable;
 
             setup.argv[0] = shell_path;
-            setup.argc = 1;
+            setup.argv[1] = &S.login_arg;
+            setup.argc = 2;
             setup.env_name = &S.zdotdir_name;
             setup.env_value = zdotdir.ptr;
         },
