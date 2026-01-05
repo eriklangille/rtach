@@ -35,6 +35,7 @@ The iOS app uses the version to determine when to redeploy the binary to remote 
 - Magic: `RTCH` (0x48435452)
 - Client→Server: `[type:1B][len:1B][payload]` (max 255B)
 - Server→Client: `[type:1B][len:4B][payload]`
+- Active claim: `[type=10][len=0]` (foreground client for size/commands)
 
 ### Compression
 

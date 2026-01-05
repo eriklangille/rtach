@@ -564,6 +564,9 @@ export const MessageType = {
   REQUEST_SCROLLBACK: 5,
   REQUEST_SCROLLBACK_PAGE: 6,
   UPGRADE: 7,
+  PAUSE: 8,
+  RESUME: 9,
+  CLAIM_ACTIVE: 10,
 } as const;
 
 export const ResponseType = {

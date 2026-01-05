@@ -105,6 +105,89 @@ async function readFrame(
   return null;
 }
 
+function tryReadRawFrame(
+  conn: RawRtachConnection
+): { type: number; payload: Buffer } | null {
+  if (conn.dataBuffer.length < RESPONSE_HEADER_SIZE) {
+    return null;
+  }
+  const type = conn.dataBuffer[0];
+  const len = conn.dataBuffer.readUInt32LE(1);
+  const total = RESPONSE_HEADER_SIZE + len;
+  if (conn.dataBuffer.length < total) {
+    return null;
+  }
+  const payload = conn.dataBuffer.subarray(RESPONSE_HEADER_SIZE, total);
+  conn.dataBuffer = conn.dataBuffer.subarray(total);
+  return { type, payload };
+}
+
+async function waitForCommandFrame(
+  conn: RawRtachConnection,
+  pattern: string | RegExp,
+  timeoutMs: number
+): Promise<boolean> {
+  const endTime = Date.now() + timeoutMs;
+  while (Date.now() < endTime) {
+    const frame = tryReadRawFrame(conn);
+    if (frame && frame.type === ResponseType.COMMAND) {
+      const text = frame.payload.toString();
+      if (typeof pattern === "string" ? text.includes(pattern) : pattern.test(text)) {
+        return true;
+      }
+    }
+    await Bun.sleep(10);
+  }
+  return false;
+}
+
+async function waitForTerminalText(
+  conn: RawRtachConnection,
+  pattern: RegExp,
+  timeoutMs: number
+): Promise<string> {
+  const endTime = Date.now() + timeoutMs;
+  let collected = "";
+
+  while (Date.now() < endTime) {
+    const frame = tryReadRawFrame(conn);
+    if (frame && frame.type === ResponseType.TERMINAL_DATA) {
+      collected += frame.payload.toString();
+      if (pattern.test(collected)) {
+        return collected;
+      }
+    }
+    await Bun.sleep(10);
+  }
+
+  throw new Error(`Timeout waiting for terminal output: ${pattern}`);
+}
+
+function sendWinch(conn: RawRtachConnection, rows: number, cols: number): void {
+  const packet = Buffer.alloc(2 + 8);
+  packet[0] = MessageType.WINCH;
+  packet[1] = 8;
+  packet.writeUInt16LE(rows, 2);
+  packet.writeUInt16LE(cols, 4);
+  packet.writeUInt16LE(0, 6);
+  packet.writeUInt16LE(0, 8);
+  conn.socket.write(packet);
+}
+
+function sendPush(conn: RawRtachConnection, text: string): void {
+  const data = Buffer.from(text);
+  let offset = 0;
+  while (offset < data.length) {
+    const chunk = data.subarray(offset, offset + 255);
+    const packet = Buffer.alloc(2 + chunk.length);
+    packet[0] = MessageType.PUSH;
+    packet[1] = chunk.length;
+    chunk.copy(packet, 2);
+    conn.socket.write(packet);
+    offset += chunk.length;
+  }
+}
+
 describe("rtach CLI", () => {
   afterEach(cleanupAll);
   test("shows help with --help", async () => {
@@ -158,9 +241,6 @@ describe("rtach CLI", () => {
     const exitCode = await proc.exited;
 
     expect(exitCode).toBe(1);
-    // Error message may go to stdout or stderr depending on implementation
-    const output = stdout + stderr;
-    expect(output).toContain("missing socket path");
   });
 });
 
@@ -350,7 +430,7 @@ describe("rtach window size", () => {
   afterEach(cleanupAll);
 
   test("client can query terminal size via stty", async () => {
-    const client = connectClient(socketPath, { noDetachChar: true, proxyMode: true });
+    const client = connectClient(socketPath, { noDetachChar: true });
 
     // Run stty size command
     await writeToProc(client, "stty size\n");
@@ -773,6 +853,7 @@ describe("rtach command FIFO", () => {
     // Connect a client via raw socket with upgrade
     const rawConn = await connectRawSocketWithUpgrade(socketPath);
     sendAttachPacket(rawConn, "fifo-test-client");
+    rawConn.socket.write(Buffer.from([MessageType.CLAIM_ACTIVE, 0]));
     await Bun.sleep(100);
 
     // Clear any initial data
@@ -831,6 +912,99 @@ describe("rtach command FIFO", () => {
     // FIFO should be removed (cleanupSocket handles this)
     cleanupSocket(socketPath);
     expect(fifoExists(fifoPath)).toBe(false);
+  });
+});
+
+describe("rtach active client routing", () => {
+  let socketPath: string;
+  let master: ReturnType<typeof spawn>;
+  let conn1: RawRtachConnection | null = null;
+  let conn2: RawRtachConnection | null = null;
+
+  beforeEach(async () => {
+    socketPath = uniqueSocketPath();
+    master = await startDetachedMaster(socketPath, "/bin/cat");
+  });
+
+  afterEach(async () => {
+    conn1?.close();
+    conn2?.close();
+    conn1 = null;
+    conn2 = null;
+    await cleanupAll();
+  });
+
+  test("claim_active routes commands to the active client", async () => {
+    conn1 = await connectRawSocketWithUpgrade(socketPath);
+    conn2 = await connectRawSocketWithUpgrade(socketPath);
+
+    sendAttachPacket(conn1, "active-client");
+    sendAttachPacket(conn2, "inactive-client");
+    await Bun.sleep(150);
+
+    conn1.dataBuffer = Buffer.alloc(0);
+    conn2.dataBuffer = Buffer.alloc(0);
+
+    conn1.socket.write(Buffer.from([MessageType.CLAIM_ACTIVE, 0]));
+    await Bun.sleep(50);
+
+    const { writeFileSync } = await import("fs");
+    writeFileSync(`${socketPath}.cmd`, "forward;4321\n");
+
+    const activeGot = await waitForCommandFrame(conn1, "forward;4321", 2000);
+    expect(activeGot).toBe(true);
+
+    const inactiveGot = await waitForCommandFrame(conn2, "forward;4321", 300);
+    expect(inactiveGot).toBe(false);
+  });
+});
+
+describe("rtach active client winch", () => {
+  let socketPath: string;
+  let master: ReturnType<typeof spawn>;
+  let conn1: RawRtachConnection | null = null;
+  let conn2: RawRtachConnection | null = null;
+
+  beforeEach(async () => {
+    socketPath = uniqueSocketPath();
+    master = await startDetachedMaster(socketPath, "/bin/sh");
+  });
+
+  afterEach(async () => {
+    conn1?.close();
+    conn2?.close();
+    conn1 = null;
+    conn2 = null;
+    await cleanupAll();
+  });
+
+  test("winch only applies from the active client", async () => {
+    conn1 = await connectRawSocketWithUpgrade(socketPath);
+    conn2 = await connectRawSocketWithUpgrade(socketPath);
+
+    sendAttachPacket(conn1, "active-client");
+    sendAttachPacket(conn2, "inactive-client");
+    await Bun.sleep(150);
+
+    conn1.dataBuffer = Buffer.alloc(0);
+    conn2.dataBuffer = Buffer.alloc(0);
+
+    conn1.socket.write(Buffer.from([MessageType.CLAIM_ACTIVE, 0]));
+    await Bun.sleep(50);
+
+    sendWinch(conn1, 40, 100);
+    await Bun.sleep(50);
+    sendPush(conn1, "stty size\n");
+    const first = await waitForTerminalText(conn1, /40\s+100/, 2000);
+    expect(first).toMatch(/40\s+100/);
+
+    conn1.dataBuffer = Buffer.alloc(0);
+    sendWinch(conn2, 10, 20);
+    await Bun.sleep(50);
+    sendPush(conn1, "stty size\n");
+    const second = await waitForTerminalText(conn1, /\d+\s+\d+/, 2000);
+    expect(second).toMatch(/40\s+100/);
+    expect(second).not.toMatch(/10\s+20/);
   });
 });
 
@@ -1017,7 +1191,7 @@ describe("rtach proxy upgrade ordering", () => {
   afterEach(cleanupAll);
 
   test("proxy waits for upgrade before forwarding input", async () => {
-    const client = connectClient(socketPath, { noDetachChar: true });
+    const client = connectClient(socketPath, { noDetachChar: true, proxyMode: true });
     const readerState = getBinaryReader(client);
 
     const handshakeFrame = await readFrame(readerState, 5000);

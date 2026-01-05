@@ -24,6 +24,8 @@ pub const MessageType = enum(u8) {
     pause = 8,
     /// Resume terminal output streaming (flush buffer and continue)
     @"resume" = 9,
+    /// Claim active client for window size and command routing
+    claim_active = 10,
 };
 
 /// Response types for master → client protocol.
@@ -250,6 +252,15 @@ pub const Packet = struct {
         return .{
             .header = .{
                 .type = .@"resume",
+                .len = 0,
+            },
+        };
+    }
+
+    pub fn initClaimActive() Packet {
+        return .{
+            .header = .{
+                .type = .claim_active,
                 .len = 0,
             },
         };
@@ -606,6 +617,10 @@ test "MessageType resume value" {
     try testing.expectEqual(@as(u8, 9), @intFromEnum(MessageType.@"resume"));
 }
 
+test "MessageType claim_active value" {
+    try testing.expectEqual(@as(u8, 10), @intFromEnum(MessageType.claim_active));
+}
+
 test "ResponseType idle value" {
     try testing.expectEqual(@as(u8, 4), @intFromEnum(ResponseType.idle));
 }
@@ -629,5 +644,16 @@ test "resume packet format" {
     const data = pkt.serialize();
     try testing.expectEqual(@as(usize, 2), data.len);
     try testing.expectEqual(@as(u8, 9), data[0]); // type
+    try testing.expectEqual(@as(u8, 0), data[1]); // len
+}
+
+test "claim_active packet format" {
+    const pkt = Packet.initClaimActive();
+    try testing.expectEqual(MessageType.claim_active, pkt.header.type);
+    try testing.expectEqual(@as(u8, 0), pkt.header.len);
+
+    const data = pkt.serialize();
+    try testing.expectEqual(@as(usize, 2), data.len);
+    try testing.expectEqual(@as(u8, 10), data[0]); // type
     try testing.expectEqual(@as(u8, 0), data[1]); // len
 }

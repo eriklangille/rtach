@@ -278,7 +278,7 @@ describe("client.zig framed stdin handling", () => {
     waitForFramedOutput: (pattern: string, timeoutMs?: number) => Promise<string>;
   }> {
     // Connect client to master
-    client = connectClient(socketPath, { noDetachChar: true });
+    client = connectClient(socketPath, { noDetachChar: true, proxyMode: true });
 
     // Wait for handshake from server (relayed through client stdout)
     // Handshake: [type=255][len=8 LE][payload=8]

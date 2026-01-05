@@ -2,6 +2,7 @@ const std = @import("std");
 const xev = @import("xev");
 const posix = std.posix;
 const Protocol = @import("protocol.zig");
+const compression = @import("compression.zig");
 
 const log = std.log.scoped(.client);
 
@@ -28,6 +29,10 @@ pub const Client = struct {
     stdin_is_tty: bool = false,
     handshake_received: bool = false,
     pending_post_upgrade_setup: bool = false,
+    socket_header_buf: [Protocol.RESPONSE_HEADER_SIZE]u8 = undefined,
+    socket_header_read: usize = 0,
+    socket_payload_remaining: usize = 0,
+    socket_payload_type: u8 = 0,
     // Buffer for incomplete framed packets (when packet spans multiple reads)
     // 4KB buffer handles packets up to ~16 max-size push packets
     stdin_buffer: [4096]u8 = undefined,
@@ -389,6 +394,10 @@ pub const Client = struct {
                     // Forward resume to master
                     const pkt = Protocol.Packet.initResume();
                     _ = try posix.write(self.socket_fd, pkt.serialize());
+                } else if (pkt_type == @intFromEnum(Protocol.MessageType.claim_active)) {
+                    // Forward active claim to master
+                    const pkt = Protocol.Packet.initClaimActive();
+                    _ = try posix.write(self.socket_fd, pkt.serialize());
                 }
                 // Other packet types: ignore
                 offset += 2 + pkt_len_usize;
@@ -435,8 +444,62 @@ pub const Client = struct {
         const n = try posix.read(self.socket_fd, &buf);
         if (n == 0) return error.ConnectionClosed;
 
-        // Write directly to stdout (raw terminal output from master)
-        _ = try posix.write(STDOUT_FILENO, buf[0..n]);
+        // Proxy mode or legacy server without handshake: forward raw bytes.
+        if (self.options.proxy_mode or !self.handshake_received) {
+            _ = try posix.write(STDOUT_FILENO, buf[0..n]);
+            return;
+        }
+
+        self.processFramedSocket(buf[0..n]);
+    }
+
+    fn processFramedSocket(self: *Client, data: []const u8) void {
+        var offset: usize = 0;
+
+        while (offset < data.len) {
+            if (self.socket_payload_remaining == 0) {
+                const needed = Protocol.RESPONSE_HEADER_SIZE - self.socket_header_read;
+                const take = @min(needed, data.len - offset);
+                std.mem.copyForwards(
+                    u8,
+                    self.socket_header_buf[self.socket_header_read..][0..take],
+                    data[offset..][0..take],
+                );
+                self.socket_header_read += take;
+                offset += take;
+
+                if (self.socket_header_read < Protocol.RESPONSE_HEADER_SIZE) {
+                    continue;
+                }
+
+                const type_byte = self.socket_header_buf[0];
+                const payload_len = std.mem.readInt(u32, self.socket_header_buf[1..5], .little);
+                self.socket_payload_type = type_byte;
+                self.socket_payload_remaining = @intCast(payload_len);
+                self.socket_header_read = 0;
+
+                if (self.socket_payload_remaining == 0) {
+                    self.socket_payload_type = 0;
+                }
+                continue;
+            }
+
+            const take = @min(self.socket_payload_remaining, data.len - offset);
+            const chunk = data[offset..][0..take];
+            const response_type = compression.getResponseType(self.socket_payload_type);
+            const is_compressed = compression.isCompressed(self.socket_payload_type);
+
+            if (response_type == @intFromEnum(Protocol.ResponseType.terminal_data) and !is_compressed) {
+                _ = posix.write(STDOUT_FILENO, chunk) catch {};
+            }
+
+            self.socket_payload_remaining -= take;
+            offset += take;
+
+            if (self.socket_payload_remaining == 0) {
+                self.socket_payload_type = 0;
+            }
+        }
     }
 };
 

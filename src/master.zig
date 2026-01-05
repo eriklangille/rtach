@@ -253,6 +253,14 @@ const ClientConn = struct {
     /// When true, fd has been closed and client will be destroyed when callback fires
     /// Used for safe deferred destruction (e.g., when kicking duplicate clients)
     pending_remove: bool = false,
+    /// Timestamp of last input received from this client (nanoseconds)
+    last_input_ns: i128 = 0,
+    /// Timestamp of last explicit active claim (nanoseconds)
+    last_claim_ns: i128 = 0,
+    /// Timestamp of last attach event (nanoseconds)
+    last_attach_ns: i128 = 0,
+    /// Whether this client can receive command frames (e.g., Clauntty)
+    supports_commands: bool = false,
 };
 
 pub const Master = struct {
@@ -287,6 +295,8 @@ pub const Master = struct {
 
     // Connected clients
     clients: std.ArrayListUnmanaged(*ClientConn) = .{},
+    /// Active client for window size and command routing
+    active_client: ?*ClientConn = null,
 
     // Event loop
     loop: xev.Loop,
@@ -507,6 +517,15 @@ pub const Master = struct {
             // This is the path to the FIFO that scripts can write to
             _ = setenv("RTACH_CMD_PIPE", fifo_path_z, 1);
 
+            // Set BROWSER to open-browser so CLI tools use iOS browser
+            if (std.posix.getenv("HOME")) |home| {
+                var browser_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+                const browser_path = std.fmt.bufPrintZ(&browser_path_buf, "{s}/.clauntty/bin/open-browser", .{home}) catch null;
+                if (browser_path) |path| {
+                    _ = setenv("BROWSER", path, 1);
+                }
+            }
+
             // Deploy shell integration files
             ShellIntegration.deployIntegrationFiles() catch |err| {
                 log.warn("failed to deploy shell integration: {}", .{err});
@@ -514,7 +533,6 @@ pub const Master = struct {
 
             // Detect shell type and prepare args with integration
             const shell_type = ShellIntegration.detectShellType(self.options.command);
-            log.info("detected shell type: {s}", .{@tagName(shell_type)});
 
             const shell_setup = ShellIntegration.prepareShellArgs(
                 self.allocator,
@@ -538,18 +556,35 @@ pub const Master = struct {
                 }
             }
 
-            // Log the command being executed
-            log.info("executing shell: {s}", .{shell_setup.argv[0].?});
-            if (shell_setup.argc > 1) {
-                if (shell_setup.argv[1]) |arg1| {
-                    log.info("  arg1: {s}", .{arg1});
+            const arg1 = if (shell_setup.argc > 1 and shell_setup.argv[1] != null)
+                std.mem.span(shell_setup.argv[1].?)
+            else
+                "-";
+            const arg2 = if (shell_setup.argc > 2 and shell_setup.argv[2] != null)
+                std.mem.span(shell_setup.argv[2].?)
+            else
+                "-";
+
+            const integration_dir = blk: {
+                if (std.posix.getenv("HOME")) |home| {
+                    var path_buf: [512]u8 = undefined;
+                    const path = std.fmt.bufPrint(&path_buf, "{s}/.clauntty/shell-integration", .{home}) catch break :blk "unknown";
+                    break :blk path;
                 }
-            }
-            if (shell_setup.argc > 2) {
-                if (shell_setup.argv[2]) |arg2| {
-                    log.info("  arg2: {s}", .{arg2});
+                break :blk "unknown";
+            };
+
+            const session_name = blk: {
+                if (std.mem.lastIndexOf(u8, self.options.socket_path, "/")) |idx| {
+                    break :blk self.options.socket_path[idx + 1 ..];
                 }
-            }
+                break :blk self.options.socket_path;
+            };
+
+            log.info(
+                "shell setup: dir={s} shell={s} exec={s} arg1={s} arg2={s} detach=Ctrl-\\ kill=pkill -f 'rtach.*{s}'",
+                .{ integration_dir, @tagName(shell_type), shell_setup.argv[0].?, arg1, arg2, session_name },
+            );
 
             // Execute shell with integration
             _ = posix.execvpeZ(shell_setup.argv[0].?, &shell_setup.argv, std.c.environ) catch {};
@@ -891,13 +926,83 @@ pub const Master = struct {
     fn sendCommandToClients(self: *Master, cmd: []const u8) void {
         log.info("sending command to clients: {s}", .{cmd});
 
-        // Send to all attached clients (framed)
+        const target = self.pickCommandTarget();
+        if (target) |client| {
+            writeFramed(client.fd, .command, cmd);
+        } else {
+            log.info("no eligible command client (dropping command)", .{});
+        }
+    }
+
+    fn isClientEligible(self: *Master, client: *ClientConn, require_commands: bool) bool {
+        _ = self;
+        if (client.pending_remove or !client.attached) return false;
+        if (require_commands and (!client.supports_commands or !client.framed_mode)) return false;
+        return true;
+    }
+
+    fn mostRecentActivityClient(self: *Master, require_commands: bool) ?*ClientConn {
+        var best: ?*ClientConn = null;
+        var best_time: i128 = 0;
+
         for (self.clients.items) |client| {
-            if (client.pending_remove) continue;
-            if (client.attached) {
-                writeFramed(client.fd, .command, cmd);
+            if (!self.isClientEligible(client, require_commands)) continue;
+            const activity = @max(client.last_claim_ns, client.last_input_ns);
+            if (activity == 0) continue;
+            if (activity > best_time) {
+                best_time = activity;
+                best = client;
             }
         }
+
+        return best;
+    }
+
+    fn mostRecentAttachClient(self: *Master, require_commands: bool) ?*ClientConn {
+        var best: ?*ClientConn = null;
+        var best_time: i128 = 0;
+
+        for (self.clients.items) |client| {
+            if (!self.isClientEligible(client, require_commands)) continue;
+            if (client.last_attach_ns == 0) continue;
+            if (client.last_attach_ns > best_time) {
+                best_time = client.last_attach_ns;
+                best = client;
+            }
+        }
+
+        return best;
+    }
+
+    fn pickActiveClient(self: *Master) ?*ClientConn {
+        if (self.mostRecentActivityClient(false)) |activity| {
+            return activity;
+        }
+
+        return self.mostRecentAttachClient(false);
+    }
+
+    fn updateActiveClient(self: *Master) void {
+        const previous = self.active_client;
+        const chosen = self.pickActiveClient();
+        if (previous != chosen) {
+            log.debug("active client update: {} -> {}", .{
+                if (previous) |client| client.fd else -1,
+                if (chosen) |client| client.fd else -1,
+            });
+        }
+        self.active_client = chosen;
+    }
+
+    fn pickCommandTarget(self: *Master) ?*ClientConn {
+        self.updateActiveClient();
+
+        if (self.active_client) |client| {
+            if (self.isClientEligible(client, true)) return client;
+        }
+
+        if (self.mostRecentActivityClient(true)) |activity| return activity;
+        return self.mostRecentAttachClient(true);
     }
 
     /// Send handshake to client after attach
@@ -1150,6 +1255,8 @@ pub const Master = struct {
                     };
                     // Forward remaining data to PTY (if any)
                     if (data.len > packet_len) {
+                        client.last_input_ns = std.time.nanoTimestamp();
+                        self.updateActiveClient();
                         _ = posix.write(self.pty_master, data[packet_len..]) catch |err| {
                             log.warn("failed to write to PTY: {}", .{err});
                         };
@@ -1157,6 +1264,8 @@ pub const Master = struct {
                 }
             } else {
                 // Forward to PTY as raw input
+                client.last_input_ns = std.time.nanoTimestamp();
+                self.updateActiveClient();
                 _ = posix.write(self.pty_master, data) catch |err| {
                     log.warn("failed to write to PTY: {}", .{err});
                 };
@@ -1203,6 +1312,8 @@ pub const Master = struct {
 
                 log.info("client {} attached (client_id: {}, alt_screen: {})", .{ idx, if (client_id != null) @as(u64, @bitCast(client_id.?[0..8].*)) else 0, self.in_alternate_screen });
                 self.clients.items[idx].attached = true;
+                self.clients.items[idx].last_attach_ns = std.time.nanoTimestamp();
+                self.updateActiveClient();
 
                 // Handshake already sent on connect, now send scrollback
 
@@ -1266,17 +1377,36 @@ pub const Master = struct {
                     log.info("sent idle to newly attached client {} (session was already idle)", .{idx});
                 }
             },
+            .claim_active => {
+                const now_ns = std.time.nanoTimestamp();
+                const client = self.clients.items[idx];
+                client.last_claim_ns = now_ns;
+                client.supports_commands = true;
+                self.updateActiveClient();
+                log.info("client {} claimed active", .{client.fd});
+            },
             .detach => {
                 log.info("client {} detached", .{idx});
                 self.clients.items[idx].attached = false;
+                self.updateActiveClient();
             },
             .push => {
                 const payload = pkt.getPayload();
                 if (payload.len > 0) {
+                    self.clients.items[idx].last_input_ns = std.time.nanoTimestamp();
+                    self.updateActiveClient();
                     _ = try posix.write(self.pty_master, payload);
                 }
             },
             .winch => {
+                const client = self.clients.items[idx];
+                self.updateActiveClient();
+                if (self.active_client == null) {
+                    self.active_client = client;
+                } else if (self.active_client.? != client) {
+                    log.debug("ignoring winch from non-active client {}", .{client.fd});
+                    return;
+                }
                 if (pkt.getWinsize()) |ws| {
                     const size_changed = ws.cols != self.winsize.cols or ws.rows != self.winsize.rows;
                     self.winsize = ws;
@@ -1693,11 +1823,15 @@ pub const Master = struct {
     fn removeClient(self: *Master, idx: usize) void {
         const client = self.clients.items[idx];
         log.info("client {} disconnected", .{client.fd});
+        if (self.active_client != null and self.active_client.? == client) {
+            self.active_client = null;
+        }
         // Don't close fd if pending_remove - it was already closed by kick logic
         if (!client.pending_remove) {
             posix.close(client.fd);
         }
         self.allocator.destroy(client);
         _ = self.clients.swapRemove(idx);
+        self.updateActiveClient();
     }
 };

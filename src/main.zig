@@ -59,7 +59,9 @@ pub const Protocol = @import("protocol.zig");
 /// 2.6.5 - Fix: Proxy client waits for iOS upgrade before upgrading master.
 /// 2.6.6 - Fix: Explicit proxy mode flag to avoid TTY detection mismatch.
 /// 2.7.0 - Interactive session picker: run 'rtach' with no args to select a session.
-pub const version = "2.7.0";
+/// 2.7.1 - Set BROWSER env var to open-browser for CLI tools (gh, python, etc.)
+/// 2.7.2 - Active client claims for window size + command routing.
+pub const version = "2.7.2";
 
 pub const std_options: std.Options = .{
     .log_level = .info,

@@ -153,6 +153,7 @@ Client connects
 | 7 | `upgrade` | None (switches to framed mode) |
 | 8 | `pause` | None (pause terminal output streaming) |
 | 9 | `resume` | None (resume terminal output streaming) |
+| 10 | `claim_active` | None (mark client as active) |
 
 ### Server → Client Frames
 
@@ -193,6 +194,7 @@ Upgrade allows raw output (help text, errors) to pass through before rtach start
 
 | Version | Changes |
 |---------|---------|
+| 2.7.2 | Active client claims for size + command routing |
 | 2.5.x | FIFO command channel (RTACH_CMD_PIPE), multiline paste fix |
 | 2.4.0 | Shell integration (bash/zsh/fish title updates) |
 | 2.3.0 | OSC title parsing (.title file for session picker) |

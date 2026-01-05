@@ -1,6 +1,5 @@
 const std = @import("std");
 const posix = std.posix;
-const log = std.log.scoped(.shell_integration);
 
 /// Shell types we support
 pub const ShellType = enum {
@@ -173,7 +172,6 @@ pub fn deployIntegrationFiles() !void {
         try f.writeAll(content);
     }
 
-    log.info("deployed shell integration files to {s}", .{dir_path});
 }
 
 /// Build argv for shell with integration
