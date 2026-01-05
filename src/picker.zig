@@ -522,8 +522,15 @@ fn formatTimeAgo(timestamp: i64) []const u8 {
 }
 
 /// Show the picker and return the result
+/// Note: The caller owns the returned session ID string (if .existing)
 pub fn showPicker(allocator: std.mem.Allocator) !PickerResult {
     var picker = try Picker.init(allocator);
     defer picker.deinit();
-    return picker.run();
+    const result = try picker.run();
+    // Dupe the session ID before deinit frees it
+    return switch (result) {
+        .existing => |id| .{ .existing = try allocator.dupe(u8, id) },
+        .new_session => .new_session,
+        .quit => .quit,
+    };
 }
