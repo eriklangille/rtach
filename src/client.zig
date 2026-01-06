@@ -33,6 +33,7 @@ pub const Client = struct {
     socket_header_read: usize = 0,
     socket_payload_remaining: usize = 0,
     socket_payload_type: u8 = 0,
+    raw_socket_buffer: std.ArrayList(u8),
     // Buffer for incomplete framed packets (when packet spans multiple reads)
     // 4KB buffer handles packets up to ~16 max-size push packets
     stdin_buffer: [4096]u8 = undefined,
@@ -45,6 +46,7 @@ pub const Client = struct {
         self.* = .{
             .allocator = allocator,
             .options = options,
+            .raw_socket_buffer = .{},
         };
 
         try self.connect();
@@ -56,6 +58,7 @@ pub const Client = struct {
         if (self.socket_fd >= 0) {
             posix.close(self.socket_fd);
         }
+        self.raw_socket_buffer.deinit(self.allocator);
         self.allocator.destroy(self);
     }
 
@@ -133,69 +136,6 @@ pub const Client = struct {
         }
     }
 
-    /// Wait for handshake from server and send upgrade packet
-    fn handleProtocolUpgrade(self: *Client) !void {
-        // Handshake frame: [type=255][len=8 LE][payload=8 bytes] = 13 bytes total
-        const handshake_frame_size = Protocol.RESPONSE_HEADER_SIZE + Protocol.HANDSHAKE_SIZE;
-        var buf: [handshake_frame_size]u8 = undefined;
-        var received: usize = 0;
-
-        // Read handshake frame with timeout (using poll)
-        var poll_fds = [_]posix.pollfd{
-            .{ .fd = self.socket_fd, .events = posix.POLL.IN, .revents = 0 },
-        };
-
-        while (received < handshake_frame_size) {
-            // Poll with 5 second timeout
-            const ready = posix.poll(&poll_fds, 5000) catch |err| {
-                if (err == error.Interrupted) continue;
-                return err;
-            };
-
-            if (ready == 0) {
-                // Timeout - no handshake received, maybe old server version
-                log.warn("No handshake received, proceeding without upgrade", .{});
-                return;
-            }
-
-            if (poll_fds[0].revents & posix.POLL.IN != 0) {
-                const n = try posix.read(self.socket_fd, buf[received..]);
-                if (n == 0) return error.ConnectionClosed;
-                received += n;
-            }
-
-            if (poll_fds[0].revents & (posix.POLL.HUP | posix.POLL.ERR) != 0) {
-                return error.ConnectionClosed;
-            }
-        }
-
-        // Validate handshake frame
-        const resp_type = buf[0];
-        const resp_len = std.mem.readInt(u32, buf[1..5], .little);
-
-        if (resp_type != @intFromEnum(Protocol.ResponseType.handshake) or resp_len != Protocol.HANDSHAKE_SIZE) {
-            log.warn("Invalid handshake frame: type={}, len={}", .{ resp_type, resp_len });
-            return;
-        }
-
-        // Parse handshake payload
-        const handshake = Protocol.Handshake.parse(buf[Protocol.RESPONSE_HEADER_SIZE..]);
-        if (handshake) |h| {
-            if (h.isValid()) {
-                self.handshake_received = true;
-
-                if (self.options.proxy_mode) {
-                    // Proxy mode: wait for iOS upgrade, only forward handshake to stdout
-                    _ = try posix.write(STDOUT_FILENO, buf[0..handshake_frame_size]);
-                } else {
-                    // CLI mode: upgrade master immediately, no handshake forwarded to stdout
-                    const upgrade_pkt = Protocol.Packet.initUpgrade();
-                    _ = try posix.write(self.socket_fd, upgrade_pkt.serialize());
-                }
-            }
-        }
-    }
-
     fn sendPostUpgradeSetup(self: *Client) !void {
         const client_id_ptr: ?*const [Protocol.CLIENT_ID_SIZE]u8 = if (self.options.client_id) |*id| id else null;
         const attach_pkt = Protocol.Packet.initAttach(client_id_ptr);
@@ -221,16 +161,6 @@ pub const Client = struct {
         // Setup raw terminal
         try self.setupRawTerminal();
         errdefer self.restoreTerminal();
-
-        // Wait for handshake from server and send upgrade
-        try self.handleProtocolUpgrade();
-
-        const defer_setup = self.options.proxy_mode and self.handshake_received;
-        if (defer_setup) {
-            self.pending_post_upgrade_setup = true;
-        } else {
-            try self.sendPostUpgradeSetup();
-        }
 
         // Setup SIGWINCH handler
         var sa = posix.Sigaction{
@@ -444,16 +374,109 @@ pub const Client = struct {
         const n = try posix.read(self.socket_fd, &buf);
         if (n == 0) return error.ConnectionClosed;
 
-        // Proxy mode or legacy server without handshake: forward raw bytes.
-        if (self.options.proxy_mode or !self.handshake_received) {
-            _ = try posix.write(STDOUT_FILENO, buf[0..n]);
+        if (self.options.proxy_mode) {
+            if (!self.handshake_received) {
+                try self.processRawSocketData(buf[0..n]);
+            } else {
+                _ = posix.write(STDOUT_FILENO, buf[0..n]) catch {};
+            }
+            return;
+        }
+
+        if (!self.handshake_received) {
+            try self.processRawSocketData(buf[0..n]);
             return;
         }
 
         self.processFramedSocket(buf[0..n]);
     }
 
+    fn dropRawPrefix(self: *Client, count: usize) void {
+        if (count == 0) return;
+        if (count >= self.raw_socket_buffer.items.len) {
+            self.raw_socket_buffer.items.len = 0;
+            return;
+        }
+        const remaining = self.raw_socket_buffer.items.len - count;
+        std.mem.copyForwards(u8, self.raw_socket_buffer.items[0..remaining], self.raw_socket_buffer.items[count..]);
+        self.raw_socket_buffer.items.len = remaining;
+    }
+
+    fn processRawSocketData(self: *Client, data: []const u8) !void {
+        const handshake_frame_size = Protocol.RESPONSE_HEADER_SIZE + Protocol.HANDSHAKE_SIZE;
+
+        if (self.options.proxy_mode) {
+            _ = posix.write(STDOUT_FILENO, data) catch {};
+        }
+
+        try self.raw_socket_buffer.appendSlice(self.allocator, data);
+
+        var i: usize = 0;
+        while (i + handshake_frame_size <= self.raw_socket_buffer.items.len) {
+            const buf = self.raw_socket_buffer.items;
+            const type_byte = buf[i];
+            const len = std.mem.readInt(u32, buf[i + 1 ..][0..4], .little);
+
+            if (type_byte == @intFromEnum(Protocol.ResponseType.handshake) and len == Protocol.HANDSHAKE_SIZE) {
+                const payload_start = i + Protocol.RESPONSE_HEADER_SIZE;
+                const payload = buf[payload_start .. payload_start + Protocol.HANDSHAKE_SIZE];
+                const handshake = Protocol.Handshake.parse(payload);
+                if (handshake) |h| {
+                    if (h.isValid()) {
+                        if (!self.options.proxy_mode and i > 0) {
+                            _ = posix.write(STDOUT_FILENO, buf[0..i]) catch {};
+                        }
+
+                        self.handshake_received = true;
+
+                        if (self.options.proxy_mode) {
+                            if (self.stdin_framed) {
+                                self.sendPostUpgradeSetup() catch {};
+                            } else {
+                                self.pending_post_upgrade_setup = true;
+                            }
+                        } else {
+                            const upgrade_pkt = Protocol.Packet.initUpgrade();
+                            _ = posix.write(self.socket_fd, upgrade_pkt.serialize()) catch {};
+                            self.sendPostUpgradeSetup() catch {};
+                        }
+
+                        if (!self.options.proxy_mode) {
+                            const after = i + handshake_frame_size;
+                            if (after < buf.len) {
+                                self.processFramedSocket(buf[after..]);
+                            }
+                        }
+
+                        self.raw_socket_buffer.items.len = 0;
+                        return;
+                    }
+                }
+            }
+            i += 1;
+        }
+
+        const buf_len = self.raw_socket_buffer.items.len;
+        if (self.options.proxy_mode) {
+            if (buf_len > handshake_frame_size * 2) {
+                const keep = handshake_frame_size - 1;
+                if (buf_len > keep) {
+                    self.dropRawPrefix(buf_len - keep);
+                }
+            }
+        } else {
+            if (buf_len > handshake_frame_size * 2) {
+                const safe_len = buf_len - handshake_frame_size + 1;
+                if (safe_len > 0) {
+                    _ = posix.write(STDOUT_FILENO, self.raw_socket_buffer.items[0..safe_len]) catch {};
+                    self.dropRawPrefix(safe_len);
+                }
+            }
+        }
+    }
+
     fn processFramedSocket(self: *Client, data: []const u8) void {
+        const max_frame_len: u32 = 4 * 1024 * 1024;
         var offset: usize = 0;
 
         while (offset < data.len) {
@@ -474,6 +497,31 @@ pub const Client = struct {
 
                 const type_byte = self.socket_header_buf[0];
                 const payload_len = std.mem.readInt(u32, self.socket_header_buf[1..5], .little);
+                const response_type = compression.getResponseType(type_byte);
+                const is_valid = switch (response_type) {
+                    @intFromEnum(Protocol.ResponseType.terminal_data),
+                    @intFromEnum(Protocol.ResponseType.scrollback),
+                    @intFromEnum(Protocol.ResponseType.command),
+                    @intFromEnum(Protocol.ResponseType.scrollback_page),
+                    @intFromEnum(Protocol.ResponseType.idle),
+                    @intFromEnum(Protocol.ResponseType.handshake),
+                    => true,
+                    else => false,
+                };
+
+                if (!is_valid or payload_len > max_frame_len) {
+                    _ = posix.write(STDOUT_FILENO, self.socket_header_buf[0..1]) catch {};
+                    std.mem.copyForwards(
+                        u8,
+                        self.socket_header_buf[0..Protocol.RESPONSE_HEADER_SIZE - 1],
+                        self.socket_header_buf[1..Protocol.RESPONSE_HEADER_SIZE],
+                    );
+                    self.socket_header_read = Protocol.RESPONSE_HEADER_SIZE - 1;
+                    self.socket_payload_type = 0;
+                    self.socket_payload_remaining = 0;
+                    continue;
+                }
+
                 self.socket_payload_type = type_byte;
                 self.socket_payload_remaining = @intCast(payload_len);
                 self.socket_header_read = 0;
@@ -489,7 +537,10 @@ pub const Client = struct {
             const response_type = compression.getResponseType(self.socket_payload_type);
             const is_compressed = compression.isCompressed(self.socket_payload_type);
 
-            if (response_type == @intFromEnum(Protocol.ResponseType.terminal_data) and !is_compressed) {
+            if (!is_compressed and
+                (response_type == @intFromEnum(Protocol.ResponseType.terminal_data) or
+                response_type == @intFromEnum(Protocol.ResponseType.scrollback)))
+            {
                 _ = posix.write(STDOUT_FILENO, chunk) catch {};
             }
 
