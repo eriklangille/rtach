@@ -86,6 +86,60 @@ fn setupSignalHandlers() void {
     posix.sigaction(posix.SIG.PIPE, &sa_ign, null);
 }
 
+/// Write every byte of `iovs_in` to a client socket. Client sockets are non-blocking, so
+/// writev can accept only part of the data when the socket buffer fills (e.g. a large
+/// resume flush). Ignoring the short count dropped the rest of a frame whose header had
+/// promised the full length, which desynced the client's framing and showed compressed
+/// bytes as terminal text. Waits for the socket to drain instead; a client that makes no
+/// progress for 5s is shut down so it reconnects cleanly rather than receiving a
+/// truncated frame. (The wait blocks the event loop; per-client output queues would avoid
+/// that if slow clients become a problem.)
+fn writeAllVec(fd: posix.fd_t, iovs_in: []const posix.iovec_const) void {
+    var iovs: [4]posix.iovec_const = undefined;
+    std.debug.assert(iovs_in.len <= iovs.len);
+    @memcpy(iovs[0..iovs_in.len], iovs_in);
+    var start: usize = 0;
+    const end = iovs_in.len;
+    while (start < end) {
+        const written = posix.writev(fd, iovs[start..end]) catch |err| switch (err) {
+            error.WouldBlock => {
+                if (!waitWritable(fd)) {
+                    // Stalled or gone mid-frame: the frame can't be completed, so end the
+                    // connection (the read side then sees EOF and removes the client).
+                    posix.shutdown(fd, .both) catch {};
+                    return;
+                }
+                continue;
+            },
+            else => return,
+        };
+        var left = written;
+        while (start < end and left >= iovs[start].len) {
+            left -= iovs[start].len;
+            start += 1;
+        }
+        if (start < end and left > 0) {
+            iovs[start].base += left;
+            iovs[start].len -= left;
+        }
+    }
+}
+
+fn writeAll(fd: posix.fd_t, data: []const u8) void {
+    if (data.len == 0) return;
+    const iov = [1]posix.iovec_const{.{ .base = data.ptr, .len = data.len }};
+    writeAllVec(fd, &iov);
+}
+
+/// Wait up to 5s for a socket to become writable. False if it errored or timed out
+/// (a stalled or gone client); the caller then drops the rest of the write.
+fn waitWritable(fd: posix.fd_t) bool {
+    var pfd = [1]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
+    const ready = posix.poll(&pfd, 5000) catch return false;
+    if (ready == 0) return false;
+    return (pfd[0].revents & (posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL)) == 0;
+}
+
 /// Write multiple slices in a single syscall using writev
 /// More efficient than multiple write() calls for ring buffer slices
 fn writeSlices(fd: posix.fd_t, first: []const u8, second: []const u8) void {
@@ -105,7 +159,7 @@ fn writeSlices(fd: posix.fd_t, first: []const u8, second: []const u8) void {
     }
 
     if (iov_len > 0) {
-        _ = posix.writev(fd, iov[0..iov_len]) catch {};
+        writeAllVec(fd, iov[0..iov_len]);
     }
 }
 
@@ -124,7 +178,7 @@ fn writeFramed(fd: posix.fd_t, response_type: Protocol.ResponseType, data: []con
         .{ .base = data.ptr, .len = data.len },
     };
 
-    _ = posix.writev(fd, &iov) catch {};
+    writeAllVec(fd, &iov);
 }
 
 /// Write framed data using ring buffer slices: [ResponseHeader][first][second]
@@ -152,7 +206,7 @@ fn writeFramedSlices(fd: posix.fd_t, response_type: Protocol.ResponseType, first
         iov_len += 1;
     }
 
-    _ = posix.writev(fd, iov[0..iov_len]) catch {};
+    writeAllVec(fd, iov[0..iov_len]);
 }
 
 /// Thread-local buffers for compression
@@ -185,7 +239,7 @@ fn writeFramedMaybeCompressed(fd: posix.fd_t, response_type: Protocol.ResponseTy
         .{ .base = output.ptr, .len = output.len },
     };
 
-    _ = posix.writev(fd, &iov) catch {};
+    writeAllVec(fd, &iov);
 }
 
 /// Write framed slices with optional compression.
@@ -194,9 +248,16 @@ fn writeFramedSlicesMaybeCompressed(fd: posix.fd_t, response_type: Protocol.Resp
     const total_len = first.len + second.len;
     if (total_len == 0) return;
 
-    // For small data or if we can't fit in buffer, fall back to uncompressed
-    if (!compress or total_len > concat_buf.len) {
+    if (!compress) {
         writeFramedSlices(fd, response_type, first, second);
+        return;
+    }
+
+    // Too big for the compression buffer (e.g. a resume flush after a long pause): send it
+    // as several compressed frames rather than one large uncompressed frame.
+    if (total_len > concat_buf.len) {
+        writeChunkedMaybeCompressed(fd, response_type, first);
+        writeChunkedMaybeCompressed(fd, response_type, second);
         return;
     }
 
@@ -207,6 +268,17 @@ fn writeFramedSlicesMaybeCompressed(fd: posix.fd_t, response_type: Protocol.Resp
 
     // Try to compress
     writeFramedMaybeCompressed(fd, response_type, data, true);
+}
+
+/// Send `data` as consecutive frames of at most concat_buf.len bytes, each compressed when
+/// that makes it smaller. Only for stream-like types (terminal data) where splitting is fine.
+fn writeChunkedMaybeCompressed(fd: posix.fd_t, response_type: Protocol.ResponseType, data: []const u8) void {
+    var offset: usize = 0;
+    while (offset < data.len) {
+        const n = @min(concat_buf.len, data.len - offset);
+        writeFramedMaybeCompressed(fd, response_type, data[offset..][0..n], true);
+        offset += n;
+    }
 }
 
 // Terminal ioctl constants
@@ -736,7 +808,7 @@ pub const Master = struct {
                     writeFramedMaybeCompressed(client.fd, .terminal_data, data, client.compression_enabled);
                 } else {
                     // Raw mode - send terminal data without framing
-                    _ = posix.write(client.fd, data) catch {};
+                    writeAll(client.fd, data);
                 }
             }
         }
@@ -822,7 +894,7 @@ pub const Master = struct {
                         .type = .idle,
                         .len = 0,
                     };
-                    _ = posix.write(client.fd, header.toBytes()) catch {};
+                    writeAll(client.fd, header.toBytes());
                     sent_count += 1;
                     log.info("sent idle to client fd={} (paused={})", .{ client.fd, client.paused });
                 }
@@ -1018,7 +1090,7 @@ pub const Master = struct {
             .{ .base = handshake.toBytes().ptr, .len = Protocol.Handshake.WIRE_SIZE },
         };
 
-        _ = posix.writev(client_fd, &iov) catch {};
+        writeAllVec(client_fd, &iov);
         log.info("sent handshake to client fd={}", .{client_fd});
     }
 
@@ -1373,7 +1445,7 @@ pub const Master = struct {
                         .type = .idle,
                         .len = 0,
                     };
-                    _ = posix.write(self.clients.items[idx].fd, header.toBytes()) catch {};
+                    writeAll(self.clients.items[idx].fd, header.toBytes());
                     log.info("sent idle to newly attached client {} (session was already idle)", .{idx});
                 }
             },
@@ -1457,7 +1529,7 @@ pub const Master = struct {
                         .type = .scrollback,
                         .len = 0,
                     };
-                    _ = posix.write(self.clients.items[idx].fd, header.toBytes()) catch {};
+                    writeAll(self.clients.items[idx].fd, header.toBytes());
                     return;
                 }
 
@@ -1472,7 +1544,7 @@ pub const Master = struct {
                         .type = .scrollback,
                         .len = 0,
                     };
-                    _ = posix.write(self.clients.items[idx].fd, header.toBytes()) catch {};
+                    writeAll(self.clients.items[idx].fd, header.toBytes());
                     log.info("scrollback request: no additional data (all sent on attach)", .{});
                 } else {
                     // Send the OLD scrollback (everything before the last 16KB)
@@ -1481,12 +1553,12 @@ pub const Master = struct {
                         .type = .scrollback,
                         .len = @intCast(old_len),
                     };
-                    _ = posix.write(self.clients.items[idx].fd, header.toBytes()) catch {};
+                    writeAll(self.clients.items[idx].fd, header.toBytes());
 
                     // Send old scrollback data
                     if (old_len <= slices.first.len) {
                         // Old scrollback is entirely in first slice
-                        _ = posix.write(self.clients.items[idx].fd, slices.first[0..old_len]) catch {};
+                        writeAll(self.clients.items[idx].fd, slices.first[0..old_len]);
                     } else {
                         // Old scrollback spans first slice + part of second
                         const second_len = old_len - slices.first.len;
@@ -1511,8 +1583,8 @@ pub const Master = struct {
                         .offset = 0,
                     };
                     const client_fd = self.clients.items[idx].fd;
-                    _ = posix.write(client_fd, header.toBytes()) catch {};
-                    _ = posix.write(client_fd, meta.toBytes()) catch {};
+                    writeAll(client_fd, header.toBytes());
+                    writeAll(client_fd, meta.toBytes());
                     return;
                 }
 
@@ -1547,8 +1619,8 @@ pub const Master = struct {
                 const client_fd = self.clients.items[idx].fd;
 
                 // Send header + metadata
-                _ = posix.write(client_fd, header.toBytes()) catch {};
-                _ = posix.write(client_fd, meta.toBytes()) catch {};
+                writeAll(client_fd, header.toBytes());
+                writeAll(client_fd, meta.toBytes());
 
                 // Send data slice using sliceRange helper
                 if (to_send > 0) {
