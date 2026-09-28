@@ -61,7 +61,7 @@ pub const Protocol = @import("protocol.zig");
 /// 2.7.0 - Interactive session picker: run 'rtach' with no args to select a session.
 /// 2.7.1 - Set BROWSER env var to open-browser for CLI tools (gh, python, etc.)
 /// 2.7.2 - Active client claims for window size + command routing.
-pub const version = "2.7.4";
+pub const version = "2.7.6";
 
 pub const std_options: std.Options = .{
     .log_level = .info,
@@ -424,4 +424,5 @@ test {
     _ = @import("client.zig");
     _ = @import("compression.zig");
     _ = @import("picker.zig");
+    _ = @import("query_filter.zig");
 }

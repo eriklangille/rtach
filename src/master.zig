@@ -15,6 +15,7 @@ const Protocol = @import("protocol.zig");
 const RingBuffer = @import("ringbuffer.zig").DynamicRingBuffer;
 const ShellIntegration = @import("shell_integration.zig");
 const compression = @import("compression.zig");
+const QueryFilter = @import("query_filter.zig").QueryFilter;
 
 const log = std.log.scoped(.master);
 
@@ -377,6 +378,9 @@ pub const Master = struct {
     pty_completion: xev.Completion = .{},
     socket_completion: xev.Completion = .{},
     pty_read_buf: [4096]u8 = undefined,
+    /// Strips terminal queries from output stored for replay (see query_filter.zig)
+    replay_filter: QueryFilter = .{},
+    replay_buf: [4096 + QueryFilter.max_pending]u8 = undefined,
 
     // Window size
     winsize: Protocol.Winsize = .{ .rows = 24, .cols = 80 },
@@ -794,9 +798,11 @@ pub const Master = struct {
         self.last_pty_write_ns = std.time.nanoTimestamp();
         self.idle_notified = false; // Reset - we have new output
 
-        // Store in scrollback
-        self.scrollback.write(data);
-        self.scrollback_total_written += @intCast(data.len);
+        // Store in scrollback, minus queries: stored output is only replayed, and a
+        // replayed query gets a stale reply typed into the program's input
+        const stored = self.replay_filter.process(data, &self.replay_buf);
+        self.scrollback.write(stored);
+        self.scrollback_total_written += @intCast(stored.len);
 
         // Forward to all attached, non-paused clients
         // Paused clients will receive buffered data when they resume

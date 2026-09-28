@@ -296,7 +296,11 @@ pub const Client = struct {
                 }
 
                 pkt_count += 1;
-                if (pkt_type == @intFromEnum(Protocol.MessageType.push)) {
+                if (pkt_type == @intFromEnum(Protocol.MessageType.push) or
+                    pkt_type == @intFromEnum(Protocol.MessageType.redraw) or
+                    pkt_type == @intFromEnum(Protocol.MessageType.request_scrollback) or
+                    pkt_type == @intFromEnum(Protocol.MessageType.request_scrollback_page))
+                {
                     // Forward the raw packet (header + payload) to master
                     const packet_size: usize = 2 + pkt_len_usize;
                     const raw_packet = data[offset..][0..packet_size];

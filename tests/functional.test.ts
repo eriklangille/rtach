@@ -30,7 +30,7 @@ import {
   COMPRESSION_FLAG,
   COMPRESSION_ZLIB,
 } from "./helpers";
-import { existsSync, readFileSync } from "fs";
+import { chmodSync, existsSync, readFileSync, unlinkSync } from "fs";
 import { tmpdir } from "os";
 
 type BinaryReaderState = {
@@ -1250,6 +1250,84 @@ describe("rtach proxy upgrade ordering", () => {
     client.kill(9);
     await client.exited;
     throw new Error("Timeout waiting for framed response after upgrade");
+  });
+
+  test("proxy forwards scrollback page requests to master", async () => {
+    // The proxy used to drop every packet type it didn't know (redraw, scrollback
+    // requests), so the app's redraw and scrollback paging never reached the master.
+    const client = connectClient(socketPath, { noDetachChar: true, proxyMode: true });
+    const readerState = getBinaryReader(client);
+    expect(await readFrame(readerState, 5000)).not.toBeNull(); // handshake
+
+    if (!client.stdin) {
+      throw new Error("No stdin available");
+    }
+    client.stdin.write(Buffer.from([MessageType.UPGRADE, 0]));
+    client.stdin.flush();
+    await Bun.sleep(50);
+
+    // [type][len=8][offset:4 LE][limit:4 LE]
+    const request = Buffer.alloc(10);
+    request[0] = MessageType.REQUEST_SCROLLBACK_PAGE;
+    request[1] = 8;
+    request.writeUInt32LE(0, 2);
+    request.writeUInt32LE(1024, 6);
+    client.stdin.write(request);
+    client.stdin.flush();
+
+    const deadline = Date.now() + 2000;
+    while (Date.now() < deadline) {
+      const frame = await readFrame(readerState, 200);
+      if (frame && (frame.type & ~COMPRESSION_FLAG) === ResponseType.SCROLLBACK_PAGE) {
+        client.kill(9);
+        await client.exited;
+        return;
+      }
+    }
+
+    client.kill(9);
+    await client.exited;
+    throw new Error("Timeout waiting for scrollback_page response through proxy");
+  });
+});
+
+describe("rtach replay drops terminal queries", () => {
+  afterEach(cleanupAll);
+
+  test("attach replay omits a cursor position query the program printed", async () => {
+    // A replayed query gets answered again by the client's terminal, and the stale
+    // answer lands in the program's input (Codex showed "[6;1R" in its prompt).
+    const socketPath = uniqueSocketPath();
+    const script = `${socketPath}.sh`;
+    await Bun.write(script, "#!/bin/sh\nprintf 'BEFORE\\033[6nAFTER\\n'\nexec sleep 30\n");
+    chmodSync(script, 0o755);
+    await startDetachedMaster(socketPath, script);
+    await Bun.sleep(300);
+
+    const client = connectClient(socketPath, { noDetachChar: true, proxyMode: true });
+    const readerState = getBinaryReader(client);
+    expect(await readFrame(readerState, 5000)).not.toBeNull(); // handshake
+    if (!client.stdin) {
+      throw new Error("No stdin available");
+    }
+    client.stdin.write(Buffer.from([MessageType.UPGRADE, 0]));
+    client.stdin.flush();
+
+    let replay = Buffer.alloc(0);
+    const deadline = Date.now() + 2000;
+    while (Date.now() < deadline && !replay.toString("latin1").includes("AFTER")) {
+      const frame = await readFrame(readerState, 200);
+      if (frame && (frame.type & ~COMPRESSION_FLAG) === ResponseType.TERMINAL_DATA) {
+        replay = Buffer.concat([replay, frame.payload]);
+      }
+    }
+    client.kill(9);
+    await client.exited;
+    unlinkSync(script);
+
+    const text = replay.toString("latin1");
+    expect(text).toContain("BEFOREAFTER");
+    expect(text).not.toContain("\x1b[6n");
   });
 });
 
