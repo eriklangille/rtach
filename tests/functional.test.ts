@@ -29,6 +29,8 @@ import {
   HANDSHAKE_MAGIC,
   COMPRESSION_FLAG,
   COMPRESSION_ZLIB,
+  HANDSHAKE_FLAG_HISTORY,
+  HISTORY_BEFORE_REPLAY,
 } from "./helpers";
 import { chmodSync, existsSync, readFileSync, unlinkSync } from "fs";
 import { tmpdir } from "os";
@@ -1328,6 +1330,86 @@ describe("rtach replay drops terminal queries", () => {
     const text = replay.toString("latin1");
     expect(text).toContain("BEFOREAFTER");
     expect(text).not.toContain("\x1b[6n");
+  });
+});
+
+describe("rtach history paging", () => {
+  afterEach(cleanupAll);
+
+  test("replay plus history pages give every line once, in order, without TUI output", async () => {
+    // The app used to page from the oldest byte and prepend each page, so after a
+    // reconnect the history read 1-884 then 2146-3000.
+    const socketPath = uniqueSocketPath();
+    const script = `${socketPath}.sh`;
+    await Bun.write(
+      script,
+      "#!/bin/sh\n" +
+        // The full-screen burst lands in a history page, not the 16KB replay
+        "i=1; while [ $i -le 1000 ]; do echo \"history line $i\"; i=$((i+1)); done\n" +
+        "printf '\\033[?1049hFULLSCREEN APP\\n\\033[?1049l'\n" +
+        "while [ $i -le 3000 ]; do echo \"history line $i\"; i=$((i+1)); done\n" +
+        "echo 'after fullscreen'\n" +
+        "exec sleep 30\n",
+    );
+    chmodSync(script, 0o755);
+    await startDetachedMaster(socketPath, script);
+    await Bun.sleep(1500);
+
+    const client = connectClient(socketPath, { noDetachChar: true, proxyMode: true });
+    const reader = getBinaryReader(client);
+    const handshake = await readFrame(reader, 5000);
+    if (!handshake || !client.stdin) throw new Error("no handshake");
+    expect(handshake.payload.readUInt16LE(6) & HANDSHAKE_FLAG_HISTORY).toBe(HANDSHAKE_FLAG_HISTORY);
+    client.stdin.write(Buffer.from([MessageType.UPGRADE, 0]));
+    client.stdin.flush();
+
+    // Attach replay (last ~16KB)
+    let replay = Buffer.alloc(0);
+    let deadline = Date.now() + 3000;
+    while (Date.now() < deadline && !replay.toString("latin1").includes("after fullscreen")) {
+      const frame = await readFrame(reader, 200);
+      if (frame && (frame.type & ~COMPRESSION_FLAG) === ResponseType.TERMINAL_DATA) {
+        replay = Buffer.concat([replay, frame.payload]);
+      }
+    }
+
+    // Page backwards until the oldest byte
+    const pages: Buffer[] = [];
+    let before = HISTORY_BEFORE_REPLAY;
+    for (let n = 0; n < 50; n++) {
+      const req = Buffer.alloc(14);
+      req[0] = MessageType.REQUEST_HISTORY;
+      req[1] = 12;
+      req.writeBigUInt64LE(before, 2);
+      req.writeUInt32LE(16 * 1024, 10);
+      client.stdin.write(req);
+      client.stdin.flush();
+
+      let page: { type: number; payload: Buffer } | null = null;
+      deadline = Date.now() + 2000;
+      while (!page && Date.now() < deadline) {
+        const frame = await readFrame(reader, 200);
+        if (frame && (frame.type & ~COMPRESSION_FLAG) === ResponseType.HISTORY_PAGE) page = frame;
+      }
+      if (!page) throw new Error("no history_page response");
+      const start = page.payload.readBigUInt64LE(0);
+      const oldest = page.payload.readBigUInt64LE(16);
+      pages.unshift(page.payload.subarray(24));
+      if (start <= oldest) break;
+      before = start;
+    }
+    client.kill(9);
+    await client.exited;
+    unlinkSync(script);
+
+    const historyText = Buffer.concat(pages).toString("latin1");
+    const text = historyText + replay.toString("latin1");
+    const nums = [...text.matchAll(/history line (\d+)\r?\n/g)].map((m) => Number(m[1]));
+    expect(pages.length).toBeGreaterThan(1);
+    expect(nums.length).toBe(3000);
+    expect(nums.every((n, i) => n === i + 1)).toBe(true);
+    expect(historyText).not.toContain("FULLSCREEN APP");
+    expect(text).toContain("after fullscreen");
   });
 });
 

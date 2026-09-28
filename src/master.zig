@@ -16,6 +16,7 @@ const RingBuffer = @import("ringbuffer.zig").DynamicRingBuffer;
 const ShellIntegration = @import("shell_integration.zig");
 const compression = @import("compression.zig");
 const QueryFilter = @import("query_filter.zig").QueryFilter;
+const history = @import("history.zig");
 
 const log = std.log.scoped(.master);
 
@@ -323,6 +324,9 @@ const ClientConn = struct {
     paused: bool = false,
     /// Total bytes written when client was paused (used to flush buffered data on resume)
     paused_total_written: u64 = 0,
+    /// Absolute stream position where this client's attach replay started; history
+    /// pages (request_history) end here
+    replay_start: u64 = 0,
     /// When true, fd has been closed and client will be destroyed when callback fires
     /// Used for safe deferred destruction (e.g., when kicking duplicate clients)
     pending_remove: bool = false,
@@ -1083,9 +1087,17 @@ pub const Master = struct {
         return self.mostRecentAttachClient(true);
     }
 
+    /// Stored output as history.Stored: ring buffer slices plus the absolute position of
+    /// the oldest byte
+    fn storedOutput(self: *const Master) history.Stored {
+        const slices = self.scrollback.slices();
+        const len: u64 = slices.first.len + slices.second.len;
+        return .{ .first = slices.first, .second = slices.second, .oldest = self.scrollback_total_written - len };
+    }
+
     /// Send handshake to client after attach
     fn sendHandshake(client_fd: posix.fd_t) void {
-        const handshake = Protocol.Handshake{};
+        const handshake = Protocol.Handshake{ .flags = Protocol.HANDSHAKE_FLAG_HISTORY };
         const header = Protocol.ResponseHeader{
             .type = .handshake,
             .len = Protocol.Handshake.WIRE_SIZE,
@@ -1400,6 +1412,7 @@ pub const Master = struct {
                 // Sending old scrollback would corrupt the display
                 if (self.in_alternate_screen) {
                     log.info("skipping scrollback (alternate screen active)", .{});
+                    self.clients.items[idx].replay_start = self.scrollback_total_written;
                     // Switch client to alternate screen mode so it knows to interpret
                     // the following TUI content correctly. Without this, the client's
                     // terminal emulator thinks it's on the normal screen and scrolling
@@ -1414,28 +1427,24 @@ pub const Master = struct {
                 } else {
                     // Only send last 16KB of scrollback on attach (a few screens worth)
                     // This prevents UI freezes when reconnecting to sessions with large history
-                    // Full scrollback is still stored and could be requested on-demand later
+                    // Older output is paged in on demand (request_history)
                     const max_initial_scrollback: usize = 16 * 1024;
-                    const slices = self.scrollback.slices();
-                    const total_len = slices.first.len + slices.second.len;
+                    const stored = self.storedOutput();
+                    const total_len = stored.len();
 
-                    const client = self.clients.items[idx];
-                    if (total_len <= max_initial_scrollback) {
-                        // Small buffer - send all in one syscall (framed, compressed if enabled)
-                        writeFramedSlicesMaybeCompressed(client.fd, .terminal_data, slices.first, slices.second, client.compression_enabled);
-                    } else {
-                        // Large buffer - only send the tail (framed, compressed if enabled)
-                        const skip = total_len - max_initial_scrollback;
-                        if (skip < slices.first.len) {
-                            // Skip part of first slice, send rest of first + all of second
-                            writeFramedSlicesMaybeCompressed(client.fd, .terminal_data, slices.first[skip..], slices.second, client.compression_enabled);
-                        } else {
-                            // Skip all of first slice, skip part of second
-                            const skip_second = skip - slices.first.len;
-                            writeFramedMaybeCompressed(client.fd, .terminal_data, slices.second[skip_second..], client.compression_enabled);
-                        }
-                        log.debug("sent last {}KB of {}KB scrollback", .{ max_initial_scrollback / 1024, total_len / 1024 });
+                    // Start at a line start so the replay and the history before it
+                    // don't split a line
+                    var start = stored.oldest;
+                    if (total_len > max_initial_scrollback) {
+                        start = history.nextLineStart(stored, stored.end() - max_initial_scrollback);
                     }
+                    const client = self.clients.items[idx];
+                    client.replay_start = start;
+
+                    const offset: usize = @intCast(start - stored.oldest);
+                    const range = self.scrollback.sliceRange(offset, total_len - offset);
+                    writeFramedSlicesMaybeCompressed(client.fd, .terminal_data, range.first, range.second, client.compression_enabled);
+                    log.debug("sent last {}KB of {}KB scrollback", .{ (total_len - offset) / 1024, total_len / 1024 });
 
                     // Restore cursor visibility state after scrollback
                     if (!self.cursor_visible) {
@@ -1455,6 +1464,7 @@ pub const Master = struct {
                     log.info("sent idle to newly attached client {} (session was already idle)", .{idx});
                 }
             },
+            _ => log.debug("client {} sent unknown packet type {}", .{ idx, @intFromEnum(pkt.header.type) }),
             .claim_active => {
                 const now_ns = std.time.nanoTimestamp();
                 const client = self.clients.items[idx];
@@ -1572,6 +1582,39 @@ pub const Master = struct {
                     }
                     log.debug("scrollback request: sent {}KB of old scrollback", .{old_len / 1024});
                 }
+            },
+            .request_history => {
+                const payload = pkt.getPayload();
+                if (payload.len < Protocol.HistoryRequest.WIRE_SIZE) {
+                    log.warn("request_history too short: {} bytes", .{payload.len});
+                    return;
+                }
+                const req = Protocol.HistoryRequest.fromBytes(payload[0..Protocol.HistoryRequest.WIRE_SIZE]);
+                const client = self.clients.items[idx];
+                const before = if (req.before == Protocol.HISTORY_BEFORE_REPLAY) client.replay_start else req.before;
+
+                const stored = self.storedOutput();
+                const range = history.selectPage(stored, before, req.limit);
+                var data: std.ArrayList(u8) = .empty;
+                defer data.deinit(self.allocator);
+                history.appendWithoutAltScreen(self.allocator, stored, range, &data) catch |err| {
+                    log.warn("request_history: {}", .{err});
+                    data.clearRetainingCapacity();
+                };
+
+                const meta = Protocol.HistoryPageMeta{ .start = range.start, .end = range.end, .oldest = stored.oldest };
+                const meta_bytes = meta.toBytes();
+                const header = Protocol.ResponseHeader{
+                    .type = .history_page,
+                    .len = @intCast(Protocol.HistoryPageMeta.WIRE_SIZE + data.items.len),
+                };
+                var iov = [3]posix.iovec_const{
+                    .{ .base = header.toBytes().ptr, .len = Protocol.ResponseHeader.WIRE_SIZE },
+                    .{ .base = &meta_bytes, .len = meta_bytes.len },
+                    .{ .base = data.items.ptr, .len = data.items.len },
+                };
+                writeAllVec(client.fd, &iov);
+                log.debug("history page {}..{} ({} bytes sent, oldest {})", .{ range.start, range.end, data.items.len, stored.oldest });
             },
             .request_scrollback_page => {
                 // Paginated scrollback request - returns a chunk with metadata

@@ -26,6 +26,12 @@ pub const MessageType = enum(u8) {
     @"resume" = 9,
     /// Claim active client for window size and command routing
     claim_active = 10,
+    /// Request a page of scrollback history before a stream position (HistoryRequest).
+    /// Only sent to masters whose handshake has HANDSHAKE_FLAG_HISTORY.
+    request_history = 11,
+    /// Unknown types are ignored. The enum used to be exhaustive, so an unknown value
+    /// from a newer client was undefined behavior in an older master.
+    _,
 };
 
 /// Response types for master → client protocol.
@@ -48,6 +54,8 @@ pub const ResponseType = enum(u8) {
     idle = 4,
     /// Protocol handshake (sent immediately after attach)
     handshake = 5,
+    /// A page of scrollback history: HistoryPageMeta, then the data
+    history_page = 6,
 };
 
 /// Response header size (type: 1 byte + len: 4 bytes)
@@ -85,6 +93,47 @@ pub const ScrollbackPageMeta = packed struct {
         return @ptrCast(self);
     }
 };
+
+/// request_history payload: the page ends at `before` (absolute stream position, bytes
+/// written since the session started); `before` = HISTORY_BEFORE_REPLAY means where
+/// this client's attach replay started.
+pub const HistoryRequest = struct {
+    before: u64,
+    limit: u32,
+
+    pub const WIRE_SIZE = 12;
+
+    pub fn fromBytes(bytes: *const [WIRE_SIZE]u8) HistoryRequest {
+        return .{
+            .before = std.mem.readInt(u64, bytes[0..8], .little),
+            .limit = std.mem.readInt(u32, bytes[8..12], .little),
+        };
+    }
+};
+
+pub const HISTORY_BEFORE_REPLAY: u64 = std.math.maxInt(u64);
+
+/// history_page metadata, before the data. The data is stored output from `start` to
+/// `end` (absolute positions) minus alternate-screen output. The next page is requested
+/// with before = start; history is complete when start <= oldest.
+pub const HistoryPageMeta = struct {
+    start: u64,
+    end: u64,
+    oldest: u64,
+
+    pub const WIRE_SIZE = 24;
+
+    pub fn toBytes(self: HistoryPageMeta) [WIRE_SIZE]u8 {
+        var out: [WIRE_SIZE]u8 = undefined;
+        std.mem.writeInt(u64, out[0..8], self.start, .little);
+        std.mem.writeInt(u64, out[8..16], self.end, .little);
+        std.mem.writeInt(u64, out[16..24], self.oldest, .little);
+        return out;
+    }
+};
+
+/// Handshake flag: the master supports request_history
+pub const HANDSHAKE_FLAG_HISTORY: u16 = 1 << 0;
 
 /// Handshake sent immediately after client attaches
 /// Identifies rtach protocol and version for compatibility checking

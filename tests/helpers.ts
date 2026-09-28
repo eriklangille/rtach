@@ -567,6 +567,7 @@ export const MessageType = {
   PAUSE: 8,
   RESUME: 9,
   CLAIM_ACTIVE: 10,
+  REQUEST_HISTORY: 11,
 } as const;
 
 export const ResponseType = {
@@ -576,7 +577,11 @@ export const ResponseType = {
   SCROLLBACK_PAGE: 3,
   IDLE: 4,
   HANDSHAKE: 5,
+  HISTORY_PAGE: 6,
 } as const;
+
+export const HANDSHAKE_FLAG_HISTORY = 1;
+export const HISTORY_BEFORE_REPLAY = 0xffffffffffffffffn;
 
 // Protocol constants
 export const RESPONSE_HEADER_SIZE = 5;
