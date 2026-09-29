@@ -140,15 +140,16 @@ pub fn build(b: *std.Build) void {
             const cross_install = b.addInstallArtifact(cross_exe, .{});
             mode.step.dependOn(&cross_install.step);
 
-            // Copy to clauntty resources directory (only for release builds)
+            // Compress and copy to clauntty resources directory (only for release builds)
+            // Binaries are gzip-compressed for App Store compliance (no standalone executables)
             if (mode.opt == .ReleaseFast) {
-                const copy_cmd = b.addSystemCommand(&.{
-                    "cp",
-                    b.fmt("zig-out/bin/rtach-{s}", .{ct.name}),
-                    b.fmt("{s}rtach-{s}", .{ clauntty_resources_path, ct.name }),
+                const compress_cmd = b.addSystemCommand(&.{
+                    "sh",
+                    "-c",
+                    b.fmt("gzip -c zig-out/bin/rtach-{s} > {s}rtach-{s}.gz", .{ ct.name, clauntty_resources_path, ct.name }),
                 });
-                copy_cmd.step.dependOn(&cross_install.step);
-                mode.step.dependOn(&copy_cmd.step);
+                compress_cmd.step.dependOn(&cross_install.step);
+                mode.step.dependOn(&compress_cmd.step);
             }
         }
     }
