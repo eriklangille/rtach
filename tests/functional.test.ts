@@ -1640,3 +1640,47 @@ describe("rtach compression", () => {
     expect(decompressedContent).toContain(marker);
   });
 });
+
+describe("rtach restores terminal modes on attach", () => {
+  afterEach(cleanupAll);
+
+  test("attach to an alternate-screen app re-sends its mouse modes", async () => {
+    // Replay is skipped in the alternate screen, so modes a TUI set at startup were
+    // lost on reattach: Herdr took keys but no longer got mouse clicks. The modes are
+    // enabled crossterm-style; the last mouse mode and format set are the ones in effect.
+    const socketPath = uniqueSocketPath();
+    const script = `${socketPath}.sh`;
+    await Bun.write(
+      script,
+      "#!/bin/sh\nprintf '\\033[?1049h\\033[?1000h\\033[?1002h\\033[?1003h\\033[?1015h\\033[?1006h\\033[?2004h\\033[?25lTUI'\nexec sleep 30\n",
+    );
+    chmodSync(script, 0o755);
+    await startDetachedMaster(socketPath, script);
+    await Bun.sleep(300);
+
+    const client = connectClient(socketPath, { noDetachChar: true, proxyMode: true });
+    const readerState = getBinaryReader(client);
+    expect(await readFrame(readerState, 5000)).not.toBeNull(); // handshake
+    if (!client.stdin) {
+      throw new Error("No stdin available");
+    }
+    client.stdin.write(Buffer.from([MessageType.UPGRADE, 0]));
+    client.stdin.flush();
+
+    let data = Buffer.alloc(0);
+    const deadline = Date.now() + 1000;
+    while (Date.now() < deadline) {
+      const frame = await readFrame(readerState, 200);
+      if (frame && (frame.type & ~COMPRESSION_FLAG) === ResponseType.TERMINAL_DATA) {
+        data = Buffer.concat([data, frame.payload]);
+      }
+    }
+    client.kill(9);
+    await client.exited;
+    unlinkSync(script);
+
+    const text = data.toString("latin1");
+    expect(text).not.toContain("TUI"); // no replay in the alternate screen
+    expect(text).toBe("\x1b[?1049h\x1b[?2004h\x1b[?1003h\x1b[?1006h\x1b[?25l");
+  });
+});

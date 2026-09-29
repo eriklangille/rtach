@@ -17,6 +17,7 @@ const ShellIntegration = @import("shell_integration.zig");
 const compression = @import("compression.zig");
 const QueryFilter = @import("query_filter.zig").QueryFilter;
 const history = @import("history.zig");
+const TermModes = @import("term_modes.zig").TermModes;
 
 const log = std.log.scoped(.master);
 
@@ -389,14 +390,10 @@ pub const Master = struct {
     // Window size
     winsize: Protocol.Winsize = .{ .rows = 24, .cols = 80 },
 
-    // Alternate screen state tracking
-    // When true, the terminal is in alternate screen mode (vim, less, Claude Code, etc.)
-    // We skip sending scrollback on attach when in this mode since the TUI will redraw itself
-    in_alternate_screen: bool = false,
-
-    // Cursor visibility state (DECTCEM mode)
-    // When false, cursor should be hidden (TUI apps like Claude Code hide the cursor)
-    cursor_visible: bool = true,
+    // Terminal mode tracking (alternate screen, cursor visibility, mouse, bracketed paste...)
+    // In the alternate screen (vim, less, Claude Code, etc.) we skip sending scrollback on
+    // attach since the TUI will redraw itself; the other modes are restored on attach
+    modes: TermModes = .{},
 
     // Idle detection for battery optimization
     // When PTY has no output for IDLE_THRESHOLD_NS, send idle notification to paused clients
@@ -790,10 +787,8 @@ pub const Master = struct {
 
         const data = self.pty_read_buf[0..n];
 
-        // Track terminal mode state by scanning for escape sequences
-        // Alternate screen: ESC[?1049h/l, ESC[?47h/l
-        // Cursor visibility: ESC[?25h/l
-        self.updateTerminalModeState(data);
+        // Track terminal modes (alternate screen, cursor, mouse, ...) for restore on attach
+        self.modes.process(data);
 
         // Parse OSC title sequences (OSC 0/1/2)
         self.updateTerminalTitle(data);
@@ -1400,7 +1395,7 @@ pub const Master = struct {
                     self.clients.items[idx].client_id = id;
                 }
 
-                log.info("client {} attached (client_id: {}, alt_screen: {})", .{ idx, if (client_id != null) @as(u64, @bitCast(client_id.?[0..8].*)) else 0, self.in_alternate_screen });
+                log.info("client {} attached (client_id: {}, alt_screen: {})", .{ idx, if (client_id != null) @as(u64, @bitCast(client_id.?[0..8].*)) else 0, self.modes.alt_screen });
                 self.clients.items[idx].attached = true;
                 self.clients.items[idx].last_attach_ns = std.time.nanoTimestamp();
                 self.updateActiveClient();
@@ -1410,7 +1405,7 @@ pub const Master = struct {
                 // Skip sending scrollback if in alternate screen mode (vim, less, Claude Code, etc.)
                 // The TUI app will redraw itself when it receives SIGWINCH
                 // Sending old scrollback would corrupt the display
-                if (self.in_alternate_screen) {
+                if (self.modes.alt_screen) {
                     log.info("skipping scrollback (alternate screen active)", .{});
                     self.clients.items[idx].replay_start = self.scrollback_total_written;
                     // Switch client to alternate screen mode so it knows to interpret
@@ -1419,11 +1414,7 @@ pub const Master = struct {
                     // behaves incorrectly (e.g., shows "@" artifacts in Claude Code).
                     writeFramed(self.clients.items[idx].fd, .terminal_data, "\x1b[?1049h");
                     log.debug("sent alternate screen switch", .{});
-                    // Restore cursor visibility state - TUI apps typically hide the cursor
-                    if (!self.cursor_visible) {
-                        writeFramed(self.clients.items[idx].fd, .terminal_data, "\x1b[?25l");
-                        log.debug("restored hidden cursor state", .{});
-                    }
+                    self.restoreModes(idx);
                 } else {
                     // Only send last 16KB of scrollback on attach (a few screens worth)
                     // This prevents UI freezes when reconnecting to sessions with large history
@@ -1446,11 +1437,8 @@ pub const Master = struct {
                     writeFramedSlicesMaybeCompressed(client.fd, .terminal_data, range.first, range.second, client.compression_enabled);
                     log.debug("sent last {}KB of {}KB scrollback", .{ (total_len - offset) / 1024, total_len / 1024 });
 
-                    // Restore cursor visibility state after scrollback
-                    if (!self.cursor_visible) {
-                        writeFramed(self.clients.items[idx].fd, .terminal_data, "\x1b[?25l");
-                        log.debug("restored hidden cursor state", .{});
-                    }
+                    // The replay may start after the modes were set
+                    self.restoreModes(idx);
                 }
 
                 // Send idle notification if session is already idle
@@ -1519,7 +1507,7 @@ pub const Master = struct {
                 }
             },
             .redraw => {
-                if (self.in_alternate_screen) {
+                if (self.modes.alt_screen) {
                     log.info("client {} redraw: skipping scrollback (alternate screen active)", .{idx});
                     if (self.child_pid > 0) {
                         _ = std.c.kill(-self.child_pid, posix.SIG.WINCH);
@@ -1539,7 +1527,7 @@ pub const Master = struct {
                 // LEGACY: sends all old scrollback at once - use request_scrollback_page instead
 
                 // Skip if alternate screen is active
-                if (self.in_alternate_screen) {
+                if (self.modes.alt_screen) {
                     log.info("scrollback request: skipping (alternate screen active)", .{});
                     const header = Protocol.ResponseHeader{
                         .type = .scrollback,
@@ -1620,7 +1608,7 @@ pub const Master = struct {
                 // Paginated scrollback request - returns a chunk with metadata
                 // Skip if alternate screen is active (vim, less, Claude Code, etc.)
                 // These apps manage their own display and scrollback is irrelevant
-                if (self.in_alternate_screen) {
+                if (self.modes.alt_screen) {
                     log.info("scrollback_page: skipping (alternate screen active)", .{});
                     // Send empty response so client knows we're done
                     const header = Protocol.ResponseHeader{
@@ -1760,54 +1748,14 @@ pub const Master = struct {
         }
     }
 
-    /// Scan data for terminal mode escape sequences and update state
-    /// Tracks:
-    /// - Alternate screen: ESC[?1049h/l, ESC[?47h/l
-    /// - Cursor visibility (DECTCEM): ESC[?25h/l
-    fn updateTerminalModeState(self: *Master, data: []const u8) void {
-        // Look for escape sequences in the data
-        // We need to find ESC [ ? followed by a number, then h or l
-        var i: usize = 0;
-        while (i < data.len) {
-            // Look for ESC (0x1B)
-            if (data[i] == 0x1B) {
-                // Check for CSI: ESC [
-                if (i + 1 < data.len and data[i + 1] == '[') {
-                    // Check for private mode: ?
-                    if (i + 2 < data.len and data[i + 2] == '?') {
-                        // Parse the number
-                        var num: u32 = 0;
-                        var j = i + 3;
-                        while (j < data.len and data[j] >= '0' and data[j] <= '9') {
-                            num = num * 10 + (data[j] - '0');
-                            j += 1;
-                        }
-                        // Check for h (set) or l (reset) and matching number
-                        if (j < data.len) {
-                            const is_set = data[j] == 'h';
-                            const is_reset = data[j] == 'l';
-
-                            if (is_set or is_reset) {
-                                switch (num) {
-                                    // Alternate screen modes
-                                    1049, 47 => {
-                                        self.in_alternate_screen = is_set;
-                                        log.debug("{s} alternate screen (mode {})", .{ if (is_set) "entered" else "exited", num });
-                                    },
-                                    // Cursor visibility (DECTCEM)
-                                    25 => {
-                                        self.cursor_visible = is_set;
-                                        log.debug("cursor {s} (DECTCEM)", .{if (is_set) "shown" else "hidden"});
-                                    },
-                                    else => {},
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            i += 1;
-        }
+    /// Put a newly attached client's terminal into the tracked modes. Programs set
+    /// modes like mouse tracking once at startup, so a fresh terminal would lose them.
+    fn restoreModes(self: *Master, idx: usize) void {
+        var buf: [TermModes.max_restore_len]u8 = undefined;
+        const seq = self.modes.restoreSequence(&buf);
+        if (seq.len == 0) return;
+        writeFramed(self.clients.items[idx].fd, .terminal_data, seq);
+        log.debug("restored terminal modes ({} bytes)", .{seq.len});
     }
 
     /// Parse OSC 0/1/2 title sequences from terminal data
