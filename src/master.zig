@@ -18,6 +18,7 @@ const compression = @import("compression.zig");
 const QueryFilter = @import("query_filter.zig").QueryFilter;
 const history = @import("history.zig");
 const TermModes = @import("term_modes.zig").TermModes;
+const active = @import("active.zig");
 
 const log = std.log.scoped(.master);
 
@@ -359,7 +360,11 @@ pub const Master = struct {
     cmd_fifo_stream: xev.Stream = undefined,
     cmd_fifo_completion: xev.Completion = .{},
     cmd_fifo_buf: [512]u8 = undefined,
-    cmd_line_buf: [512]u8 = undefined, // Buffer for accumulating partial lines
+    cmd_line_buf: [4096]u8 = undefined, // Buffer for accumulating partial lines (OAuth URLs run long)
+    /// ~/.clauntty/active: points at this session's FIFO while its Clauntty client is
+    /// the machine's most recently active one (see active.zig)
+    active_pointer_path: [std.fs.max_path_bytes]u8 = undefined,
+    active_pointer_len: usize = 0,
     cmd_line_len: usize = 0,
 
     // Unix socket (using TCP abstraction which works for any socket)
@@ -456,6 +461,10 @@ pub const Master = struct {
 
         try self.createPty();
         errdefer self.closePty();
+
+        if (active.pointerPath(options.socket_path, &self.active_pointer_path)) |path| {
+            self.active_pointer_len = path.len;
+        }
 
         return self;
     }
@@ -601,6 +610,15 @@ pub const Master = struct {
                 if (browser_path) |path| {
                     _ = setenv("BROWSER", path, 1);
                 }
+
+                // The clauntty command, also for shells without our integration
+                // (the integration adds it too, after the user's rc files)
+                const old_path = std.posix.getenv("PATH") orelse "/usr/bin:/bin";
+                var path_env_buf: [8192]u8 = undefined;
+                const path_env = std.fmt.bufPrintZ(&path_env_buf, "{s}:{s}/.clauntty/bin", .{ old_path, home }) catch null;
+                if (path_env) |value| {
+                    _ = setenv("PATH", value, 1);
+                }
             }
 
             // Deploy shell integration files
@@ -684,6 +702,7 @@ pub const Master = struct {
         }
         // Remove the FIFO file
         if (self.cmd_fifo_path_len > 0) {
+            self.clearActivePointer();
             const fifo_path_z: [*:0]const u8 = @ptrCast(&self.cmd_fifo_path);
             _ = std.c.unlink(fifo_path_z);
             self.cmd_fifo_path_len = 0;
@@ -837,6 +856,16 @@ pub const Master = struct {
         result: xev.Timer.RunError!void,
     ) xev.CallbackAction {
         const self = self_opt orelse return .disarm;
+
+        // SIGTERM/SIGINT (e.g. the app's pkill when a tab is closed): stop the loop so
+        // the master cleans up (socket, FIFO, active pointer, shell) and exits. The
+        // handlers are one-shot, so a second signal kills outright if this is stuck.
+        const sig = g_received_signal.load(.acquire);
+        if (sig == posix.SIG.TERM or sig == posix.SIG.INT) {
+            log.info("received signal {}, shutting down", .{sig});
+            loop.stop();
+            return .disarm;
+        }
 
         _ = result catch |err| {
             log.warn("idle timer error: {}", .{err});
@@ -1460,11 +1489,13 @@ pub const Master = struct {
                 client.supports_commands = true;
                 self.updateActiveClient();
                 log.info("client {} claimed active", .{client.fd});
+                self.writeActivePointer();
             },
             .detach => {
                 log.info("client {} detached", .{idx});
                 self.clients.items[idx].attached = false;
                 self.updateActiveClient();
+                self.clearActivePointerIfUnreachable();
             },
             .push => {
                 const payload = pkt.getPayload();
@@ -1902,5 +1933,30 @@ pub const Master = struct {
         self.allocator.destroy(client);
         _ = self.clients.swapRemove(idx);
         self.updateActiveClient();
+        self.clearActivePointerIfUnreachable();
+    }
+
+    // MARK: Active session pointer
+
+    fn writeActivePointer(self: *Master) void {
+        if (self.active_pointer_len == 0 or self.cmd_fifo_path_len == 0) return;
+        const pointer = self.active_pointer_path[0..self.active_pointer_len];
+        active.write(pointer, self.cmd_fifo_path[0..self.cmd_fifo_path_len]) catch |err| {
+            log.warn("failed to write active pointer {s}: {}", .{ pointer, err });
+        };
+    }
+
+    fn clearActivePointer(self: *Master) void {
+        if (self.active_pointer_len == 0 or self.cmd_fifo_path_len == 0) return;
+        active.clearIf(self.active_pointer_path[0..self.active_pointer_len], self.cmd_fifo_path[0..self.cmd_fifo_path_len]);
+    }
+
+    /// Commands sent here would be dropped once no Clauntty client is left, so stop
+    /// pointing at this session
+    fn clearActivePointerIfUnreachable(self: *Master) void {
+        for (self.clients.items) |client| {
+            if (self.isClientEligible(client, true)) return;
+        }
+        self.clearActivePointer();
     }
 };

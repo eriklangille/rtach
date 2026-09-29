@@ -17,6 +17,9 @@ pub const bash_integration =
     \\[[ -n "$CLAUNTTY_SHELL_INTEGRATION" ]] && return
     \\export CLAUNTTY_SHELL_INTEGRATION=1
     \\
+    \\# The clauntty command (clauntty show, open, forward, tab)
+    \\[[ ":$PATH:" == *":$HOME/.clauntty/bin:"* ]] || PATH="$PATH:$HOME/.clauntty/bin"
+    \\
     \\# Set title before prompt (shows current directory)
     \\__clauntty_prompt() {
     \\    printf '\033]0;%s\007' "${PWD/#$HOME/~}"
@@ -41,6 +44,9 @@ pub const zsh_integration =
     \\[[ -n "$CLAUNTTY_SHELL_INTEGRATION" ]] && return
     \\export CLAUNTTY_SHELL_INTEGRATION=1
     \\
+    \\# The clauntty command (clauntty show, open, forward, tab)
+    \\[[ ":$PATH:" == *":$HOME/.clauntty/bin:"* ]] || PATH="$PATH:$HOME/.clauntty/bin"
+    \\
     \\# Set title before prompt (shows current directory)
     \\__clauntty_precmd() {
     \\    print -Pn '\033]0;%~\007'
@@ -61,6 +67,9 @@ pub const fish_integration =
     \\status is-interactive; or exit
     \\set -q CLAUNTTY_SHELL_INTEGRATION; and exit
     \\set -gx CLAUNTTY_SHELL_INTEGRATION 1
+    \\
+    \\# The clauntty command (clauntty show, open, forward, tab)
+    \\contains -- $HOME/.clauntty/bin $PATH; or set -gx PATH $PATH $HOME/.clauntty/bin
     \\
     \\# Set title to current directory (fish_title is called automatically)
     \\function fish_title
@@ -118,76 +127,57 @@ pub fn deployIntegrationFiles() !void {
         if (err != error.PathAlreadyExists) return err;
     };
 
-    // Write each integration file
-    const files = [_]struct { name: []const u8, content: []const u8 }{
-        .{ .name = "clauntty.bash", .content = bash_integration },
-        .{ .name = "clauntty.zsh", .content = zsh_integration },
-        .{ .name = "clauntty.fish", .content = fish_integration },
+    // Integration scripts
+    try writeFileAtomic(dir_path, "clauntty.bash", bash_integration);
+    try writeFileAtomic(dir_path, "clauntty.zsh", zsh_integration);
+    try writeFileAtomic(dir_path, "clauntty.fish", fish_integration);
+
+    // Wrapper rcfiles that source user config + our integration
+    var content_buf: [1024]u8 = undefined;
+
+    try writeFileAtomic(dir_path, "bashrc", try std.fmt.bufPrint(&content_buf,
+        \\# Clauntty bashrc wrapper - sources user config then integration
+        \\[ -f /etc/bash.bashrc ] && . /etc/bash.bashrc
+        \\[ -f ~/.bashrc ] && . ~/.bashrc
+        \\. {s}/.clauntty/shell-integration/clauntty.bash
+        \\
+    , .{home}));
+
+    // Zsh wrappers (ZDOTDIR)
+    try writeFileAtomic(dir_path, ".zprofile",
+        \\# Clauntty zprofile wrapper - sources user config
+        \\[ -f ~/.zprofile ] && . ~/.zprofile
+        \\
+    );
+
+    try writeFileAtomic(dir_path, ".zshrc", try std.fmt.bufPrint(&content_buf,
+        \\# Clauntty zshrc wrapper - sources user config then integration
+        \\[ -f /etc/zsh/zshrc ] && . /etc/zsh/zshrc
+        \\[ -f ~/.zshrc ] && . ~/.zshrc
+        \\. {s}/.clauntty/shell-integration/clauntty.zsh
+        \\
+    , .{home}));
+}
+
+/// Write to a temp file and rename it into place. Every new session rewrites these
+/// files right before its shell reads them; written in place, sessions starting
+/// together (the app reconnecting all tabs) could read a truncated file and start
+/// without the integration.
+fn writeFileAtomic(dir_path: []const u8, name: []const u8, content: []const u8) !void {
+    var path_buf: [512]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir_path, name });
+    var tmp_buf: [512]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, "{s}.{d}.tmp", .{ path, std.c.getpid() });
+
+    {
+        const f = try std.fs.createFileAbsolute(tmp_path, .{});
+        defer f.close();
+        try f.writeAll(content);
+    }
+    std.fs.renameAbsolute(tmp_path, path) catch |err| {
+        std.fs.deleteFileAbsolute(tmp_path) catch {};
+        return err;
     };
-
-    for (files) |file| {
-        var file_path_buf: [512]u8 = undefined;
-        const file_path = try std.fmt.bufPrint(&file_path_buf, "{s}/{s}", .{ dir_path, file.name });
-
-        const f = try std.fs.createFileAbsolute(file_path, .{});
-        defer f.close();
-        try f.writeAll(file.content);
-    }
-
-    // Also write wrapper rcfiles that source user config + our integration
-
-    // Bash wrapper
-    {
-        var file_path_buf: [512]u8 = undefined;
-        const file_path = try std.fmt.bufPrint(&file_path_buf, "{s}/bashrc", .{dir_path});
-        const f = try std.fs.createFileAbsolute(file_path, .{});
-        defer f.close();
-
-        var content_buf: [1024]u8 = undefined;
-        const content = try std.fmt.bufPrint(&content_buf,
-            \\# Clauntty bashrc wrapper - sources user config then integration
-            \\[ -f /etc/bash.bashrc ] && . /etc/bash.bashrc
-            \\[ -f ~/.bashrc ] && . ~/.bashrc
-            \\. {s}/.clauntty/shell-integration/clauntty.bash
-            \\
-        , .{home});
-        try f.writeAll(content);
-    }
-
-    // Zsh wrapper (zprofile in ZDOTDIR)
-    {
-        var file_path_buf: [512]u8 = undefined;
-        const file_path = try std.fmt.bufPrint(&file_path_buf, "{s}/.zprofile", .{dir_path});
-        const f = try std.fs.createFileAbsolute(file_path, .{});
-        defer f.close();
-
-        var content_buf: [1024]u8 = undefined;
-        const content = try std.fmt.bufPrint(&content_buf,
-            \\# Clauntty zprofile wrapper - sources user config
-            \\[ -f ~/.zprofile ] && . ~/.zprofile
-            \\
-        , .{});
-        try f.writeAll(content);
-    }
-
-    // Zsh wrapper (zshrc in ZDOTDIR)
-    {
-        var file_path_buf: [512]u8 = undefined;
-        const file_path = try std.fmt.bufPrint(&file_path_buf, "{s}/.zshrc", .{dir_path});
-        const f = try std.fs.createFileAbsolute(file_path, .{});
-        defer f.close();
-
-        var content_buf: [1024]u8 = undefined;
-        const content = try std.fmt.bufPrint(&content_buf,
-            \\# Clauntty zshrc wrapper - sources user config then integration
-            \\[ -f /etc/zsh/zshrc ] && . /etc/zsh/zshrc
-            \\[ -f ~/.zshrc ] && . ~/.zshrc
-            \\. {s}/.clauntty/shell-integration/clauntty.zsh
-            \\
-        , .{home});
-        try f.writeAll(content);
-    }
-
 }
 
 /// Build argv for shell with integration

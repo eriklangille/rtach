@@ -8,6 +8,7 @@ const Client = client_mod.Client;
 const ClientOptions = client_mod.ClientOptions;
 const RingBuffer = @import("ringbuffer.zig").RingBuffer;
 const picker_mod = @import("picker.zig");
+const cli = @import("cli.zig");
 
 pub const Protocol = @import("protocol.zig");
 
@@ -62,7 +63,11 @@ pub const Protocol = @import("protocol.zig");
 /// 2.7.1 - Set BROWSER env var to open-browser for CLI tools (gh, python, etc.)
 /// 2.7.2 - Active client claims for window size + command routing.
 /// 2.8.2 - Fix: restore mouse, bracketed paste, focus and cursor-key modes on attach.
-pub const version = "2.8.2";
+/// 2.9.0 - `clauntty` command (argv[0] clauntty/open-browser/forward-port/open-tab):
+///         open, forward, tab, show <image>, status. Outside rtach sessions it finds
+///         the machine's active session via ~/.clauntty/active, written on claim_active.
+///         Shell integration adds ~/.clauntty/bin to PATH. Command lines up to 4KB.
+pub const version = "2.9.0";
 
 pub const std_options: std.Options = .{
     .log_level = .info,
@@ -122,6 +127,12 @@ pub fn main() void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
+
+    // Invoked as `clauntty` (or an older helper name): send a command to the app
+    var argv = std.process.args();
+    if (argv.next()) |argv0| {
+        if (cli.isCommandName(argv0)) std.process.exit(cli.main(allocator));
+    }
 
     const args = parseArgs(allocator) catch {
         // Don't print to stderr - it goes to SSH and corrupts protocol
@@ -216,9 +227,11 @@ fn createAndAttach(allocator: std.mem.Allocator, args: Args, detached: bool) !vo
             .command = command,
             .scrollback_size = args.scrollback_size,
         }) catch posix.exit(1);
-        defer master.deinit();
 
         master.run() catch posix.exit(1);
+        // posix.exit skips defers: clean up explicitly so the socket, FIFO and active
+        // pointer don't outlive the session
+        master.deinit();
         posix.exit(0);
     } else {
         // Parent becomes client (or exits if detached)
@@ -428,4 +441,6 @@ test {
     _ = @import("query_filter.zig");
     _ = @import("history.zig");
     _ = @import("term_modes.zig");
+    _ = @import("active.zig");
+    _ = @import("cli.zig");
 }
