@@ -68,7 +68,9 @@ pub const Protocol = @import("protocol.zig");
 ///         the machine's active session via ~/.clauntty/active, written on claim_active.
 ///         Shell integration adds ~/.clauntty/bin to PATH. Command lines up to 4KB.
 /// 2.9.1 - Built with Zig 0.16 and upstream libxev (no behavior change).
-pub const version = "2.9.1";
+/// 2.9.2 - Log timestamps print milliseconds without a "+" sign.
+///         Fix: client detaches when stdin hangs up instead of spinning in poll.
+pub const version = "2.9.2";
 
 pub const std_options: std.Options = .{
     .log_level = .info,
@@ -93,7 +95,8 @@ fn timestampedLog(
     // Get current time for timestamp
     const now_ns = sys.realtimeNs();
     const now_s = @divFloor(now_ns, std.time.ns_per_s);
-    const subsec_ms = @divFloor(@rem(now_ns, std.time.ns_per_s), std.time.ns_per_ms);
+    // Unsigned: a signed value with a width prints a sign ("+484")
+    const subsec_ms: u16 = @intCast(@divFloor(@mod(now_ns, std.time.ns_per_s), std.time.ns_per_ms));
 
     // Get process ID (cross-platform)
     const pid = std.c.getpid();

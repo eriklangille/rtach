@@ -198,6 +198,12 @@ pub const Client = struct {
                 if (try self.handleStdin()) {
                     break; // Detach requested
                 }
+            } else if (poll_fds[0].revents & (posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL) != 0) {
+                // stdin is gone with nothing left to read (e.g. a pipe whose writer closed,
+                // or /dev/null on macOS, which poll reports as NVAL). Polling again would
+                // return immediately forever and spin a core.
+                log.info("stdin closed", .{});
+                break;
             }
 
             // Check socket
