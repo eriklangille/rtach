@@ -3,3 +3,4 @@ build/
 .env
 .zig-cache/
 node_modules/
+zig-pkg/

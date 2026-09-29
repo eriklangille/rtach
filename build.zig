@@ -28,7 +28,7 @@ pub fn build(b: *std.Build) void {
     });
 
     exe.root_module.addImport("xev", xev_dep.module("xev"));
-    exe.linkLibrary(zlib_dep.artifact("z"));
+    exe.root_module.linkLibrary(zlib_dep.artifact("z"));
     b.installArtifact(exe);
 
     // Run command
@@ -51,7 +51,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     test_exe.root_module.addImport("xev", xev_dep.module("xev"));
-    test_exe.linkLibrary(zlib_dep.artifact("z"));
+    test_exe.root_module.linkLibrary(zlib_dep.artifact("z"));
 
     const run_unit_tests = b.addRunArtifact(test_exe);
     const test_step = b.step("test", "Run unit tests");
@@ -135,7 +135,7 @@ pub fn build(b: *std.Build) void {
             });
 
             cross_exe.root_module.addImport("xev", cross_xev.module("xev"));
-            cross_exe.linkLibrary(cross_zlib.artifact("z"));
+            cross_exe.root_module.linkLibrary(cross_zlib.artifact("z"));
 
             const cross_install = b.addInstallArtifact(cross_exe, .{});
             mode.step.dependOn(&cross_install.step);

@@ -294,11 +294,11 @@ test "ring buffer replay" {
     var buf = RingBuffer(10){};
     buf.write("test data!");
 
-    var output: std.ArrayList(u8) = .empty;
-    defer output.deinit(testing.allocator);
+    var output: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer output.deinit();
 
-    try buf.replay(output.writer(testing.allocator));
-    try testing.expectEqualStrings("test data!", output.items);
+    try buf.replay(&output.writer);
+    try testing.expectEqualStrings("test data!", output.written());
 }
 
 // Edge case tests for OOB safety

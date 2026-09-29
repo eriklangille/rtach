@@ -1,5 +1,5 @@
 const std = @import("std");
-const posix = std.posix;
+const sys = @import("sys.zig");
 
 /// Shell types we support
 pub const ShellType = enum {
@@ -116,26 +116,26 @@ pub fn getIntegrationScript(shell_type: ShellType) ?[]const u8 {
 
 /// Write shell integration files to ~/.clauntty/shell-integration/
 /// Returns true if successful
-pub fn deployIntegrationFiles() !void {
-    const home = std.posix.getenv("HOME") orelse return error.NoHomeDir;
+pub fn deployIntegrationFiles(io: std.Io) !void {
+    const home = sys.getenv("HOME") orelse return error.NoHomeDir;
 
     // Create directory
     var path_buf: [512]u8 = undefined;
     const dir_path = try std.fmt.bufPrint(&path_buf, "{s}/.clauntty/shell-integration", .{home});
 
-    std.fs.makeDirAbsolute(dir_path) catch |err| {
+    std.Io.Dir.cwd().createDir(io, dir_path, .default_dir) catch |err| {
         if (err != error.PathAlreadyExists) return err;
     };
 
     // Integration scripts
-    try writeFileAtomic(dir_path, "clauntty.bash", bash_integration);
-    try writeFileAtomic(dir_path, "clauntty.zsh", zsh_integration);
-    try writeFileAtomic(dir_path, "clauntty.fish", fish_integration);
+    try writeFileAtomic(io, dir_path, "clauntty.bash", bash_integration);
+    try writeFileAtomic(io, dir_path, "clauntty.zsh", zsh_integration);
+    try writeFileAtomic(io, dir_path, "clauntty.fish", fish_integration);
 
     // Wrapper rcfiles that source user config + our integration
     var content_buf: [1024]u8 = undefined;
 
-    try writeFileAtomic(dir_path, "bashrc", try std.fmt.bufPrint(&content_buf,
+    try writeFileAtomic(io, dir_path, "bashrc", try std.fmt.bufPrint(&content_buf,
         \\# Clauntty bashrc wrapper - sources user config then integration
         \\[ -f /etc/bash.bashrc ] && . /etc/bash.bashrc
         \\[ -f ~/.bashrc ] && . ~/.bashrc
@@ -144,13 +144,13 @@ pub fn deployIntegrationFiles() !void {
     , .{home}));
 
     // Zsh wrappers (ZDOTDIR)
-    try writeFileAtomic(dir_path, ".zprofile",
+    try writeFileAtomic(io, dir_path, ".zprofile",
         \\# Clauntty zprofile wrapper - sources user config
         \\[ -f ~/.zprofile ] && . ~/.zprofile
         \\
     );
 
-    try writeFileAtomic(dir_path, ".zshrc", try std.fmt.bufPrint(&content_buf,
+    try writeFileAtomic(io, dir_path, ".zshrc", try std.fmt.bufPrint(&content_buf,
         \\# Clauntty zshrc wrapper - sources user config then integration
         \\[ -f /etc/zsh/zshrc ] && . /etc/zsh/zshrc
         \\[ -f ~/.zshrc ] && . ~/.zshrc
@@ -163,19 +163,16 @@ pub fn deployIntegrationFiles() !void {
 /// files right before its shell reads them; written in place, sessions starting
 /// together (the app reconnecting all tabs) could read a truncated file and start
 /// without the integration.
-fn writeFileAtomic(dir_path: []const u8, name: []const u8, content: []const u8) !void {
+fn writeFileAtomic(io: std.Io, dir_path: []const u8, name: []const u8, content: []const u8) !void {
     var path_buf: [512]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir_path, name });
     var tmp_buf: [512]u8 = undefined;
     const tmp_path = try std.fmt.bufPrint(&tmp_buf, "{s}.{d}.tmp", .{ path, std.c.getpid() });
 
-    {
-        const f = try std.fs.createFileAbsolute(tmp_path, .{});
-        defer f.close();
-        try f.writeAll(content);
-    }
-    std.fs.renameAbsolute(tmp_path, path) catch |err| {
-        std.fs.deleteFileAbsolute(tmp_path) catch {};
+    const cwd = std.Io.Dir.cwd();
+    try cwd.writeFile(io, .{ .sub_path = tmp_path, .data = content });
+    cwd.rename(tmp_path, cwd, path, io) catch |err| {
+        cwd.deleteFile(io, tmp_path) catch {};
         return err;
     };
 }
@@ -203,7 +200,7 @@ pub fn prepareShellArgs(
 ) !ShellSetup {
     _ = allocator; // Not needed for now since we use static buffers
 
-    const home = std.posix.getenv("HOME") orelse return error.NoHomeDir;
+    const home = sys.getenv("HOME") orelse return error.NoHomeDir;
 
     var setup = ShellSetup{
         .argv = .{ null, null, null, null, null, null, null, null },

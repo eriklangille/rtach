@@ -1,6 +1,6 @@
 const std = @import("std");
-const xev = @import("xev");
 const posix = std.posix;
+const sys = @import("sys.zig");
 
 const Master = @import("master.zig").Master;
 const client_mod = @import("client.zig");
@@ -67,7 +67,8 @@ pub const Protocol = @import("protocol.zig");
 ///         open, forward, tab, show <image>, status. Outside rtach sessions it finds
 ///         the machine's active session via ~/.clauntty/active, written on claim_active.
 ///         Shell integration adds ~/.clauntty/bin to PATH. Command lines up to 4KB.
-pub const version = "2.9.0";
+/// 2.9.1 - Built with Zig 0.16 and upstream libxev (no behavior change).
+pub const version = "2.9.1";
 
 pub const std_options: std.Options = .{
     .log_level = .info,
@@ -90,17 +91,16 @@ fn timestampedLog(
     };
 
     // Get current time for timestamp
-    const now_ns = std.time.nanoTimestamp();
+    const now_ns = sys.realtimeNs();
     const now_s = @divFloor(now_ns, std.time.ns_per_s);
     const subsec_ms = @divFloor(@rem(now_ns, std.time.ns_per_s), std.time.ns_per_ms);
 
     // Get process ID (cross-platform)
     const pid = std.c.getpid();
 
-    // Write to stderr using posix.write (zig 0.15 compatible)
     var buf: [4096]u8 = undefined;
     const msg = std.fmt.bufPrint(&buf, "[{d}.{d:0>3}][{d}] {s} {s}" ++ format ++ "\n", .{ now_s, subsec_ms, pid, level_prefix, scope_prefix } ++ args) catch return;
-    _ = std.posix.write(std.posix.STDERR_FILENO, msg) catch {};
+    _ = sys.write(posix.STDERR_FILENO, msg) catch {};
 }
 
 const Args = struct {
@@ -123,18 +123,17 @@ const Args = struct {
     };
 };
 
-pub fn main() void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) void {
+    const allocator = init.gpa;
+    const io = init.io;
 
     // Invoked as `clauntty` (or an older helper name): send a command to the app
-    var argv = std.process.args();
+    var argv = init.minimal.args.iterate();
     if (argv.next()) |argv0| {
-        if (cli.isCommandName(argv0)) std.process.exit(cli.main(allocator));
+        if (cli.isCommandName(argv0)) std.process.exit(cli.main(allocator, io, init.minimal.args));
     }
 
-    const args = parseArgs(allocator) catch {
+    const args = parseArgs(init.minimal.args) catch {
         // Don't print to stderr - it goes to SSH and corrupts protocol
         std.process.exit(1);
     };
@@ -144,15 +143,15 @@ pub fn main() void {
     switch (args.mode) {
         .picker => {
             // Interactive session picker
-            const result = picker_mod.showPicker(allocator) catch std.process.exit(1);
+            const result = picker_mod.showPicker(allocator, io) catch std.process.exit(1);
             switch (result) {
                 .new_session => {
                     // Generate new session ID and create
-                    const session_id = generateSessionId() catch std.process.exit(1);
+                    const session_id = generateSessionId(io) catch std.process.exit(1);
                     var new_args = args;
                     new_args.socket_path = buildSessionPath(allocator, &session_id) catch std.process.exit(1);
                     new_args.mode = .create_or_attach;
-                    createAndAttach(allocator, new_args, false) catch std.process.exit(1);
+                    createAndAttach(allocator, io, new_args, false) catch std.process.exit(1);
                 },
                 .existing => |session_id| {
                     // Attach to existing session
@@ -166,14 +165,14 @@ pub fn main() void {
         },
         .create => {
             // Create new session and attach
-            createAndAttach(allocator, args, false) catch std.process.exit(1);
+            createAndAttach(allocator, io, args, false) catch std.process.exit(1);
         },
         .create_or_attach => {
             // Try to attach, create if doesn't exist
-            if (socketExists(args.socket_path)) {
+            if (socketExists(io, args.socket_path)) {
                 attach(allocator, args) catch std.process.exit(1);
             } else {
-                createAndAttach(allocator, args, false) catch std.process.exit(1);
+                createAndAttach(allocator, io, args, false) catch std.process.exit(1);
             }
         },
         .attach => {
@@ -182,28 +181,28 @@ pub fn main() void {
         },
         .create_detached => {
             // Create detached (master only, no client)
-            createAndAttach(allocator, args, true) catch std.process.exit(1);
+            createAndAttach(allocator, io, args, true) catch std.process.exit(1);
         },
     }
 }
 
-fn createAndAttach(allocator: std.mem.Allocator, args: Args, detached: bool) !void {
-    const command = args.command orelse std.posix.getenv("SHELL") orelse "/bin/sh";
+fn createAndAttach(allocator: std.mem.Allocator, io: std.Io, args: Args, detached: bool) !void {
+    const command = args.command orelse sys.getenv("SHELL") orelse "/bin/sh";
 
     // Fork: child becomes master (can properly daemonize), parent becomes client
-    const pid = try posix.fork();
+    const pid = try sys.fork();
 
     if (pid == 0) {
         // Child becomes the master (daemon)
         // setsid() works here because child is not a process group leader
-        _ = posix.setsid() catch {};
+        sys.setsid();
 
         // Redirect stdin to /dev/null, but stderr to a log file for debugging
-        const dev_null = posix.open("/dev/null", .{ .ACCMODE = .RDWR }, 0) catch null;
+        const dev_null = sys.open("/dev/null", .{ .ACCMODE = .RDWR }, 0) catch null;
         if (dev_null) |null_fd| {
-            posix.dup2(null_fd, posix.STDIN_FILENO) catch {};
-            posix.dup2(null_fd, posix.STDOUT_FILENO) catch {};
-            if (null_fd > 2) posix.close(null_fd);
+            sys.dup2(null_fd, posix.STDIN_FILENO);
+            sys.dup2(null_fd, posix.STDOUT_FILENO);
+            if (null_fd > 2) sys.close(null_fd);
         }
 
         // Open per-session log file for stderr (debug logging)
@@ -211,28 +210,28 @@ fn createAndAttach(allocator: std.mem.Allocator, args: Args, detached: bool) !vo
         var log_path_buf: [512]u8 = undefined;
         const log_path = std.fmt.bufPrint(&log_path_buf, "{s}.log", .{args.socket_path}) catch null;
         if (log_path) |path| {
-            // Null-terminate for posix.open
+            // Null-terminate for open
             var path_z: [513]u8 = undefined;
             @memcpy(path_z[0..path.len], path);
             path_z[path.len] = 0;
-            const log_fd = posix.open(path_z[0..path.len :0], .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644) catch null;
+            const log_fd = sys.open(path_z[0..path.len :0], .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644) catch null;
             if (log_fd) |fd| {
-                posix.dup2(fd, posix.STDERR_FILENO) catch {};
-                if (fd > 2) posix.close(fd);
+                sys.dup2(fd, posix.STDERR_FILENO);
+                if (fd > 2) sys.close(fd);
             }
         }
 
-        var master = Master.init(allocator, .{
+        var master = Master.init(allocator, io, .{
             .socket_path = args.socket_path,
             .command = command,
             .scrollback_size = args.scrollback_size,
-        }) catch posix.exit(1);
+        }) catch std.process.exit(1);
 
-        master.run() catch posix.exit(1);
-        // posix.exit skips defers: clean up explicitly so the socket, FIFO and active
+        master.run() catch std.process.exit(1);
+        // exit skips defers: clean up explicitly so the socket, FIFO and active
         // pointer don't outlive the session
         master.deinit();
-        posix.exit(0);
+        std.process.exit(0);
     } else {
         // Parent becomes client (or exits if detached)
         if (detached) {
@@ -240,7 +239,7 @@ fn createAndAttach(allocator: std.mem.Allocator, args: Args, detached: bool) !vo
             return;
         }
         // Small delay to let master set up
-        std.Thread.sleep(50 * std.time.ns_per_ms);
+        io.sleep(.fromMilliseconds(50), .awake) catch {};
         // Attach to the session we just created
         try attach(allocator, args);
     }
@@ -259,15 +258,15 @@ fn attach(allocator: std.mem.Allocator, args: Args) !void {
     try client.run();
 }
 
-fn socketExists(path: []const u8) bool {
-    const stat = std.fs.cwd().statFile(path) catch return false;
+fn socketExists(io: std.Io, path: []const u8) bool {
+    const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch return false;
     return stat.kind == .unix_domain_socket;
 }
 
 /// Generate a new UUID-format session ID
-fn generateSessionId() ![36]u8 {
+fn generateSessionId(io: std.Io) ![36]u8 {
     var uuid_bytes: [16]u8 = undefined;
-    std.crypto.random.bytes(&uuid_bytes);
+    io.random(&uuid_bytes);
 
     // Set version (4) and variant bits
     uuid_bytes[6] = (uuid_bytes[6] & 0x0f) | 0x40; // Version 4
@@ -288,7 +287,7 @@ fn generateSessionId() ![36]u8 {
 
 /// Build full socket path from session ID
 fn buildSessionPath(allocator: std.mem.Allocator, session_id: []const u8) ![]const u8 {
-    const home = std.posix.getenv("HOME") orelse return error.NoHome;
+    const home = sys.getenv("HOME") orelse return error.NoHome;
     return std.fmt.allocPrint(allocator, "{s}/.clauntty/sessions/{s}", .{ home, session_id });
 }
 
@@ -319,9 +318,8 @@ fn parseClientId(id_str: []const u8) ?[Protocol.CLIENT_ID_SIZE]u8 {
     return result;
 }
 
-fn parseArgs(allocator: std.mem.Allocator) !Args {
-    _ = allocator;
-    var args_iter = std.process.args();
+fn parseArgs(process_args: std.process.Args) !Args {
+    var args_iter = process_args.iterate();
     _ = args_iter.skip(); // Skip program name
 
     var result = Args{
@@ -334,8 +332,7 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
     while (args_iter.next()) |arg| {
         if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) {
             // Print version and exit
-            const stdout = std.posix.STDOUT_FILENO;
-            _ = std.posix.write(stdout, version ++ "\n") catch {};
+            _ = sys.write(posix.STDOUT_FILENO, version ++ "\n") catch {};
             std.process.exit(0);
         } else if (std.mem.eql(u8, arg, "-c")) {
             result.mode = .create;
@@ -427,8 +424,7 @@ fn printUsage() void {
         \\  rtach -a ~/.rtach/session
         \\
     ;
-    const stdout = std.posix.STDOUT_FILENO;
-    _ = std.posix.write(stdout, usage) catch {};
+    _ = sys.write(posix.STDOUT_FILENO, usage) catch {};
 }
 
 test {
@@ -443,4 +439,5 @@ test {
     _ = @import("term_modes.zig");
     _ = @import("active.zig");
     _ = @import("cli.zig");
+    _ = @import("sys.zig");
 }

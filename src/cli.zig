@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const posix = std.posix;
+const sys = @import("sys.zig");
 const active = @import("active.zig");
 
 /// Names rtach answers to as this command
@@ -37,9 +38,8 @@ const usage =
     \\
 ;
 
-pub fn main(allocator: std.mem.Allocator) u8 {
-    var args = std.process.argsWithAllocator(allocator) catch return fail("out of memory", .{});
-    defer args.deinit();
+pub fn main(allocator: std.mem.Allocator, io: std.Io, process_args: std.process.Args) u8 {
+    var args = process_args.iterate();
 
     const argv0 = args.next() orelse "clauntty";
     const name = std.fs.path.basename(argv0);
@@ -57,23 +57,23 @@ pub fn main(allocator: std.mem.Allocator) u8 {
             return 2;
         };
 
-    var rest: std.ArrayListUnmanaged([]const u8) = .{};
+    var rest: std.ArrayList([]const u8) = .empty;
     defer rest.deinit(allocator);
     while (args.next()) |arg| rest.append(allocator, arg) catch return fail("out of memory", .{});
 
-    return run(allocator, sub, rest.items);
+    return run(allocator, io, sub, rest.items);
 }
 
-fn run(allocator: std.mem.Allocator, sub: []const u8, args: []const []const u8) u8 {
+fn run(allocator: std.mem.Allocator, io: std.Io, sub: []const u8, args: []const []const u8) u8 {
     if (eql(sub, "-h") or eql(sub, "--help") or eql(sub, "help")) {
         writeOut(usage);
         return 0;
     }
-    if (eql(sub, "status")) return status();
+    if (eql(sub, "status")) return status(io);
 
     if (eql(sub, "open") or eql(sub, "browser")) {
         if (args.len != 1) return fail("usage: clauntty open <url>", .{});
-        return sendLines(&.{.{ "browser", args[0] }}, null);
+        return sendLines(io, &.{.{ "browser", args[0] }}, null);
     }
 
     if (eql(sub, "forward") or eql(sub, "tab")) {
@@ -82,7 +82,7 @@ fn run(allocator: std.mem.Allocator, sub: []const u8, args: []const []const u8) 
         var port_buf: [8]u8 = undefined;
         const port_str = std.fmt.bufPrint(&port_buf, "{d}", .{port}) catch unreachable;
         const is_forward = eql(sub, "forward");
-        const code = sendLines(&.{.{ if (is_forward) "forward" else "open", port_str }}, null);
+        const code = sendLines(io, &.{.{ if (is_forward) "forward" else "open", port_str }}, null);
         if (code == 0) {
             if (is_forward) printOut("Port {d} forwarded\n", .{port}) else printOut("Opened port {d}\n", .{port});
         }
@@ -91,22 +91,24 @@ fn run(allocator: std.mem.Allocator, sub: []const u8, args: []const []const u8) 
 
     if (eql(sub, "show")) {
         if (args.len == 0) return fail("usage: clauntty show <image>...", .{});
-        var lines: std.ArrayListUnmanaged([2][]const u8) = .{};
+        var lines: std.ArrayList([2][]const u8) = .empty;
         defer {
             for (lines.items) |line| allocator.free(line[1]);
             lines.deinit(allocator);
         }
         for (args) |arg| {
             if (!isImagePath(arg)) return fail("not an image (png, jpg, gif, heic, webp): {s}", .{arg});
-            const path = std.fs.cwd().realpathAlloc(allocator, arg) catch |err|
+            var real_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const real_len = std.Io.Dir.cwd().realPathFile(io, arg, &real_buf) catch |err|
                 return fail("{s}: {s}", .{ arg, errorText(err) });
+            const path = allocator.dupe(u8, real_buf[0..real_len]) catch return fail("out of memory", .{});
             if (std.mem.indexOfScalar(u8, path, '\n') != null) {
                 allocator.free(path);
                 return fail("path contains a newline: {s}", .{arg});
             }
             lines.append(allocator, .{ "image", path }) catch return fail("out of memory", .{});
         }
-        const code = sendLines(lines.items, null);
+        const code = sendLines(io, lines.items, null);
         if (code == 0) printOut("Sent {d} image{s} to Clauntty\n", .{ lines.items.len, if (lines.items.len == 1) "" else "s" });
         return code;
     }
@@ -122,63 +124,55 @@ const Target = struct {
     from_env: bool,
 };
 
-fn resolveTarget(pointer_buf: []u8) ?Target {
-    if (posix.getenv("RTACH_CMD_PIPE")) |pipe| {
+fn resolveTarget(io: std.Io, pointer_buf: []u8) ?Target {
+    if (sys.getenv("RTACH_CMD_PIPE")) |pipe| {
         if (pipe.len > 0) return .{ .fifo = pipe, .from_env = true };
     }
-    const home = posix.getenv("HOME") orelse return null;
+    const home = sys.getenv("HOME") orelse return null;
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const pointer = std.fmt.bufPrint(&path_buf, "{s}/.clauntty/active", .{home}) catch return null;
-    const fifo = active.read(pointer, pointer_buf) orelse return null;
+    const fifo = active.read(io, pointer, pointer_buf) orelse return null;
     return .{ .fifo = fifo, .from_env = false };
 }
 
 const no_target_msg = "no Clauntty session is active on this machine (open a Clauntty tab connected to it)";
 
 /// Write `kind;value` lines to the target session's FIFO
-fn sendLines(lines: []const [2][]const u8, target_override: ?Target) u8 {
+fn sendLines(io: std.Io, lines: []const [2][]const u8, target_override: ?Target) u8 {
     var pointer_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const target = target_override orelse resolveTarget(&pointer_buf) orelse return fail(no_target_msg, .{});
+    const target = target_override orelse resolveTarget(io, &pointer_buf) orelse return fail(no_target_msg, .{});
 
     const fd = openFifo(target.fifo) catch |err| {
         if (target.from_env) return fail("session command pipe unavailable ({s}): {s}", .{ errorText(err), target.fifo });
         return fail(no_target_msg, .{});
     };
-    defer posix.close(fd);
+    defer sys.close(fd);
 
     var buf: [8192]u8 = undefined;
     for (lines) |line| {
         const text = std.fmt.bufPrint(&buf, "{s};{s}\n", .{ line[0], line[1] }) catch return fail("argument too long", .{});
-        writeAllFd(fd, text) catch |err| return fail("failed to send command: {s}", .{errorText(err)});
+        writeAllFd(io, fd, text) catch |err| return fail("failed to send command: {s}", .{errorText(err)});
     }
     return 0;
 }
 
-/// Open a FIFO for writing without blocking. ENXIO means no reader: the session's
+/// Open a FIFO for writing without blocking. error.NoReader means the session's
 /// master is gone.
 fn openFifo(path: []const u8) !posix.fd_t {
-    // std.posix.open reports ENXIO as Unexpected (with a stack trace), so call open(2)
     const path_z = try posix.toPosixPath(path);
-    const fd = std.c.open(&path_z, .{ .ACCMODE = .WRONLY, .NONBLOCK = true });
-    if (fd >= 0) return fd;
-    return switch (posix.errno(fd)) {
-        .NXIO => error.NoReader,
-        .NOENT => error.FileNotFound,
-        .ACCES => error.AccessDenied,
-        else => error.OpenFailed,
-    };
+    return sys.open(&path_z, .{ .ACCMODE = .WRONLY, .NONBLOCK = true }, 0);
 }
 
-fn writeAllFd(fd: posix.fd_t, data: []const u8) !void {
+fn writeAllFd(io: std.Io, fd: posix.fd_t, data: []const u8) !void {
     var written: usize = 0;
     var retries: usize = 0;
     while (written < data.len) {
-        const n = posix.write(fd, data[written..]) catch |err| switch (err) {
+        const n = sys.write(fd, data[written..]) catch |err| switch (err) {
             // Pipe momentarily full (the master reads it from its event loop)
             error.WouldBlock => {
                 retries += 1;
                 if (retries > 200) return err;
-                std.Thread.sleep(5 * std.time.ns_per_ms);
+                try io.sleep(.fromMilliseconds(5), .awake);
                 continue;
             },
             else => return err,
@@ -187,9 +181,9 @@ fn writeAllFd(fd: posix.fd_t, data: []const u8) !void {
     }
 }
 
-fn status() u8 {
+fn status(io: std.Io) u8 {
     var pointer_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const target = resolveTarget(&pointer_buf) orelse {
+    const target = resolveTarget(io, &pointer_buf) orelse {
         printOut("No active Clauntty session on this machine.\n", .{});
         return 1;
     };
@@ -197,7 +191,7 @@ fn status() u8 {
         printOut("Session {s} is gone ({s}).\n", .{ sessionId(target.fifo), target.fifo });
         return 1;
     };
-    posix.close(fd);
+    sys.close(fd);
     printOut("Commands go to session {s} ({s}).\n", .{
         sessionId(target.fifo),
         if (target.from_env) "this session, $RTACH_CMD_PIPE" else "last active in Clauntty",
@@ -245,7 +239,7 @@ fn eql(a: []const u8, b: []const u8) bool {
 }
 
 fn writeOut(text: []const u8) void {
-    _ = posix.write(posix.STDOUT_FILENO, text) catch {};
+    _ = sys.write(posix.STDOUT_FILENO, text) catch {};
 }
 
 fn printOut(comptime fmt: []const u8, args: anytype) void {
@@ -256,7 +250,7 @@ fn printOut(comptime fmt: []const u8, args: anytype) void {
 fn fail(comptime fmt: []const u8, args: anytype) u8 {
     var buf: [1024]u8 = undefined;
     const msg = std.fmt.bufPrint(&buf, "clauntty: " ++ fmt ++ "\n", args) catch "clauntty: error\n";
-    _ = posix.write(posix.STDERR_FILENO, msg) catch {};
+    _ = sys.write(posix.STDERR_FILENO, msg) catch {};
     return 1;
 }
 
@@ -290,20 +284,21 @@ test "isImagePath" {
 test "sendLines writes kind;value lines to the FIFO" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
+    const io = testing.io;
     var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir = try tmp.dir.realpath(".", &dir_buf);
+    const dir = dir_buf[0..try tmp.dir.realPath(io, &dir_buf)];
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const fifo = try std.fmt.bufPrintZ(&path_buf, "{s}/s.cmd", .{dir});
 
     try testing.expectEqual(@as(c_int, 0), mkfifo(fifo, 0o600));
 
     // No reader yet: sending fails rather than blocking
-    try testing.expectEqual(@as(u8, 1), sendLines(&.{.{ "open", "1" }}, .{ .fifo = fifo, .from_env = true }));
+    try testing.expectEqual(@as(u8, 1), sendLines(io, &.{.{ "open", "1" }}, .{ .fifo = fifo, .from_env = true }));
 
-    const reader = try posix.open(fifo, .{ .ACCMODE = .RDONLY, .NONBLOCK = true }, 0);
-    defer posix.close(reader);
+    const reader = try sys.open(fifo, .{ .ACCMODE = .RDONLY, .NONBLOCK = true }, 0);
+    defer sys.close(reader);
 
-    try testing.expectEqual(@as(u8, 0), sendLines(&.{ .{ "image", "/a.png" }, .{ "image", "/b.png" } }, .{ .fifo = fifo, .from_env = true }));
+    try testing.expectEqual(@as(u8, 0), sendLines(io, &.{ .{ "image", "/a.png" }, .{ "image", "/b.png" } }, .{ .fifo = fifo, .from_env = true }));
     var buf: [64]u8 = undefined;
     const n = try posix.read(reader, &buf);
     try testing.expectEqualStrings("image;/a.png\nimage;/b.png\n", buf[0..n]);

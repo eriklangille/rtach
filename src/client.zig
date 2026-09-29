@@ -1,6 +1,7 @@
 const std = @import("std");
 const xev = @import("xev");
 const posix = std.posix;
+const sys = @import("sys.zig");
 const Protocol = @import("protocol.zig");
 const compression = @import("compression.zig");
 
@@ -46,7 +47,7 @@ pub const Client = struct {
         self.* = .{
             .allocator = allocator,
             .options = options,
-            .raw_socket_buffer = .{},
+            .raw_socket_buffer = .empty,
         };
 
         try self.connect();
@@ -56,7 +57,7 @@ pub const Client = struct {
     pub fn deinit(self: *Client) void {
         self.restoreTerminal();
         if (self.socket_fd >= 0) {
-            posix.close(self.socket_fd);
+            sys.close(self.socket_fd);
         }
         self.raw_socket_buffer.deinit(self.allocator);
         self.allocator.destroy(self);
@@ -64,24 +65,19 @@ pub const Client = struct {
 
     fn connect(self: *Client) !void {
         // Create Unix domain socket
-        self.socket_fd = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+        self.socket_fd = try sys.unixSocket(false);
         errdefer {
-            posix.close(self.socket_fd);
+            sys.close(self.socket_fd);
             self.socket_fd = -1;
         }
 
         // Connect to server
-        var addr = std.posix.sockaddr.un{ .path = undefined, .family = posix.AF.UNIX };
-        const path_len = @min(self.options.socket_path.len, addr.path.len - 1);
-        @memcpy(addr.path[0..path_len], self.options.socket_path[0..path_len]);
-        addr.path[path_len] = 0;
-
-        try posix.connect(self.socket_fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr)));
+        try sys.connect(self.socket_fd, self.options.socket_path);
         // Note: Don't log here - stderr goes to SSH channel and corrupts the framed protocol
     }
 
     fn setupRawTerminal(self: *Client) !void {
-        self.stdin_is_tty = posix.isatty(STDIN_FILENO);
+        self.stdin_is_tty = sys.isatty(STDIN_FILENO);
         if (!self.stdin_is_tty) {
             return;
         }
@@ -132,14 +128,14 @@ pub const Client = struct {
                 .xpixel = ws.xpixel,
                 .ypixel = ws.ypixel,
             });
-            _ = try posix.write(self.socket_fd, pkt.serialize());
+            _ = try sys.write(self.socket_fd, pkt.serialize());
         }
     }
 
     fn sendPostUpgradeSetup(self: *Client) !void {
         const client_id_ptr: ?*const [Protocol.CLIENT_ID_SIZE]u8 = if (self.options.client_id) |*id| id else null;
         const attach_pkt = Protocol.Packet.initAttach(client_id_ptr);
-        _ = try posix.write(self.socket_fd, attach_pkt.serialize());
+        _ = try sys.write(self.socket_fd, attach_pkt.serialize());
 
         try self.sendWindowSize();
 
@@ -147,11 +143,11 @@ pub const Client = struct {
         switch (self.options.redraw_method) {
             .ctrl_l => {
                 const pkt = Protocol.Packet.init(.push, "\x0c");
-                _ = try posix.write(self.socket_fd, pkt.serialize());
+                _ = try sys.write(self.socket_fd, pkt.serialize());
             },
             .winch => {
                 const pkt = Protocol.Packet.initRedraw();
-                _ = try posix.write(self.socket_fd, pkt.serialize());
+                _ = try sys.write(self.socket_fd, pkt.serialize());
             },
             .none => {},
         }
@@ -217,7 +213,7 @@ pub const Client = struct {
 
         // Send detach
         const detach_pkt = Protocol.Packet.initDetach();
-        _ = posix.write(self.socket_fd, detach_pkt.serialize()) catch {};
+        _ = sys.write(self.socket_fd, detach_pkt.serialize()) catch {};
 
         self.restoreTerminal();
         log.info("detached", .{});
@@ -251,7 +247,7 @@ pub const Client = struct {
                     self.stdin_framed = true;
 
                     // Forward upgrade packet to master so it knows compression preference
-                    _ = posix.write(self.socket_fd, data[0..upgrade_packet_size]) catch {};
+                    _ = sys.write(self.socket_fd, data[0..upgrade_packet_size]) catch {};
                     if (self.pending_post_upgrade_setup) {
                         self.pending_post_upgrade_setup = false;
                         self.sendPostUpgradeSetup() catch {};
@@ -305,7 +301,7 @@ pub const Client = struct {
                     // Forward the raw packet (header + payload) to master
                     const packet_size: usize = 2 + pkt_len_usize;
                     const raw_packet = data[offset..][0..packet_size];
-                    _ = posix.write(self.socket_fd, raw_packet) catch return error.BrokenPipe;
+                    _ = sys.write(self.socket_fd, raw_packet) catch return error.BrokenPipe;
                 } else if (pkt_type == @intFromEnum(Protocol.MessageType.winch)) {
                     // Forward winch to master
                     if (pkt_len == 8) {
@@ -316,7 +312,7 @@ pub const Client = struct {
                             .xpixel = std.mem.readInt(u16, payload[4..6], .little),
                             .ypixel = std.mem.readInt(u16, payload[6..8], .little),
                         });
-                        _ = try posix.write(self.socket_fd, pkt.serialize());
+                        _ = try sys.write(self.socket_fd, pkt.serialize());
                     }
                 } else if (pkt_type == @intFromEnum(Protocol.MessageType.detach)) {
                     self.stdin_buffered = 0;
@@ -324,15 +320,15 @@ pub const Client = struct {
                 } else if (pkt_type == @intFromEnum(Protocol.MessageType.pause)) {
                     // Forward pause to master
                     const pkt = Protocol.Packet.initPause();
-                    _ = try posix.write(self.socket_fd, pkt.serialize());
+                    _ = try sys.write(self.socket_fd, pkt.serialize());
                 } else if (pkt_type == @intFromEnum(Protocol.MessageType.@"resume")) {
                     // Forward resume to master
                     const pkt = Protocol.Packet.initResume();
-                    _ = try posix.write(self.socket_fd, pkt.serialize());
+                    _ = try sys.write(self.socket_fd, pkt.serialize());
                 } else if (pkt_type == @intFromEnum(Protocol.MessageType.claim_active)) {
                     // Forward active claim to master
                     const pkt = Protocol.Packet.initClaimActive();
-                    _ = try posix.write(self.socket_fd, pkt.serialize());
+                    _ = try sys.write(self.socket_fd, pkt.serialize());
                 }
                 // Other packet types: ignore
                 offset += 2 + pkt_len_usize;
@@ -364,7 +360,7 @@ pub const Client = struct {
             while (offset < data.len) {
                 const chunk_size = @min(data.len - offset, Protocol.MAX_PAYLOAD_SIZE);
                 const pkt = Protocol.Packet.init(.push, data[offset..][0..chunk_size]);
-                _ = try posix.write(self.socket_fd, pkt.serialize());
+                _ = try sys.write(self.socket_fd, pkt.serialize());
                 offset += chunk_size;
             }
             // Raw mode always consumes all data
@@ -383,7 +379,7 @@ pub const Client = struct {
             if (!self.handshake_received) {
                 try self.processRawSocketData(buf[0..n]);
             } else {
-                _ = posix.write(STDOUT_FILENO, buf[0..n]) catch {};
+                _ = sys.write(STDOUT_FILENO, buf[0..n]) catch {};
             }
             return;
         }
@@ -411,7 +407,7 @@ pub const Client = struct {
         const handshake_frame_size = Protocol.RESPONSE_HEADER_SIZE + Protocol.HANDSHAKE_SIZE;
 
         if (self.options.proxy_mode) {
-            _ = posix.write(STDOUT_FILENO, data) catch {};
+            _ = sys.write(STDOUT_FILENO, data) catch {};
         }
 
         try self.raw_socket_buffer.appendSlice(self.allocator, data);
@@ -429,7 +425,7 @@ pub const Client = struct {
                 if (handshake) |h| {
                     if (h.isValid()) {
                         if (!self.options.proxy_mode and i > 0) {
-                            _ = posix.write(STDOUT_FILENO, buf[0..i]) catch {};
+                            _ = sys.write(STDOUT_FILENO, buf[0..i]) catch {};
                         }
 
                         self.handshake_received = true;
@@ -442,7 +438,7 @@ pub const Client = struct {
                             }
                         } else {
                             const upgrade_pkt = Protocol.Packet.initUpgrade();
-                            _ = posix.write(self.socket_fd, upgrade_pkt.serialize()) catch {};
+                            _ = sys.write(self.socket_fd, upgrade_pkt.serialize()) catch {};
                             self.sendPostUpgradeSetup() catch {};
                         }
 
@@ -473,7 +469,7 @@ pub const Client = struct {
             if (buf_len > handshake_frame_size * 2) {
                 const safe_len = buf_len - handshake_frame_size + 1;
                 if (safe_len > 0) {
-                    _ = posix.write(STDOUT_FILENO, self.raw_socket_buffer.items[0..safe_len]) catch {};
+                    _ = sys.write(STDOUT_FILENO, self.raw_socket_buffer.items[0..safe_len]) catch {};
                     self.dropRawPrefix(safe_len);
                 }
             }
@@ -515,7 +511,7 @@ pub const Client = struct {
                 };
 
                 if (!is_valid or payload_len > max_frame_len) {
-                    _ = posix.write(STDOUT_FILENO, self.socket_header_buf[0..1]) catch {};
+                    _ = sys.write(STDOUT_FILENO, self.socket_header_buf[0..1]) catch {};
                     std.mem.copyForwards(
                         u8,
                         self.socket_header_buf[0..Protocol.RESPONSE_HEADER_SIZE - 1],
@@ -546,7 +542,7 @@ pub const Client = struct {
                 (response_type == @intFromEnum(Protocol.ResponseType.terminal_data) or
                 response_type == @intFromEnum(Protocol.ResponseType.scrollback)))
             {
-                _ = posix.write(STDOUT_FILENO, chunk) catch {};
+                _ = sys.write(STDOUT_FILENO, chunk) catch {};
             }
 
             self.socket_payload_remaining -= take;
@@ -563,6 +559,6 @@ pub const Client = struct {
 var global_client: ?*Client = null;
 var winch_pending: bool = false;
 
-fn handleSigwinch(_: c_int) callconv(.c) void {
+fn handleSigwinch(_: posix.SIG) callconv(.c) void {
     winch_pending = true;
 }

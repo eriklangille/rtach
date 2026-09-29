@@ -1,5 +1,6 @@
 const std = @import("std");
 const posix = std.posix;
+const sys = @import("sys.zig");
 
 const log = std.log.scoped(.picker);
 
@@ -30,6 +31,7 @@ pub const PickerResult = union(enum) {
 /// Interactive session picker
 pub const Picker = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     sessions: []SessionInfo,
     selected_index: usize = 0,
     scroll_offset: usize = 0,
@@ -41,12 +43,13 @@ pub const Picker = struct {
     const SESSIONS_DIR = ".clauntty/sessions";
     const METADATA_FILE = ".clauntty/sessions.json";
 
-    pub fn init(allocator: std.mem.Allocator) !*Picker {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io) !*Picker {
         const self = try allocator.create(Picker);
         errdefer allocator.destroy(self);
 
         self.* = .{
             .allocator = allocator,
+            .io = io,
             .sessions = &.{},
         };
 
@@ -70,7 +73,7 @@ pub const Picker = struct {
     /// Discover all sessions and show picker UI
     pub fn run(self: *Picker) !PickerResult {
         // Discover sessions
-        self.sessions = try discoverSessions(self.allocator);
+        self.sessions = try discoverSessions(self.allocator, self.io);
 
         // If no sessions, go directly to new session
         if (self.sessions.len == 0) {
@@ -95,7 +98,7 @@ pub const Picker = struct {
     }
 
     fn setupTerminal(self: *Picker) !void {
-        if (!posix.isatty(posix.STDIN_FILENO)) {
+        if (!sys.isatty(posix.STDIN_FILENO)) {
             return error.NotATty;
         }
 
@@ -132,7 +135,7 @@ pub const Picker = struct {
     fn restoreTerminal(self: *Picker) void {
         if (self.orig_termios) |termios| {
             // Show cursor, clear screen
-            _ = posix.write(posix.STDOUT_FILENO, "\x1b[?25h\x1b[2J\x1b[H") catch {};
+            _ = sys.write(posix.STDOUT_FILENO, "\x1b[?25h\x1b[2J\x1b[H") catch {};
             posix.tcsetattr(posix.STDIN_FILENO, .FLUSH, termios) catch {};
             self.orig_termios = null;
         }
@@ -148,8 +151,9 @@ pub const Picker = struct {
 
     fn render(self: *Picker) void {
         var buf: [4096]u8 = undefined;
-        var stream = std.io.fixedBufferStream(&buf);
-        const writer = stream.writer();
+        var w: std.Io.Writer = .fixed(&buf);
+        const writer = &w;
+        const now = std.Io.Timestamp.now(self.io, .real).toSeconds();
 
         // Hide cursor, clear screen, home
         writer.writeAll("\x1b[?25l\x1b[2J\x1b[H") catch return;
@@ -207,7 +211,7 @@ pub const Picker = struct {
             }
 
             // Time ago (dim)
-            const time_str = formatTimeAgo(session.last_active);
+            const time_str = formatTimeAgo(now, session.last_active);
             writer.writeAll(time_str) catch return;
 
             writer.writeAll("\x1b[0m\r\n") catch return;
@@ -225,7 +229,7 @@ pub const Picker = struct {
         writer.print("\x1b[{d};1H", .{self.term_rows - 1}) catch return;
         writer.writeAll("\r\n\x1b[90m[Enter] Select  [n] New  [d] Delete  [q] Quit\x1b[0m") catch return;
 
-        _ = posix.write(posix.STDOUT_FILENO, stream.getWritten()) catch {};
+        _ = sys.write(posix.STDOUT_FILENO, w.buffered()) catch {};
     }
 
     fn handleInput(self: *Picker) !?PickerResult {
@@ -290,8 +294,8 @@ pub const Picker = struct {
 };
 
 /// Discover all sessions from ~/.clauntty/sessions/
-pub fn discoverSessions(allocator: std.mem.Allocator) ![]SessionInfo {
-    const home = std.posix.getenv("HOME") orelse return &.{};
+pub fn discoverSessions(allocator: std.mem.Allocator, io: std.Io) ![]SessionInfo {
+    const home = sys.getenv("HOME") orelse return &.{};
 
     // Build sessions directory path
     var sessions_dir_buf: [512]u8 = undefined;
@@ -300,7 +304,7 @@ pub fn discoverSessions(allocator: std.mem.Allocator) ![]SessionInfo {
     // Load metadata JSON
     var metadata_path_buf: [512]u8 = undefined;
     const metadata_path = std.fmt.bufPrint(&metadata_path_buf, "{s}/{s}", .{ home, Picker.METADATA_FILE }) catch return &.{};
-    const metadata = loadMetadata(allocator, metadata_path) catch std.StringHashMap(SessionMetadata).init(allocator);
+    const metadata = loadMetadata(allocator, io, metadata_path) catch std.StringHashMap(SessionMetadata).init(allocator);
     defer {
         var it = metadata.iterator();
         while (it.next()) |entry| {
@@ -311,11 +315,11 @@ pub fn discoverSessions(allocator: std.mem.Allocator) ![]SessionInfo {
     }
 
     // Open sessions directory
-    var dir = std.fs.cwd().openDir(sessions_dir, .{ .iterate = true }) catch return &.{};
-    defer dir.close();
+    var dir = std.Io.Dir.cwd().openDir(io, sessions_dir, .{ .iterate = true }) catch return &.{};
+    defer dir.close(io);
 
     // Collect sessions
-    var sessions: std.ArrayListUnmanaged(SessionInfo) = .{};
+    var sessions: std.ArrayList(SessionInfo) = .empty;
     errdefer {
         for (sessions.items) |s| {
             allocator.free(s.id);
@@ -327,7 +331,7 @@ pub fn discoverSessions(allocator: std.mem.Allocator) ![]SessionInfo {
     }
 
     var iter = dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(io)) |entry| {
         // Skip non-sockets and special files
         if (entry.kind != .unix_domain_socket) continue;
         if (entry.name.len == 0 or entry.name[0] == '.') continue;
@@ -356,17 +360,15 @@ pub fn discoverSessions(allocator: std.mem.Allocator) ![]SessionInfo {
         const last_active: i64 = if (metadata.get(id)) |m|
             m.last_accessed orelse m.created
         else blk: {
-            const stat = dir.statFile(entry.name) catch break :blk 0;
-            break :blk @intCast(@divTrunc(stat.mtime, std.time.ns_per_s));
+            const stat = dir.statFile(io, entry.name, .{}) catch break :blk 0;
+            break :blk stat.mtime.toSeconds();
         };
 
         // Try to read title file
         var title_path_buf: [1024]u8 = undefined;
         const title_path = std.fmt.bufPrint(&title_path_buf, "{s}.title", .{socket_path}) catch null;
         const title: ?[]const u8 = if (title_path) |tp| blk: {
-            const title_file = std.fs.cwd().openFile(tp, .{}) catch break :blk null;
-            defer title_file.close();
-            const content = title_file.readToEndAlloc(allocator, 1024) catch break :blk null;
+            const content = std.Io.Dir.cwd().readFileAlloc(io, tp, allocator, .limited(1024)) catch break :blk null;
             // Trim whitespace
             const trimmed = std.mem.trim(u8, content, " \t\n\r");
             if (trimmed.len == 0) {
@@ -411,11 +413,8 @@ const SessionMetadata = struct {
 };
 
 /// Load session metadata from JSON file
-fn loadMetadata(allocator: std.mem.Allocator, path: []const u8) !std.StringHashMap(SessionMetadata) {
-    const file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
-
-    const content = try file.readToEndAlloc(allocator, 1024 * 1024);
+fn loadMetadata(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !std.StringHashMap(SessionMetadata) {
+    const content = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024));
     defer allocator.free(content);
 
     var result = std.StringHashMap(SessionMetadata).init(allocator);
@@ -475,8 +474,7 @@ fn loadMetadata(allocator: std.mem.Allocator, path: []const u8) !std.StringHashM
 }
 
 /// Format a timestamp as relative time (e.g., "3h ago", "2d ago")
-fn formatTimeAgo(timestamp: i64) []const u8 {
-    const now = std.time.timestamp();
+fn formatTimeAgo(now: i64, timestamp: i64) []const u8 {
     const diff = now - timestamp;
 
     if (diff < 0) return "future";
@@ -523,8 +521,8 @@ fn formatTimeAgo(timestamp: i64) []const u8 {
 
 /// Show the picker and return the result
 /// Note: The caller owns the returned session ID string (if .existing)
-pub fn showPicker(allocator: std.mem.Allocator) !PickerResult {
-    var picker = try Picker.init(allocator);
+pub fn showPicker(allocator: std.mem.Allocator, io: std.Io) !PickerResult {
+    var picker = try Picker.init(allocator, io);
     defer picker.deinit();
     const result = try picker.run();
     // Dupe the session ID before deinit frees it

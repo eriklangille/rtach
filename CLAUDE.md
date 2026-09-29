@@ -20,6 +20,7 @@ zig build cross             # Cross-compile all targets
 - `src/compression.zig` - zlib wrapper for terminal data compression
 - `src/ringbuffer.zig` - Scrollback buffer
 - `src/shell_integration.zig` - Shell integration scripts
+- `src/sys.zig` - Thin wrappers for fd, socket and process calls (Zig 0.16 removed most `std.posix` ones; files go through `std.Io`)
 
 ## Version Bumping
 
@@ -59,5 +60,5 @@ Terminal data can be compressed to reduce bandwidth (30-60% savings on typical o
 
 ## Dependencies
 
-- **libxev**: Event loop (local fork at `../libxev`)
+- **libxev**: Event loop, upstream mitchellh/libxev pinned to the same commit as ghostty
 - **zlib**: Compression (compiled from source via [allyourcodebase/zlib](https://github.com/allyourcodebase/zlib) for cross-compilation support)

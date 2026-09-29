@@ -2,10 +2,13 @@
     .name = .rtach,
     .version = "0.2.0",
     .fingerprint = 0xe5c10360ef96ef33,
+    .minimum_zig_version = "0.16.0",
     .paths = .{""},
     .dependencies = .{
         .libxev = .{
-            .path = "../libxev",
+            // mitchellh/libxev (same pin as ghostty)
+            .url = "https://deps.files.ghostty.org/libxev-9ce8e8e6ff89e583258a7f8e7adeeeaeae8611bf.tar.gz",
+            .hash = "libxev-0.0.0-86vtcwIRFADbH4hk-EjROXxlrKIRPQdA41XiTSytYO-F",
         },
         .zlib = .{
             .url = "https://github.com/allyourcodebase/zlib/archive/3599c16d41dbe749ae51b0ff7ab864c61adc779a.tar.gz",

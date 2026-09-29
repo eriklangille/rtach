@@ -11,6 +11,7 @@ else if (builtin.os.tag == .macos)
 else
     @import("xev").Dynamic;
 const posix = std.posix;
+const sys = @import("sys.zig");
 const Protocol = @import("protocol.zig");
 const RingBuffer = @import("ringbuffer.zig").DynamicRingBuffer;
 const ShellIntegration = @import("shell_integration.zig");
@@ -26,42 +27,42 @@ const log = std.log.scoped(.master);
 var g_received_signal: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
 var g_log_fd: std.atomic.Value(i32) = std.atomic.Value(i32).init(-1);
 
-fn signalHandler(sig: c_int) callconv(.c) void {
+fn signalHandler(sig: posix.SIG) callconv(.c) void {
     // Store the signal - will be logged when we can
-    g_received_signal.store(@intCast(sig), .release);
+    g_received_signal.store(@intFromEnum(sig), .release);
 
     // Try to write directly to log file (signal-safe)
     const fd = g_log_fd.load(.acquire);
     if (fd >= 0) {
         const msg = switch (sig) {
-            posix.SIG.TERM => "[SIGNAL] Received SIGTERM - terminating\n",
-            posix.SIG.INT => "[SIGNAL] Received SIGINT - interrupted\n",
-            posix.SIG.HUP => "[SIGNAL] Received SIGHUP - hangup\n",
-            posix.SIG.PIPE => "[SIGNAL] Received SIGPIPE - broken pipe\n",
-            posix.SIG.SEGV => "[SIGNAL] Received SIGSEGV - segmentation fault\n",
-            posix.SIG.BUS => "[SIGNAL] Received SIGBUS - bus error\n",
-            posix.SIG.ABRT => "[SIGNAL] Received SIGABRT - aborted\n",
+            .TERM => "[SIGNAL] Received SIGTERM - terminating\n",
+            .INT => "[SIGNAL] Received SIGINT - interrupted\n",
+            .HUP => "[SIGNAL] Received SIGHUP - hangup\n",
+            .PIPE => "[SIGNAL] Received SIGPIPE - broken pipe\n",
+            .SEGV => "[SIGNAL] Received SIGSEGV - segmentation fault\n",
+            .BUS => "[SIGNAL] Received SIGBUS - bus error\n",
+            .ABRT => "[SIGNAL] Received SIGABRT - aborted\n",
             else => "[SIGNAL] Received unknown signal\n",
         };
-        _ = posix.write(fd, msg) catch {};
+        _ = sys.write(fd, msg) catch {};
     }
 
     // For fatal signals, re-raise with default handler
-    if (sig == posix.SIG.SEGV or sig == posix.SIG.BUS or sig == posix.SIG.ABRT) {
+    if (sig == .SEGV or sig == .BUS or sig == .ABRT) {
         // Reset to default and re-raise
         var sa: posix.Sigaction = .{
             .handler = .{ .handler = posix.SIG.DFL },
             .mask = posix.sigemptyset(),
             .flags = 0,
         };
-        posix.sigaction(@intCast(sig), &sa, null);
+        posix.sigaction(sig, &sa, null);
         _ = std.c.raise(sig);
     }
 }
 
 fn setupSignalHandlers() void {
     // Fatal signals - log diagnostics then crash
-    const fatal_signals = [_]u8{
+    const fatal_signals = [_]posix.SIG{
         posix.SIG.TERM,
         posix.SIG.INT,
         posix.SIG.SEGV,
@@ -105,12 +106,12 @@ fn writeAllVec(fd: posix.fd_t, iovs_in: []const posix.iovec_const) void {
     var start: usize = 0;
     const end = iovs_in.len;
     while (start < end) {
-        const written = posix.writev(fd, iovs[start..end]) catch |err| switch (err) {
+        const written = sys.writev(fd, iovs[start..end]) catch |err| switch (err) {
             error.WouldBlock => {
                 if (!waitWritable(fd)) {
                     // Stalled or gone mid-frame: the frame can't be completed, so end the
                     // connection (the read side then sees EOF and removes the client).
-                    posix.shutdown(fd, .both) catch {};
+                    sys.shutdown(fd);
                     return;
                 }
                 continue;
@@ -344,6 +345,7 @@ const ClientConn = struct {
 
 pub const Master = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     options: MasterOptions,
 
     // PTY
@@ -377,7 +379,7 @@ pub const Master = struct {
     scrollback_total_written: u64 = 0,
 
     // Connected clients
-    clients: std.ArrayListUnmanaged(*ClientConn) = .{},
+    clients: std.ArrayList(*ClientConn) = .empty,
     /// Active client for window size and command routing
     active_client: ?*ClientConn = null,
 
@@ -434,7 +436,7 @@ pub const Master = struct {
     const TITLE_WRITE_DEBOUNCE_NS: i128 = 500 * std.time.ns_per_ms; // 500ms
     const HEARTBEAT_INTERVAL_TICKS: u32 = 600; // Log heartbeat every 600 ticks (5 minutes at 500ms)
 
-    pub fn init(allocator: std.mem.Allocator, options: MasterOptions) !*Master {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, options: MasterOptions) !*Master {
         const self = try allocator.create(Master);
         errdefer allocator.destroy(self);
 
@@ -449,9 +451,10 @@ pub const Master = struct {
 
         self.* = .{
             .allocator = allocator,
+            .io = io,
             .options = options,
             .scrollback = try RingBuffer.init(allocator, options.scrollback_size),
-            .clients = .{},
+            .clients = .empty,
             .loop = try xev.Loop.init(.{}),
             .cmd_line_len = 0,
         };
@@ -479,7 +482,7 @@ pub const Master = struct {
         for (self.clients.items) |client| {
             // Don't close fd if pending_remove - it was already closed
             if (!client.pending_remove) {
-                posix.close(client.fd);
+                sys.close(client.fd);
             }
             self.allocator.destroy(client);
         }
@@ -489,18 +492,12 @@ pub const Master = struct {
     }
 
     fn createSocket(self: *Master) !void {
-        posix.unlink(self.options.socket_path) catch {};
+        sys.unlink(self.options.socket_path);
 
-        self.socket_fd = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0);
-        errdefer posix.close(self.socket_fd);
+        self.socket_fd = try sys.unixSocket(true);
+        errdefer sys.close(self.socket_fd);
 
-        var addr = std.posix.sockaddr.un{ .path = undefined, .family = posix.AF.UNIX };
-        const path_len = @min(self.options.socket_path.len, addr.path.len - 1);
-        @memcpy(addr.path[0..path_len], self.options.socket_path[0..path_len]);
-        addr.path[path_len] = 0;
-
-        try posix.bind(self.socket_fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr)));
-        try posix.listen(self.socket_fd, 5);
+        try sys.bindAndListen(self.socket_fd, self.options.socket_path, 5);
 
         // Wrap in TCP abstraction (works for Unix sockets too)
         self.socket = xev.TCP.initFd(self.socket_fd);
@@ -512,18 +509,18 @@ pub const Master = struct {
 
     fn closeSocket(self: *Master) void {
         if (self.socket_fd >= 0) {
-            posix.close(self.socket_fd);
-            posix.unlink(self.options.socket_path) catch {};
+            sys.close(self.socket_fd);
+            sys.unlink(self.options.socket_path);
             self.socket_fd = -1;
         }
     }
 
     fn createPty(self: *Master) !void {
-        const master_fd = posix.open("/dev/ptmx", .{ .ACCMODE = .RDWR, .NOCTTY = true, .NONBLOCK = true }, 0) catch |err| {
+        const master_fd = sys.open("/dev/ptmx", .{ .ACCMODE = .RDWR, .NOCTTY = true, .NONBLOCK = true }, 0) catch |err| {
             log.err("failed to open /dev/ptmx: {}", .{err});
             return err;
         };
-        errdefer posix.close(master_fd);
+        errdefer sys.close(master_fd);
 
         if (grantpt(master_fd) != 0) return error.GrantPtyFailed;
         if (unlockpt(master_fd) != 0) return error.UnlockPtyFailed;
@@ -562,7 +559,7 @@ pub const Master = struct {
 
         // Open FIFO with O_RDWR | O_NONBLOCK
         // O_RDWR keeps at least one "writer" attached (ourselves), preventing immediate EOF
-        self.cmd_fifo_fd = posix.open(
+        self.cmd_fifo_fd = sys.open(
             self.cmd_fifo_path[0..self.cmd_fifo_path_len :0],
             .{ .ACCMODE = .RDWR, .NONBLOCK = true },
             0,
@@ -574,19 +571,19 @@ pub const Master = struct {
 
         self.cmd_fifo_stream = xev.Stream.initFd(self.cmd_fifo_fd);
 
-        const pid = try posix.fork();
+        const pid = try sys.fork();
         if (pid == 0) {
             // Child process
-            posix.close(master_fd);
-            posix.close(self.cmd_fifo_fd); // Close parent's FIFO fd in child
-            _ = posix.setsid() catch {};
+            sys.close(master_fd);
+            sys.close(self.cmd_fifo_fd); // Close parent's FIFO fd in child
+            sys.setsid();
 
-            const slave_fd = posix.openZ(
+            const slave_fd = sys.open(
                 @ptrCast(&self.pty_slave_path),
                 .{ .ACCMODE = .RDWR },
                 0,
             ) catch {
-                posix.exit(1);
+                std.process.exit(1);
             };
 
             // NOTE: Do NOT set PTY to raw mode here!
@@ -594,17 +591,17 @@ pub const Master = struct {
             // The shell will configure the terminal as needed (bash uses cooked mode,
             // vim/nano switch to raw mode when they start, etc.)
 
-            posix.dup2(slave_fd, 0) catch {};
-            posix.dup2(slave_fd, 1) catch {};
-            posix.dup2(slave_fd, 2) catch {};
-            if (slave_fd > 2) posix.close(slave_fd);
+            sys.dup2(slave_fd, 0);
+            sys.dup2(slave_fd, 1);
+            sys.dup2(slave_fd, 2);
+            if (slave_fd > 2) sys.close(slave_fd);
 
             // Set RTACH_CMD_PIPE environment variable for scripts to send commands
             // This is the path to the FIFO that scripts can write to
             _ = setenv("RTACH_CMD_PIPE", fifo_path_z, 1);
 
             // Set BROWSER to open-browser so CLI tools use iOS browser
-            if (std.posix.getenv("HOME")) |home| {
+            if (sys.getenv("HOME")) |home| {
                 var browser_path_buf: [std.fs.max_path_bytes]u8 = undefined;
                 const browser_path = std.fmt.bufPrintZ(&browser_path_buf, "{s}/.clauntty/bin/open-browser", .{home}) catch null;
                 if (browser_path) |path| {
@@ -613,7 +610,7 @@ pub const Master = struct {
 
                 // The clauntty command, also for shells without our integration
                 // (the integration adds it too, after the user's rc files)
-                const old_path = std.posix.getenv("PATH") orelse "/usr/bin:/bin";
+                const old_path = sys.getenv("PATH") orelse "/usr/bin:/bin";
                 var path_env_buf: [8192]u8 = undefined;
                 const path_env = std.fmt.bufPrintZ(&path_env_buf, "{s}:{s}/.clauntty/bin", .{ old_path, home }) catch null;
                 if (path_env) |value| {
@@ -622,7 +619,7 @@ pub const Master = struct {
             }
 
             // Deploy shell integration files
-            ShellIntegration.deployIntegrationFiles() catch |err| {
+            ShellIntegration.deployIntegrationFiles(self.io) catch |err| {
                 log.warn("failed to deploy shell integration: {}", .{err});
             };
 
@@ -640,8 +637,8 @@ pub const Master = struct {
                     @ptrCast(self.options.command.ptr),
                     null,
                 };
-                _ = posix.execvpeZ(@ptrCast(self.options.command.ptr), &argv, std.c.environ) catch {};
-                posix.exit(127);
+                sys.execvpZ(@ptrCast(self.options.command.ptr), &argv);
+                std.process.exit(127);
             };
 
             // Set extra environment variable if needed (e.g., ZDOTDIR for zsh)
@@ -661,7 +658,7 @@ pub const Master = struct {
                 "-";
 
             const integration_dir = blk: {
-                if (std.posix.getenv("HOME")) |home| {
+                if (sys.getenv("HOME")) |home| {
                     var path_buf: [512]u8 = undefined;
                     const path = std.fmt.bufPrint(&path_buf, "{s}/.clauntty/shell-integration", .{home}) catch break :blk "unknown";
                     break :blk path;
@@ -682,8 +679,8 @@ pub const Master = struct {
             );
 
             // Execute shell with integration
-            _ = posix.execvpeZ(shell_setup.argv[0].?, &shell_setup.argv, std.c.environ) catch {};
-            posix.exit(127);
+            sys.execvpZ(shell_setup.argv[0].?, &shell_setup.argv);
+            std.process.exit(127);
         }
 
         self.child_pid = pid;
@@ -693,11 +690,11 @@ pub const Master = struct {
 
     fn closePty(self: *Master) void {
         if (self.pty_master >= 0) {
-            posix.close(self.pty_master);
+            sys.close(self.pty_master);
             self.pty_master = -1;
         }
         if (self.cmd_fifo_fd >= 0) {
-            posix.close(self.cmd_fifo_fd);
+            sys.close(self.cmd_fifo_fd);
             self.cmd_fifo_fd = -1;
         }
         // Remove the FIFO file
@@ -754,7 +751,7 @@ pub const Master = struct {
 
         // Set up idle detection timer (checks every 500ms)
         self.idle_timer = try xev.Timer.init();
-        self.last_pty_write_ns = std.time.nanoTimestamp(); // Initialize to now
+        self.last_pty_write_ns = self.nowNs(); // Initialize to now
         self.idle_timer.run(
             &self.loop,
             &self.idle_timer_completion,
@@ -813,7 +810,7 @@ pub const Master = struct {
         self.updateTerminalTitle(data);
 
         // Record timestamp for idle detection
-        self.last_pty_write_ns = std.time.nanoTimestamp();
+        self.last_pty_write_ns = self.nowNs();
         self.idle_notified = false; // Reset - we have new output
 
         // Store in scrollback, minus queries: stored output is only replayed, and a
@@ -861,7 +858,7 @@ pub const Master = struct {
         // the master cleans up (socket, FIFO, active pointer, shell) and exits. The
         // handlers are one-shot, so a second signal kills outright if this is stuck.
         const sig = g_received_signal.load(.acquire);
-        if (sig == posix.SIG.TERM or sig == posix.SIG.INT) {
+        if (sig == @intFromEnum(posix.SIG.TERM) or sig == @intFromEnum(posix.SIG.INT)) {
             log.info("received signal {}, shutting down", .{sig});
             loop.stop();
             return .disarm;
@@ -892,7 +889,7 @@ pub const Master = struct {
         }
 
         // Check if we're idle (no PTY output for IDLE_THRESHOLD_NS)
-        const now = std.time.nanoTimestamp();
+        const now = self.nowNs();
         const elapsed = now - self.last_pty_write_ns;
         const elapsed_ms = @divFloor(elapsed, std.time.ns_per_ms);
 
@@ -1178,7 +1175,7 @@ pub const Master = struct {
         // Create client state
         const client = self.allocator.create(ClientConn) catch {
             log.err("failed to allocate ClientConn for fd={}", .{client_fd});
-            posix.close(client_fd);
+            sys.close(client_fd);
             // Re-arm accept
             self.socket.accept(
                 loop,
@@ -1199,7 +1196,7 @@ pub const Master = struct {
         self.clients.append(self.allocator, client) catch {
             log.err("failed to append client to list for fd={}", .{client_fd});
             self.allocator.destroy(client);
-            posix.close(client_fd);
+            sys.close(client_fd);
             // Re-arm accept
             self.socket.accept(
                 loop,
@@ -1369,18 +1366,18 @@ pub const Master = struct {
                     };
                     // Forward remaining data to PTY (if any)
                     if (data.len > packet_len) {
-                        client.last_input_ns = std.time.nanoTimestamp();
+                        client.last_input_ns = self.nowNs();
                         self.updateActiveClient();
-                        _ = posix.write(self.pty_master, data[packet_len..]) catch |err| {
+                        _ = sys.write(self.pty_master, data[packet_len..]) catch |err| {
                             log.warn("failed to write to PTY: {}", .{err});
                         };
                     }
                 }
             } else {
                 // Forward to PTY as raw input
-                client.last_input_ns = std.time.nanoTimestamp();
+                client.last_input_ns = self.nowNs();
                 self.updateActiveClient();
-                _ = posix.write(self.pty_master, data) catch |err| {
+                _ = sys.write(self.pty_master, data) catch |err| {
                     log.warn("failed to write to PTY: {}", .{err});
                 };
             }
@@ -1417,7 +1414,7 @@ pub const Master = struct {
                             // there may be an in-flight completion in the event loop that would
                             // cause a use-after-free when it fires.
                             other.pending_remove = true;
-                            posix.close(other.fd);
+                            sys.close(other.fd);
                             // The read callback will clean up when it fires with an error
                         }
                     }
@@ -1426,7 +1423,7 @@ pub const Master = struct {
 
                 log.info("client {} attached (client_id: {}, alt_screen: {})", .{ idx, if (client_id != null) @as(u64, @bitCast(client_id.?[0..8].*)) else 0, self.modes.alt_screen });
                 self.clients.items[idx].attached = true;
-                self.clients.items[idx].last_attach_ns = std.time.nanoTimestamp();
+                self.clients.items[idx].last_attach_ns = self.nowNs();
                 self.updateActiveClient();
 
                 // Handshake already sent on connect, now send scrollback
@@ -1483,7 +1480,7 @@ pub const Master = struct {
             },
             _ => log.debug("client {} sent unknown packet type {}", .{ idx, @intFromEnum(pkt.header.type) }),
             .claim_active => {
-                const now_ns = std.time.nanoTimestamp();
+                const now_ns = self.nowNs();
                 const client = self.clients.items[idx];
                 client.last_claim_ns = now_ns;
                 client.supports_commands = true;
@@ -1500,9 +1497,9 @@ pub const Master = struct {
             .push => {
                 const payload = pkt.getPayload();
                 if (payload.len > 0) {
-                    self.clients.items[idx].last_input_ns = std.time.nanoTimestamp();
+                    self.clients.items[idx].last_input_ns = self.nowNs();
                     self.updateActiveClient();
-                    _ = try posix.write(self.pty_master, payload);
+                    _ = try sys.write(self.pty_master, payload);
                 }
             },
             .winch => {
@@ -1886,7 +1883,7 @@ pub const Master = struct {
     fn writeTitleToFile(self: *Master) void {
         if (!self.title_dirty) return;
 
-        const now = std.time.nanoTimestamp();
+        const now = self.nowNs();
         if (now - self.last_title_write_ns < TITLE_WRITE_DEBOUNCE_NS) return;
 
         // Construct title file path: socket_path + ".title"
@@ -1898,19 +1895,13 @@ pub const Master = struct {
         const tmp_path = std.fmt.bufPrint(&tmp_path_buf, "{s}.title.tmp", .{self.options.socket_path}) catch return;
 
         // Use cwd-relative file operations (handles both absolute and relative paths)
-        const cwd = std.fs.cwd();
-        const file = cwd.createFile(tmp_path, .{}) catch |err| {
-            log.warn("failed to create title file: {}", .{err});
-            return;
-        };
-        defer file.close();
-
-        file.writeAll(self.terminal_title[0..self.terminal_title_len]) catch |err| {
+        const cwd = std.Io.Dir.cwd();
+        cwd.writeFile(self.io, .{ .sub_path = tmp_path, .data = self.terminal_title[0..self.terminal_title_len] }) catch |err| {
             log.warn("failed to write title: {}", .{err});
             return;
         };
 
-        cwd.rename(tmp_path, title_path) catch |err| {
+        cwd.rename(tmp_path, cwd, title_path, self.io) catch |err| {
             log.warn("failed to rename title file: {}", .{err});
             return;
         };
@@ -1918,6 +1909,11 @@ pub const Master = struct {
         self.title_dirty = false;
         self.last_title_write_ns = now;
         log.info("wrote title to file: \"{s}\"", .{self.terminal_title[0..self.terminal_title_len]});
+    }
+
+    /// Monotonic nanoseconds, for idle detection and client activity ordering
+    fn nowNs(self: *const Master) i128 {
+        return std.Io.Timestamp.now(self.io, .awake).nanoseconds;
     }
 
     fn removeClient(self: *Master, idx: usize) void {
@@ -1928,7 +1924,7 @@ pub const Master = struct {
         }
         // Don't close fd if pending_remove - it was already closed by kick logic
         if (!client.pending_remove) {
-            posix.close(client.fd);
+            sys.close(client.fd);
         }
         self.allocator.destroy(client);
         _ = self.clients.swapRemove(idx);
@@ -1941,14 +1937,14 @@ pub const Master = struct {
     fn writeActivePointer(self: *Master) void {
         if (self.active_pointer_len == 0 or self.cmd_fifo_path_len == 0) return;
         const pointer = self.active_pointer_path[0..self.active_pointer_len];
-        active.write(pointer, self.cmd_fifo_path[0..self.cmd_fifo_path_len]) catch |err| {
+        active.write(self.io, pointer, self.cmd_fifo_path[0..self.cmd_fifo_path_len]) catch |err| {
             log.warn("failed to write active pointer {s}: {}", .{ pointer, err });
         };
     }
 
     fn clearActivePointer(self: *Master) void {
         if (self.active_pointer_len == 0 or self.cmd_fifo_path_len == 0) return;
-        active.clearIf(self.active_pointer_path[0..self.active_pointer_len], self.cmd_fifo_path[0..self.cmd_fifo_path_len]);
+        active.clearIf(self.io, self.active_pointer_path[0..self.active_pointer_len], self.cmd_fifo_path[0..self.cmd_fifo_path_len]);
     }
 
     /// Commands sent here would be dropped once no Clauntty client is left, so stop
