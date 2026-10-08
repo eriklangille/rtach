@@ -70,7 +70,10 @@ pub const Protocol = @import("protocol.zig");
 /// 2.9.1 - Built with Zig 0.16 and upstream libxev (no behavior change).
 /// 2.9.2 - Log timestamps print milliseconds without a "+" sign.
 ///         Fix: client detaches when stdin hangs up instead of spinning in poll.
-pub const version = "2.9.2";
+/// 2.10.0 - `clauntty show` also leaves each image in ~/.clauntty/inbox/<id> and sends
+///          `image;<id>;<path>`. The app deletes entries it has shown and checks the
+///          inbox when it connects, so images sent while it's in the background wait.
+pub const version = "2.10.0";
 
 pub const std_options: std.Options = .{
     .log_level = .info,
@@ -441,6 +444,7 @@ test {
     _ = @import("history.zig");
     _ = @import("term_modes.zig");
     _ = @import("active.zig");
+    _ = @import("inbox.zig");
     _ = @import("cli.zig");
     _ = @import("sys.zig");
 }

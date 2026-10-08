@@ -10,6 +10,7 @@ const std = @import("std");
 const posix = std.posix;
 const sys = @import("sys.zig");
 const active = @import("active.zig");
+const inbox = @import("inbox.zig");
 
 /// Names rtach answers to as this command
 pub fn isCommandName(argv0: []const u8) bool {
@@ -29,7 +30,8 @@ const usage =
     \\  open <url>        Open a URL in the phone's browser (forwards localhost ports)
     \\  forward <port>    Forward a port to the phone (8000 or http://localhost:8000)
     \\  tab <port>        Open a port in a Clauntty web tab
-    \\  show <image>...   Show images in Clauntty (png, jpg, gif, heic, webp)
+    \\  show <image>...   Show images in Clauntty (png, jpg, gif, heic, webp); they
+    \\                    wait on this machine until Clauntty connects
     \\  status            Show which session commands go to
     \\
     \\Inside a Clauntty session, commands go to that session. Elsewhere (tmux,
@@ -89,31 +91,73 @@ fn run(allocator: std.mem.Allocator, io: std.Io, sub: []const u8, args: []const 
         return code;
     }
 
-    if (eql(sub, "show")) {
-        if (args.len == 0) return fail("usage: clauntty show <image>...", .{});
-        var lines: std.ArrayList([2][]const u8) = .empty;
-        defer {
-            for (lines.items) |line| allocator.free(line[1]);
-            lines.deinit(allocator);
-        }
-        for (args) |arg| {
-            if (!isImagePath(arg)) return fail("not an image (png, jpg, gif, heic, webp): {s}", .{arg});
-            var real_buf: [std.fs.max_path_bytes]u8 = undefined;
-            const real_len = std.Io.Dir.cwd().realPathFile(io, arg, &real_buf) catch |err|
-                return fail("{s}: {s}", .{ arg, errorText(err) });
-            const path = allocator.dupe(u8, real_buf[0..real_len]) catch return fail("out of memory", .{});
-            if (std.mem.indexOfScalar(u8, path, '\n') != null) {
-                allocator.free(path);
-                return fail("path contains a newline: {s}", .{arg});
-            }
-            lines.append(allocator, .{ "image", path }) catch return fail("out of memory", .{});
-        }
-        const code = sendLines(io, lines.items, null);
-        if (code == 0) printOut("Sent {d} image{s} to Clauntty\n", .{ lines.items.len, if (lines.items.len == 1) "" else "s" });
-        return code;
-    }
+    if (eql(sub, "show")) return show(allocator, io, args);
 
     return fail("unknown command: {s} (see clauntty --help)", .{sub});
+}
+
+/// Leave each image in the inbox, then send `image;<id>;<path>` to the session. With
+/// every image in the inbox, no reachable session isn't an error: the app picks them
+/// up when it connects.
+fn show(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
+    if (args.len == 0) return fail("usage: clauntty show <image>...", .{});
+
+    var paths: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (paths.items) |path| allocator.free(path);
+        paths.deinit(allocator);
+    }
+    for (args) |arg| {
+        if (!isImagePath(arg)) return fail("not an image (png, jpg, gif, heic, webp): {s}", .{arg});
+        var real_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const real_len = std.Io.Dir.cwd().realPathFile(io, arg, &real_buf) catch |err|
+            return fail("{s}: {s}", .{ arg, errorText(err) });
+        if (std.mem.indexOfScalar(u8, real_buf[0..real_len], '\n') != null) return fail("path contains a newline: {s}", .{arg});
+        const path = allocator.dupe(u8, real_buf[0..real_len]) catch return fail("out of memory", .{});
+        paths.append(allocator, path) catch {
+            allocator.free(path);
+            return fail("out of memory", .{});
+        };
+    }
+
+    var inbox_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const inbox_dir: ?[]const u8 = if (sys.getenv("HOME")) |home| inbox.dirPath(home, &inbox_buf) else null;
+    const now_ms: i64 = @intCast(@divFloor(sys.realtimeNs(), std.time.ns_per_ms));
+    if (inbox_dir) |dir| inbox.prune(io, dir, now_ms);
+
+    var lines: std.ArrayList([2][]const u8) = .empty;
+    defer {
+        for (lines.items) |line| allocator.free(line[1]);
+        lines.deinit(allocator);
+    }
+    var queued: usize = 0;
+    for (paths.items, 0..) |path, i| {
+        var id_buf: [64]u8 = undefined;
+        const id = inbox.makeId(&id_buf, now_ms, std.c.getpid(), i);
+        const in_inbox = if (inbox_dir) |dir| blk: {
+            inbox.add(io, dir, id, path) catch break :blk false;
+            break :blk true;
+        } else false;
+        if (in_inbox) queued += 1;
+        // Without an entry, send the plain path: there's nothing for the app to delete
+        const value = if (in_inbox)
+            std.fmt.allocPrint(allocator, "{s};{s}", .{ id, path })
+        else
+            allocator.dupe(u8, path);
+        lines.append(allocator, .{ "image", value catch return fail("out of memory", .{}) }) catch return fail("out of memory", .{});
+    }
+
+    const plural = if (lines.items.len == 1) "" else "s";
+    var pointer_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const target = resolveTarget(io, &pointer_buf);
+    const reachable = if (target) |t| fifoOpen(t.fifo) else false;
+    if (!reachable and queued == lines.items.len) {
+        printOut("Queued {d} image{s} (shown when Clauntty connects)\n", .{ lines.items.len, plural });
+        return 0;
+    }
+    const code = sendLines(io, lines.items, target);
+    if (code == 0) printOut("Sent {d} image{s} to Clauntty\n", .{ lines.items.len, plural });
+    return code;
 }
 
 // MARK: Target
@@ -156,6 +200,13 @@ fn sendLines(io: std.Io, lines: []const [2][]const u8, target_override: ?Target)
     return 0;
 }
 
+/// Whether the FIFO has a reader (the session's master is running)
+fn fifoOpen(path: []const u8) bool {
+    const fd = openFifo(path) catch return false;
+    sys.close(fd);
+    return true;
+}
+
 /// Open a FIFO for writing without blocking. error.NoReader means the session's
 /// master is gone.
 fn openFifo(path: []const u8) !posix.fd_t {
@@ -187,11 +238,10 @@ fn status(io: std.Io) u8 {
         printOut("No active Clauntty session on this machine.\n", .{});
         return 1;
     };
-    const fd = openFifo(target.fifo) catch {
+    if (!fifoOpen(target.fifo)) {
         printOut("Session {s} is gone ({s}).\n", .{ sessionId(target.fifo), target.fifo });
         return 1;
-    };
-    sys.close(fd);
+    }
     printOut("Commands go to session {s} ({s}).\n", .{
         sessionId(target.fifo),
         if (target.from_env) "this session, $RTACH_CMD_PIPE" else "last active in Clauntty",
