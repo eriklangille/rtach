@@ -73,7 +73,9 @@ pub const Protocol = @import("protocol.zig");
 /// 2.10.0 - `clauntty show` also leaves each image in ~/.clauntty/inbox/<id> and sends
 ///          `image;<id>;<path>`. The app deletes entries it has shown and checks the
 ///          inbox when it connects, so images sent while it's in the background wait.
-pub const version = "2.10.0";
+/// 2.10.1 - Fix: a client kicked by a reattach with the same client id is removed. On
+///          macOS it stayed in the client list forever (one more per phone reconnect).
+pub const version = "2.10.1";
 
 pub const std_options: std.Options = .{
     .log_level = .info,

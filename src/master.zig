@@ -330,7 +330,7 @@ const ClientConn = struct {
     /// Absolute stream position where this client's attach replay started; history
     /// pages (request_history) end here
     replay_start: u64 = 0,
-    /// When true, fd has been closed and client will be destroyed when callback fires
+    /// When true, fd has been shut down and client will be destroyed when callback fires
     /// Used for safe deferred destruction (e.g., when kicking duplicate clients)
     pending_remove: bool = false,
     /// Timestamp of last input received from this client (nanoseconds)
@@ -480,10 +480,7 @@ pub const Master = struct {
         self.scrollback.deinit();
 
         for (self.clients.items) |client| {
-            // Don't close fd if pending_remove - it was already closed
-            if (!client.pending_remove) {
-                sys.close(client.fd);
-            }
+            sys.close(client.fd);
             self.allocator.destroy(client);
         }
         self.clients.deinit(self.allocator);
@@ -1414,8 +1411,10 @@ pub const Master = struct {
                             // there may be an in-flight completion in the event loop that would
                             // cause a use-after-free when it fires.
                             other.pending_remove = true;
-                            sys.close(other.fd);
-                            // The read callback will clean up when it fires with an error
+                            // Shut down rather than close: the pending read then returns EOF
+                            // and its callback removes the client. Closing dropped the read
+                            // silently on kqueue, so kicked clients were never removed.
+                            sys.shutdown(other.fd);
                         }
                     }
                     self.clients.items[idx].client_id = id;
@@ -1922,10 +1921,7 @@ pub const Master = struct {
         if (self.active_client != null and self.active_client.? == client) {
             self.active_client = null;
         }
-        // Don't close fd if pending_remove - it was already closed by kick logic
-        if (!client.pending_remove) {
-            sys.close(client.fd);
-        }
+        sys.close(client.fd);
         self.allocator.destroy(client);
         _ = self.clients.swapRemove(idx);
         self.updateActiveClient();

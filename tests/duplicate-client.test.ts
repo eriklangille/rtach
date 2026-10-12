@@ -108,6 +108,32 @@ describe("duplicate client handling", () => {
     conn2.close();
   });
 
+  test("kicked clients are removed, not leaked", async () => {
+    // Closing a kicked client's fd dropped its pending read on kqueue (macOS), so
+    // its callback never ran and the client stayed in the list for good: a
+    // session reattached by the phone all day reported 24 clients.
+    const kicks = 3;
+    let conn = await connectRawSocketWithUpgrade(socketPath);
+    sendAttachPacket(conn, "test-client-id-leak0000");
+    await Bun.sleep(50);
+    const old: RawRtachConnection[] = [];
+    for (let i = 0; i < kicks; i++) {
+      old.push(conn);
+      conn = await connectRawSocketWithUpgrade(socketPath);
+      sendAttachPacket(conn, "test-client-id-leak0000");
+      await Bun.sleep(100);
+    }
+
+    // Each kicked client is removed ("client N disconnected") while the old
+    // sockets are still open on this side
+    const log = await Bun.file(`${socketPath}.log`).text();
+    const removed = log.split("\n").filter((line) => line.includes("disconnected")).length;
+    expect(removed).toBe(kicks);
+
+    for (const c of old) c.close();
+    conn.close();
+  });
+
   test("rapid reconnections with same client_id - server remains responsive", async () => {
     const clientId = "rapid-reconnect-test-id";
     let lastConn: RawRtachConnection | null = null;
