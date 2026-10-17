@@ -45,27 +45,37 @@ pub const MasterOptions = struct {
     scrollback_size: usize,
 };
 
-/// Ask spawnd to start a master. False if spawnd isn't there or the master didn't
-/// start; the caller then starts it itself.
-pub fn startMaster(allocator: std.mem.Allocator, io: std.Io, options: MasterOptions) bool {
-    if (!supported) return false;
+pub const Result = enum {
+    /// No spawnd here: start the master as before
+    unavailable,
+    started,
+    /// spawnd answered the connection but didn't report a master. launchd accepts
+    /// connections even when it can't start spawnd (its program is missing, say),
+    /// and a slow spawnd may still start one.
+    failed,
+};
+
+/// Ask spawnd to start a master
+pub fn startMaster(allocator: std.mem.Allocator, io: std.Io, options: MasterOptions) Result {
+    if (!supported) return .unavailable;
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = socketPath(&path_buf) orelse return false;
+    const path = socketPath(&path_buf) orelse return .unavailable;
 
-    const fd = sys.unixSocket(false) catch return false;
+    const fd = sys.unixSocket(false) catch return .unavailable;
     defer sys.close(fd);
-    sys.connect(fd, path) catch return false;
+    sys.connect(fd, path) catch return .unavailable;
 
-    const request = buildRequest(allocator, io, options) catch return false;
+    const request = buildRequest(allocator, io, options) catch return .failed;
     defer allocator.free(request);
-    writeAll(fd, request) catch return false;
+    writeAll(fd, request) catch return .failed;
     sys.shutdownWrite(fd);
 
-    // Starting a master takes milliseconds, plus launchd starting spawnd the first time
-    sys.setRecvTimeout(fd, 10);
+    // Starting spawnd and a master takes well under a second. Longer, and the user
+    // is looking at a frozen tab.
+    sys.setRecvTimeout(fd, 3);
     var code: [1]u8 = undefined;
-    const n = sys.read(fd, &code) catch return false;
-    return n == 1 and code[0] == 0;
+    const n = sys.read(fd, &code) catch return .failed;
+    return if (n == 1 and code[0] == 0) .started else .failed;
 }
 
 fn buildRequest(allocator: std.mem.Allocator, io: std.Io, options: MasterOptions) ![]u8 {
@@ -336,7 +346,7 @@ fn install(allocator: std.mem.Allocator, io: std.Io) !void {
     try cwd.createDirPath(io, std.fs.path.dirname(paths.program).?);
     try cwd.createDirPath(io, std.fs.path.dirname(paths.plist).?);
 
-    // Its own copy: the app replaces versioned rtach binaries. launchd starts the
+    // Its own copy: the app deletes old versioned rtach binaries (rtach-<version>). launchd starts the
     // program fresh after each idle exit, so a new copy takes over by itself.
     var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
     const exe = exe_buf[0..try std.process.executablePath(io, &exe_buf)];

@@ -3,6 +3,7 @@ import { spawn, type Subprocess } from "bun";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
+import { createServer, type Socket } from "net";
 import {
   RTACH_BIN,
   uniqueSocketPath,
@@ -97,6 +98,25 @@ describe.skipIf(process.platform !== "darwin")("spawnd", () => {
     const output = await waitForOutput(client, "var=", 3000);
     expect(output).toContain("var=from-client");
     expect(spawndLog).not.toContain(": exit");
+  });
+
+  test("a spawnd socket that never replies falls back after 3s", async () => {
+    // What launchd does when it can't start spawnd: accept, then nothing
+    const silentSocket = join(dir, "silent.sock");
+    const held: Socket[] = [];
+    const server = createServer((conn) => held.push(conn));
+    await new Promise<void>((resolve) => server.listen(silentSocket, resolve));
+    try {
+      const start = Date.now();
+      const client = attach(silentSocket);
+      const output = await waitForOutput(client, "var=", 6000);
+      expect(output).toContain("var=from-client");
+      expect(Date.now() - start).toBeLessThan(5000);
+      expect(starts()).toBe(1);
+    } finally {
+      held.forEach((c) => c.destroy());
+      server.close();
+    }
   });
 
   test("concurrent -A through spawnd start one master", async () => {

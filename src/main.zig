@@ -87,7 +87,10 @@ pub const Protocol = @import("protocol.zig");
 /// 2.12.0 - macOS: `rtach spawnd install` adds a LaunchAgent that starts masters in the
 ///          desktop session, so sessions started over SSH can use the login keychain
 ///          (code signing). Clients use it when it answers.
-pub const version = "2.12.0";
+/// 2.12.1 - A client waits 3s, not 10s, for a spawnd that launchd can't start (the
+///          app's cleanup of old binaries deleted rtach-spawnd), and attaches if the
+///          master started anyway.
+pub const version = "2.12.1";
 
 pub const std_options: std.Options = .{
     .log_level = .info,
@@ -219,14 +222,18 @@ pub fn main(init: std.process.Init) void {
 /// once the master listens.
 fn createAndAttach(allocator: std.mem.Allocator, io: std.Io, args: Args, detached: bool, lock: ?sys.fd_t) !void {
     // On macOS, spawnd starts it in the desktop session, where the keychain works
-    if (!args.no_spawnd and spawnd.startMaster(allocator, io, .{
-        .socket_path = args.socket_path,
-        .command = args.command,
-        .scrollback_size = args.scrollback_size,
-    })) {
-        if (lock) |fd| sys.close(fd);
-        if (detached) return;
-        return attach(allocator, args);
+    if (!args.no_spawnd) {
+        const result = spawnd.startMaster(allocator, io, .{
+            .socket_path = args.socket_path,
+            .command = args.command,
+            .scrollback_size = args.scrollback_size,
+        });
+        // spawnd may have started it after all, and a second one would replace it
+        if (result == .started or (result == .failed and socketLive(args.socket_path))) {
+            if (lock) |fd| sys.close(fd);
+            if (detached) return;
+            return attach(allocator, args);
+        }
     }
 
     const command = args.command orelse sys.getenv("SHELL") orelse "/bin/sh";

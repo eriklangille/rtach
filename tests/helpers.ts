@@ -8,10 +8,6 @@ import { inflateSync } from "zlib";
 // Path to rtach binary
 export const RTACH_BIN = join(import.meta.dir, "../zig-out/bin/rtach");
 
-// Masters start in the test process, not through a spawnd installed on this
-// machine (spawnd.test.ts runs its own)
-process.env.RTACH_SPAWND_SOCKET = "";
-
 // ============================================================================
 // Process Registry - tracks all spawned processes for cleanup on test failure
 // ============================================================================
