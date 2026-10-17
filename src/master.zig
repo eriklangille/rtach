@@ -539,6 +539,11 @@ pub const Master = struct {
         sys.unlink(path);
     }
 
+    fn stderrToPty(slave_fd: posix.fd_t) void {
+        sys.dup2(slave_fd, 2);
+        if (slave_fd > 2) sys.close(slave_fd);
+    }
+
     fn createPty(self: *Master) !void {
         const master_fd = sys.open("/dev/ptmx", .{ .ACCMODE = .RDWR, .NOCTTY = true, .NONBLOCK = true }, 0) catch |err| {
             log.err("failed to open /dev/ptmx: {}", .{err});
@@ -618,8 +623,8 @@ pub const Master = struct {
 
             sys.dup2(slave_fd, 0);
             sys.dup2(slave_fd, 1);
-            sys.dup2(slave_fd, 2);
-            if (slave_fd > 2) sys.close(slave_fd);
+            // stderr stays on the session log until exec, so setup logs don't show
+            // in the terminal
 
             // Set RTACH_CMD_PIPE environment variable for scripts to send commands
             // This is the path to the FIFO that scripts can write to
@@ -662,6 +667,7 @@ pub const Master = struct {
                     @ptrCast(self.options.command.ptr),
                     null,
                 };
+                stderrToPty(slave_fd);
                 sys.execvpZ(@ptrCast(self.options.command.ptr), &argv);
                 std.process.exit(127);
             };
@@ -704,6 +710,7 @@ pub const Master = struct {
             );
 
             // Execute shell with integration
+            stderrToPty(slave_fd);
             sys.execvpZ(shell_setup.argv[0].?, &shell_setup.argv);
             std.process.exit(127);
         }

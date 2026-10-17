@@ -81,7 +81,9 @@ pub const Protocol = @import("protocol.zig");
 ///          one under {socket}.lock, after checking that nothing answers on the socket
 ///          (a stale socket no longer fails the attach). A master removes its socket
 ///          and FIFO on exit only if they're still its own.
-pub const version = "2.11.1";
+/// 2.11.2 - The "shell setup" log line goes to the session log instead of showing at
+///          the top of every new session.
+pub const version = "2.11.2";
 
 pub const std_options: std.Options = .{
     .log_level = .info,

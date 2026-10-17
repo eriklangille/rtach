@@ -547,6 +547,21 @@ describe("rtach command execution", () => {
     await killAndWait(master, 9);
   });
 
+  test("shell setup logs go to the session log, not the terminal", async () => {
+    const master = await startDetachedMaster(socketPath, "/bin/zsh");
+    const client = connectClient(socketPath, { noDetachChar: true });
+
+    // The shell's own stderr still reaches the terminal
+    await writeToProc(client, `echo err-$((2+2)) >&2\n`);
+    const output = await waitForOutput(client, "err-4", 3000);
+    expect(output).not.toContain("shell setup");
+    expect(readFileSync(`${socketPath}.log`, "utf8")).toContain("shell setup");
+
+    client.kill(9);
+    await client.exited;
+    await killAndWait(master, 9);
+  });
+
   test("executes specified command and echoes", async () => {
     const master = await startDetachedMaster(socketPath, "/bin/cat");
 
