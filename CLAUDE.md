@@ -20,6 +20,7 @@ zig build cross             # Cross-compile all targets
 - `src/compression.zig` - zlib wrapper for terminal data compression
 - `src/ringbuffer.zig` - Scrollback buffer
 - `src/shell_integration.zig` - Shell integration scripts
+- `src/spawnd.zig` - macOS LaunchAgent that starts masters in the desktop session
 - `src/sys.zig` - Thin wrappers for fd, socket and process calls (Zig 0.16 removed most `std.posix` ones; files go through `std.Io`)
 
 ## Version Bumping
@@ -45,6 +46,10 @@ The master keeps each client's last `winch` size. The PTY takes the size of the 
 ### Session start
 
 `-A` takes an exclusive `flock` on `<socket>.lock`, then connects to the socket. If a master answers, it attaches. Otherwise (no socket, or a stale one) it forks a master and holds the lock until the master signals, over a pipe, that it listens. The lock file is never removed (that would let two processes hold different "locks"). A master removes its socket and `.cmd` FIFO on exit only if the path still has the inode it created. Tests: `tests/session-lock.test.ts`.
+
+### spawnd (macOS)
+
+A master started over SSH is in macOS's Background session, where the login keychain isn't available, so code signing fails inside the session. `rtach spawnd install` copies rtach to `~/.clauntty/bin/rtach-spawnd` and loads a LaunchAgent (`com.clauntty.rtach-spawnd`, Aqua only). launchd listens on `~/.clauntty/spawnd.sock` and starts spawnd on the first connection; spawnd exits after a minute idle. When a client has to create a master and spawnd answers, spawnd runs `<the client's rtach> --no-spawnd -n ...` with the client's environment and cwd, and the client attaches as usual. Otherwise the client starts the master itself (Linux, or spawnd not installed). `rtach spawnd status|uninstall`; log in `~/.clauntty/spawnd.log`. `RTACH_SPAWND_SOCKET` overrides the socket (empty: don't use spawnd; the tests set that). Tests: `tests/spawnd.test.ts`.
 
 ### Compression
 

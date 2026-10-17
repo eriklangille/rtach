@@ -206,6 +206,55 @@ pub fn shutdown(fd: fd_t) void {
     _ = system.shutdown(fd, posix.SHUT.RDWR);
 }
 
+/// Done sending: the peer's reads see EOF, and it can still reply
+pub fn shutdownWrite(fd: fd_t) void {
+    _ = system.shutdown(fd, posix.SHUT.WR);
+}
+
+pub fn accept(fd: fd_t) error{Unexpected}!fd_t {
+    while (true) {
+        const rc = system.accept(fd, null, null);
+        switch (posix.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR, .CONNABORTED => continue,
+            else => return error.Unexpected,
+        }
+    }
+}
+
+/// Wait up to `timeout_ms` (-1: forever) for `fd` to be readable. False on timeout.
+pub fn waitReadable(fd: fd_t, timeout_ms: i32) bool {
+    var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+    while (true) {
+        const rc = system.poll(&fds, 1, timeout_ms);
+        switch (posix.errno(rc)) {
+            .SUCCESS => return rc > 0,
+            .INTR => continue,
+            else => return false,
+        }
+    }
+}
+
+/// Reads on `fd` fail after `seconds` without data
+pub fn setRecvTimeout(fd: fd_t, seconds: i64) void {
+    const tv = posix.timeval{ .sec = @intCast(seconds), .usec = 0 };
+    _ = system.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv), @sizeOf(posix.timeval));
+}
+
+pub fn setCloexec(fd: fd_t) void {
+    _ = system.fcntl(fd, posix.F.SETFD, @as(c_int, posix.FD_CLOEXEC));
+}
+
+extern "c" fn getpeereid(fd: fd_t, uid: *posix.uid_t, gid: *posix.gid_t) c_int;
+
+/// The uid of the process on the other end of a Unix socket (BSD and macOS)
+pub fn peerUid(fd: fd_t) ?posix.uid_t {
+    var uid: posix.uid_t = undefined;
+    var gid: posix.gid_t = undefined;
+    if (getpeereid(fd, &uid, &gid) != 0) return null;
+    return uid;
+}
+
 // MARK: Processes
 
 pub fn fork() error{ SystemResources, Unexpected }!pid_t {
@@ -215,6 +264,19 @@ pub fn fork() error{ SystemResources, Unexpected }!pid_t {
         .AGAIN, .NOMEM => error.SystemResources,
         else => error.Unexpected,
     };
+}
+
+/// Wait for a child; its exit code, or null if it was killed by a signal
+pub fn waitExitCode(pid: pid_t) ?u8 {
+    var status: c_int = 0;
+    while (true) {
+        const rc = std.c.waitpid(pid, &status, 0);
+        if (rc == -1 and posix.errno(rc) == .INTR) continue;
+        if (rc == -1) return null;
+        break;
+    }
+    const s: u32 = @bitCast(status);
+    return if (posix.W.IFEXITED(s)) posix.W.EXITSTATUS(s) else null;
 }
 
 pub fn setsid() void {
@@ -227,4 +289,9 @@ extern "c" fn execvp(file: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) c_
 /// anything set with setenv). Only returns on failure.
 pub fn execvpZ(file: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) void {
     _ = execvp(file, argv);
+}
+
+/// Replace the process image with exactly this environment. Only returns on failure.
+pub fn execveZ(path: [*:0]const u8, argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) void {
+    _ = std.c.execve(path, argv, envp);
 }

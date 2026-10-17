@@ -9,6 +9,7 @@ const ClientOptions = client_mod.ClientOptions;
 const RingBuffer = @import("ringbuffer.zig").RingBuffer;
 const picker_mod = @import("picker.zig");
 const cli = @import("cli.zig");
+const spawnd = @import("spawnd.zig");
 
 pub const Protocol = @import("protocol.zig");
 
@@ -83,7 +84,10 @@ pub const Protocol = @import("protocol.zig");
 ///          and FIFO on exit only if they're still its own.
 /// 2.11.2 - The "shell setup" log line goes to the session log instead of showing at
 ///          the top of every new session.
-pub const version = "2.11.2";
+/// 2.12.0 - macOS: `rtach spawnd install` adds a LaunchAgent that starts masters in the
+///          desktop session, so sessions started over SSH can use the login keychain
+///          (code signing). Clients use it when it answers.
+pub const version = "2.12.0";
 
 pub const std_options: std.Options = .{
     .log_level = .info,
@@ -129,6 +133,8 @@ const Args = struct {
     scrollback_size: usize = 1024 * 1024, // 1MB default
     client_id: ?[Protocol.CLIENT_ID_SIZE]u8 = null, // Unique client identifier (UUID)
     proxy_mode: bool = false,
+    /// Start the master here even if spawnd could (spawnd's own request)
+    no_spawnd: bool = false,
 
     const Mode = enum {
         create, // -c: Create new session, attach to it
@@ -147,6 +153,9 @@ pub fn main(init: std.process.Init) void {
     var argv = init.minimal.args.iterate();
     if (argv.next()) |argv0| {
         if (cli.isCommandName(argv0)) std.process.exit(cli.main(allocator, io, init.minimal.args));
+    }
+    if (argv.next()) |arg1| {
+        if (std.mem.eql(u8, arg1, "spawnd")) std.process.exit(spawnd.main(allocator, io, init.minimal.args));
     }
 
     const args = parseArgs(init.minimal.args) catch {
@@ -209,6 +218,17 @@ pub fn main(init: std.process.Init) void {
 /// Fork the master and attach to it. With `lock`, the session lock is released
 /// once the master listens.
 fn createAndAttach(allocator: std.mem.Allocator, io: std.Io, args: Args, detached: bool, lock: ?sys.fd_t) !void {
+    // On macOS, spawnd starts it in the desktop session, where the keychain works
+    if (!args.no_spawnd and spawnd.startMaster(allocator, io, .{
+        .socket_path = args.socket_path,
+        .command = args.command,
+        .scrollback_size = args.scrollback_size,
+    })) {
+        if (lock) |fd| sys.close(fd);
+        if (detached) return;
+        return attach(allocator, args);
+    }
+
     const command = args.command orelse sys.getenv("SHELL") orelse "/bin/sh";
 
     // The master writes a byte here once it listens, or exits without writing
@@ -413,6 +433,8 @@ fn parseArgs(process_args: std.process.Args) !Args {
             result.no_detach_char = true;
         } else if (std.mem.eql(u8, arg, "--proxy")) {
             result.proxy_mode = true;
+        } else if (std.mem.eql(u8, arg, "--no-spawnd")) {
+            result.no_spawnd = true;
         } else if (std.mem.eql(u8, arg, "-s")) {
             if (args_iter.next()) |size_str| {
                 result.scrollback_size = std.fmt.parseInt(usize, size_str, 10) catch 1024 * 1024;
@@ -461,6 +483,9 @@ fn printUsage() void {
         \\  -r METHOD   Redraw method: none, ctrl_l, winch
         \\  -s SIZE     Scrollback buffer size in bytes (default: 1MB)
         \\  -C UUID     Client ID for deduplication
+        \\
+        \\  rtach spawnd install|uninstall|status
+        \\              macOS: start sessions in the desktop session (keychain)
         \\  -v          Print version
         \\  -h          Print this help
         \\
