@@ -118,6 +118,19 @@ fn writeAll(fd: sys.fd_t, bytes: []const u8) !void {
     while (sent < bytes.len) sent += try sys.write(fd, bytes[sent..]);
 }
 
+/// Shown at the top of a session that can't use the login keychain
+pub const keychain_notice = "\x1b[2mrtach: this session isn't in the desktop session, so code signing and the " ++
+    "login keychain don't work in it. For new sessions: rtach spawnd install\x1b[0m\n";
+
+/// Whether this process is outside the macOS desktop (Aqua) session, as SSH logins are
+pub fn outsideDesktopSession(allocator: std.mem.Allocator, io: std.Io) bool {
+    if (!supported) return false;
+    const result = std.process.run(allocator, io, .{ .argv = &.{ "/bin/launchctl", "managername" } }) catch return false;
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    return !std.mem.eql(u8, std.mem.trim(u8, result.stdout, " \n"), "Aqua");
+}
+
 // MARK: Server
 
 extern "c" fn launch_activate_socket(name: [*:0]const u8, fds: *?[*]c_int, count: *usize) c_int;

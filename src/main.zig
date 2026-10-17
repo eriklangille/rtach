@@ -90,7 +90,9 @@ pub const Protocol = @import("protocol.zig");
 /// 2.12.1 - A client waits 3s, not 10s, for a spawnd that launchd can't start (the
 ///          app's cleanup of old binaries deleted rtach-spawnd), and attaches if the
 ///          master started anyway.
-pub const version = "2.12.1";
+/// 2.12.2 - A macOS session started outside the desktop session without spawnd says at
+///          the top that code signing won't work in it, and how to fix that.
+pub const version = "2.12.2";
 
 pub const std_options: std.Options = .{
     .log_level = .info,
@@ -237,6 +239,11 @@ fn createAndAttach(allocator: std.mem.Allocator, io: std.Io, args: Args, detache
     }
 
     const command = args.command orelse sys.getenv("SHELL") orelse "/bin/sh";
+    // Started over SSH on macOS without spawnd: say why code signing will fail
+    const notice: ?[]const u8 = if (!args.no_spawnd and spawnd.outsideDesktopSession(allocator, io))
+        spawnd.keychain_notice
+    else
+        null;
 
     // The master writes a byte here once it listens, or exits without writing
     const ready = try sys.pipe();
@@ -280,6 +287,7 @@ fn createAndAttach(allocator: std.mem.Allocator, io: std.Io, args: Args, detache
             .socket_path = args.socket_path,
             .command = command,
             .scrollback_size = args.scrollback_size,
+            .notice = notice,
         }) catch std.process.exit(1);
         _ = sys.write(ready[1], "1") catch {};
         sys.close(ready[1]);

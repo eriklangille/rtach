@@ -308,6 +308,8 @@ pub const MasterOptions = struct {
     socket_path: []const u8,
     command: []const u8,
     scrollback_size: usize = 1024 * 1024,
+    /// Written to the terminal before the program starts
+    notice: ?[]const u8 = null,
 };
 
 /// Client connection state
@@ -623,6 +625,7 @@ pub const Master = struct {
 
             sys.dup2(slave_fd, 0);
             sys.dup2(slave_fd, 1);
+            if (self.options.notice) |notice| _ = sys.write(1, notice) catch {};
             // stderr stays on the session log until exec, so setup logs don't show
             // in the terminal
 
