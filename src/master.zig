@@ -341,6 +341,12 @@ const ClientConn = struct {
     last_attach_ns: i128 = 0,
     /// Whether this client can receive command frames (e.g., Clauntty)
     supports_commands: bool = false,
+    /// This client's terminal size, from its last winch
+    size: ?Protocol.Winsize = null,
+    /// Set by pause, cleared by a claim or input: a client that paused gives up the
+    /// PTY size until it's used again, so a background pre-fetch (resume, then pause)
+    /// doesn't take the size back
+    yielded: bool = false,
 };
 
 pub const Master = struct {
@@ -380,8 +386,10 @@ pub const Master = struct {
 
     // Connected clients
     clients: std.ArrayList(*ClientConn) = .empty,
-    /// Active client for window size and command routing
+    /// Active client for command routing
     active_client: ?*ClientConn = null,
+    /// Client whose size the PTY has: the one in use (see pickSizeClient)
+    size_client: ?*ClientConn = null,
 
     // Event loop
     loop: xev.Loop,
@@ -1094,6 +1102,70 @@ pub const Master = struct {
         self.active_client = chosen;
     }
 
+    fn isSizeEligible(self: *Master, client: *ClientConn) bool {
+        if (!self.isClientEligible(client, false)) return false;
+        return client.size != null and !client.paused and !client.yielded;
+    }
+
+    /// The client in use: latest claim or input, else latest attach, among clients
+    /// that are showing the session
+    fn pickSizeClient(self: *Master) ?*ClientConn {
+        var best: ?*ClientConn = null;
+        var best_activity: i128 = 0;
+        var best_attach: i128 = 0;
+        for (self.clients.items) |client| {
+            if (!self.isSizeEligible(client)) continue;
+            const activity = @max(client.last_claim_ns, client.last_input_ns);
+            if (best == null or activity > best_activity or
+                (activity == best_activity and client.last_attach_ns > best_attach))
+            {
+                best = client;
+                best_activity = activity;
+                best_attach = client.last_attach_ns;
+            }
+        }
+        return best;
+    }
+
+    /// Give the PTY the size of the client in use. With none (e.g. the only client
+    /// paused in the background), the size stays as it is.
+    fn updateSizeClient(self: *Master) void {
+        const chosen = self.pickSizeClient();
+        if (chosen != self.size_client) {
+            log.debug("size client update: {} -> {}", .{
+                if (self.size_client) |client| client.fd else -1,
+                if (chosen) |client| client.fd else -1,
+            });
+            self.size_client = chosen;
+        }
+        if (chosen) |client| self.applyWinsize(client.size.?);
+    }
+
+    /// Resize the PTY, and signal the program when the size changed
+    fn applyWinsize(self: *Master, ws: Protocol.Winsize) void {
+        const size_changed = ws.cols != self.winsize.cols or ws.rows != self.winsize.rows;
+        const pixels_changed = ws.xpixel != self.winsize.xpixel or ws.ypixel != self.winsize.ypixel;
+        if (!size_changed and !pixels_changed) return;
+        self.winsize = ws;
+        const c_ws = posix.winsize{
+            .row = ws.rows,
+            .col = ws.cols,
+            .xpixel = ws.xpixel,
+            .ypixel = ws.ypixel,
+        };
+        _ = std.c.ioctl(self.pty_master, getTIOCSWINSZ(), &c_ws);
+
+        // Explicitly send SIGWINCH to ensure the app redraws
+        // TIOCSWINSZ should do this automatically, but it's not always reliable
+        // Send to process GROUP (negative pid) so it reaches foreground apps like Claude Code
+        if (size_changed and self.child_pid > 0) {
+            _ = std.c.kill(-self.child_pid, posix.SIG.WINCH);
+            log.info("winsize {}x{} -> sent SIGWINCH to pgrp {}", .{ ws.cols, ws.rows, self.child_pid });
+        } else {
+            log.debug("winsize {}x{}", .{ ws.cols, ws.rows });
+        }
+    }
+
     fn pickCommandTarget(self: *Master) ?*ClientConn {
         self.updateActiveClient();
 
@@ -1424,6 +1496,7 @@ pub const Master = struct {
                 self.clients.items[idx].attached = true;
                 self.clients.items[idx].last_attach_ns = self.nowNs();
                 self.updateActiveClient();
+                self.updateSizeClient();
 
                 // Handshake already sent on connect, now send scrollback
 
@@ -1483,7 +1556,9 @@ pub const Master = struct {
                 const client = self.clients.items[idx];
                 client.last_claim_ns = now_ns;
                 client.supports_commands = true;
+                client.yielded = false;
                 self.updateActiveClient();
+                self.updateSizeClient();
                 log.info("client {} claimed active", .{client.fd});
                 self.writeActivePointer();
             },
@@ -1491,47 +1566,26 @@ pub const Master = struct {
                 log.info("client {} detached", .{idx});
                 self.clients.items[idx].attached = false;
                 self.updateActiveClient();
+                self.updateSizeClient();
                 self.clearActivePointerIfUnreachable();
             },
             .push => {
                 const payload = pkt.getPayload();
                 if (payload.len > 0) {
-                    self.clients.items[idx].last_input_ns = self.nowNs();
+                    const client = self.clients.items[idx];
+                    client.last_input_ns = self.nowNs();
+                    client.yielded = false;
                     self.updateActiveClient();
+                    if (self.size_client != client) self.updateSizeClient();
                     _ = try sys.write(self.pty_master, payload);
                 }
             },
             .winch => {
+                // Every client's size is kept; the PTY takes the one in use
+                const ws = pkt.getWinsize() orelse return;
                 const client = self.clients.items[idx];
-                self.updateActiveClient();
-                if (self.active_client == null) {
-                    self.active_client = client;
-                } else if (self.active_client.? != client) {
-                    log.debug("ignoring winch from non-active client {}", .{client.fd});
-                    return;
-                }
-                if (pkt.getWinsize()) |ws| {
-                    const size_changed = ws.cols != self.winsize.cols or ws.rows != self.winsize.rows;
-                    self.winsize = ws;
-                    const c_ws = posix.winsize{
-                        .row = ws.rows,
-                        .col = ws.cols,
-                        .xpixel = ws.xpixel,
-                        .ypixel = ws.ypixel,
-                    };
-                    _ = std.c.ioctl(self.pty_master, getTIOCSWINSZ(), &c_ws);
-
-                    // Explicitly send SIGWINCH to ensure the app redraws
-                    // TIOCSWINSZ should do this automatically, but it's not always reliable
-                    // Send to process GROUP (negative pid) so it reaches foreground apps like Claude Code
-                    if (size_changed and self.child_pid > 0) {
-                        // Send to process group (shell + all children including Claude Code)
-                        _ = std.c.kill(-self.child_pid, posix.SIG.WINCH);
-                        log.info("winsize {}x{} -> sent SIGWINCH to pgrp {}", .{ ws.cols, ws.rows, self.child_pid });
-                    } else {
-                        log.debug("winsize {}x{}", .{ ws.cols, ws.rows });
-                    }
-                }
+                client.size = ws;
+                self.updateSizeClient();
             },
             .redraw => {
                 if (self.modes.alt_screen) {
@@ -1724,6 +1778,8 @@ pub const Master = struct {
                     client.paused_total_written = self.scrollback_total_written;
                     log.info("client {} paused at total_written {}", .{ idx, client.paused_total_written });
                 }
+                client.yielded = true;
+                self.updateSizeClient();
             },
             .@"resume" => {
                 // Client requests to resume terminal output streaming
@@ -1921,10 +1977,12 @@ pub const Master = struct {
         if (self.active_client != null and self.active_client.? == client) {
             self.active_client = null;
         }
+        if (self.size_client == client) self.size_client = null;
         sys.close(client.fd);
         self.allocator.destroy(client);
         _ = self.clients.swapRemove(idx);
         self.updateActiveClient();
+        self.updateSizeClient();
         self.clearActivePointerIfUnreachable();
     }
 

@@ -36,7 +36,11 @@ The iOS app uses the version to determine when to redeploy the binary to remote 
 - Magic: `RTCH` (0x48435452)
 - Client→Server: `[type:1B][len:1B][payload]` (max 255B)
 - Server→Client: `[type:1B][len:4B][payload]`
-- Active claim: `[type=10][len=0]` (foreground client for size/commands)
+- Active claim: `[type=10][len=0]` (foreground client for commands)
+
+### Terminal size
+
+The master keeps each client's last `winch` size. The PTY takes the size of the client in use: the latest claim or input, else the latest attach, among clients that are attached and not paused. A `pause` also gives up the size until the client claims or types again, so a background pre-fetch (resume, then pause) doesn't take it back. When the client in use pauses, detaches or disconnects, the next one's size applies right away. With no such client, the size stays. Tests: `tests/size-handoff.test.ts`.
 
 ### Compression
 
