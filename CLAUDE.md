@@ -42,6 +42,10 @@ The iOS app uses the version to determine when to redeploy the binary to remote 
 
 The master keeps each client's last `winch` size. The PTY takes the size of the client in use: the latest claim or input, else the latest attach, among clients that are attached and not paused. A `pause` also gives up the size until the client claims or types again, so a background pre-fetch (resume, then pause) doesn't take it back. When the client in use pauses, detaches or disconnects, the next one's size applies right away. With no such client, the size stays. Tests: `tests/size-handoff.test.ts`.
 
+### Session start
+
+`-A` takes an exclusive `flock` on `<socket>.lock`, then connects to the socket. If a master answers, it attaches. Otherwise (no socket, or a stale one) it forks a master and holds the lock until the master signals, over a pipe, that it listens. The lock file is never removed (that would let two processes hold different "locks"). A master removes its socket and `.cmd` FIFO on exit only if the path still has the inode it created. Tests: `tests/session-lock.test.ts`.
+
 ### Compression
 
 Terminal data can be compressed to reduce bandwidth (30-60% savings on typical output).

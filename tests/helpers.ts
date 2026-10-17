@@ -156,6 +156,7 @@ export function cleanupSocket(socketPath: string): void {
     `${socketPath}.title`,     // Title file
     `${socketPath}.title.tmp`, // Title temp file
     `${socketPath}.log`,       // Per-session log file
+    `${socketPath}.lock`,      // -A start lock
   ];
   for (const file of filesToClean) {
     try {

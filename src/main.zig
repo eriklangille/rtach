@@ -75,7 +75,13 @@ pub const Protocol = @import("protocol.zig");
 ///          inbox when it connects, so images sent while it's in the background wait.
 /// 2.10.1 - Fix: a client kicked by a reattach with the same client id is removed. On
 ///          macOS it stayed in the client list forever (one more per phone reconnect).
-pub const version = "2.11.0";
+/// 2.11.0 - The PTY takes the size of the client in use, and the next client's size
+///          when that one pauses, detaches or disconnects.
+/// 2.11.1 - Fix: concurrent `-A` on one session started a master each. `-A` now starts
+///          one under {socket}.lock, after checking that nothing answers on the socket
+///          (a stale socket no longer fails the attach). A master removes its socket
+///          and FIFO on exit only if they're still its own.
+pub const version = "2.11.1";
 
 pub const std_options: std.Options = .{
     .log_level = .info,
@@ -159,7 +165,7 @@ pub fn main(init: std.process.Init) void {
                     var new_args = args;
                     new_args.socket_path = buildSessionPath(allocator, &session_id) catch std.process.exit(1);
                     new_args.mode = .create_or_attach;
-                    createAndAttach(allocator, io, new_args, false) catch std.process.exit(1);
+                    createAndAttach(allocator, io, new_args, false, null) catch std.process.exit(1);
                 },
                 .existing => |session_id| {
                     // Attach to existing session
@@ -173,14 +179,18 @@ pub fn main(init: std.process.Init) void {
         },
         .create => {
             // Create new session and attach
-            createAndAttach(allocator, io, args, false) catch std.process.exit(1);
+            createAndAttach(allocator, io, args, false, null) catch std.process.exit(1);
         },
         .create_or_attach => {
-            // Try to attach, create if doesn't exist
-            if (socketExists(io, args.socket_path)) {
+            // One -A per session at a time decides whether to start a master, so two
+            // can't both start one. The lock is held until the new master listens.
+            const lock = lockSession(args.socket_path) catch std.process.exit(1);
+            if (socketLive(args.socket_path)) {
+                sys.close(lock);
                 attach(allocator, args) catch std.process.exit(1);
             } else {
-                createAndAttach(allocator, io, args, false) catch std.process.exit(1);
+                // No socket, or a stale one left by a master that died
+                createAndAttach(allocator, io, args, false, lock) catch std.process.exit(1);
             }
         },
         .attach => {
@@ -189,19 +199,27 @@ pub fn main(init: std.process.Init) void {
         },
         .create_detached => {
             // Create detached (master only, no client)
-            createAndAttach(allocator, io, args, true) catch std.process.exit(1);
+            createAndAttach(allocator, io, args, true, null) catch std.process.exit(1);
         },
     }
 }
 
-fn createAndAttach(allocator: std.mem.Allocator, io: std.Io, args: Args, detached: bool) !void {
+/// Fork the master and attach to it. With `lock`, the session lock is released
+/// once the master listens.
+fn createAndAttach(allocator: std.mem.Allocator, io: std.Io, args: Args, detached: bool, lock: ?sys.fd_t) !void {
     const command = args.command orelse sys.getenv("SHELL") orelse "/bin/sh";
+
+    // The master writes a byte here once it listens, or exits without writing
+    const ready = try sys.pipe();
 
     // Fork: child becomes master (can properly daemonize), parent becomes client
     const pid = try sys.fork();
 
     if (pid == 0) {
         // Child becomes the master (daemon)
+        // Close, don't unlock: unlocking would release the parent's lock too
+        if (lock) |fd| sys.close(fd);
+        sys.close(ready[0]);
         // setsid() works here because child is not a process group leader
         sys.setsid();
 
@@ -234,6 +252,8 @@ fn createAndAttach(allocator: std.mem.Allocator, io: std.Io, args: Args, detache
             .command = command,
             .scrollback_size = args.scrollback_size,
         }) catch std.process.exit(1);
+        _ = sys.write(ready[1], "1") catch {};
+        sys.close(ready[1]);
 
         master.run() catch std.process.exit(1);
         // exit skips defers: clean up explicitly so the socket, FIFO and active
@@ -241,13 +261,18 @@ fn createAndAttach(allocator: std.mem.Allocator, io: std.Io, args: Args, detache
         master.deinit();
         std.process.exit(0);
     } else {
-        // Parent becomes client (or exits if detached)
+        // Parent becomes client (or exits if detached), once the master listens
+        sys.close(ready[1]);
+        var byte: [1]u8 = undefined;
+        const listening = (sys.read(ready[0], &byte) catch 0) == 1;
+        sys.close(ready[0]);
+        if (lock) |fd| sys.close(fd);
+        if (!listening) return error.MasterFailed;
+
         if (detached) {
             // Detached mode: just exit, master runs in background
             return;
         }
-        // Small delay to let master set up
-        io.sleep(.fromMilliseconds(50), .awake) catch {};
         // Attach to the session we just created
         try attach(allocator, args);
     }
@@ -266,9 +291,20 @@ fn attach(allocator: std.mem.Allocator, args: Args) !void {
     try client.run();
 }
 
-fn socketExists(io: std.Io, path: []const u8) bool {
-    const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch return false;
-    return stat.kind == .unix_domain_socket;
+/// Lock {socket_path}.lock. The file stays: removing it would let a process
+/// waiting on the old file and one creating a new file both hold "the" lock.
+fn lockSession(socket_path: []const u8) !sys.fd_t {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&buf, "{s}.lock", .{socket_path});
+    return sys.lockFile(path);
+}
+
+/// Whether a master answers on the socket. The file can outlive its master.
+fn socketLive(path: []const u8) bool {
+    const fd = sys.unixSocket(false) catch return false;
+    defer sys.close(fd);
+    sys.connect(fd, path) catch return false;
+    return true;
 }
 
 /// Generate a new UUID-format session ID

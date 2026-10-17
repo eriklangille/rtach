@@ -88,6 +88,43 @@ pub fn unlink(path: []const u8) void {
     _ = system.unlink(&path_z);
 }
 
+pub fn read(fd: fd_t, buf: []u8) error{Unexpected}!usize {
+    while (true) {
+        const rc = system.read(fd, buf.ptr, buf.len);
+        return switch (posix.errno(rc)) {
+            .SUCCESS => @intCast(rc),
+            .INTR => continue,
+            else => error.Unexpected,
+        };
+    }
+}
+
+/// A pipe whose ends close on exec
+pub fn pipe() error{Unexpected}![2]fd_t {
+    var fds: [2]fd_t = undefined;
+    if (posix.errno(std.c.pipe(&fds)) != .SUCCESS) return error.Unexpected;
+    for (fds) |fd| _ = system.fcntl(fd, posix.F.SETFD, @as(c_int, posix.FD_CLOEXEC));
+    return fds;
+}
+
+/// Open a lock file, creating it if needed, and wait for an exclusive lock on it.
+/// The lock lasts until every copy of the fd is closed. A forked child closes its
+/// copy rather than unlocking, which would release the parent's lock too.
+pub fn lockFile(path: []const u8) error{Unexpected}!fd_t {
+    const path_z = posix.toPosixPath(path) catch return error.Unexpected;
+    const fd = open(&path_z, .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true }, 0o600) catch return error.Unexpected;
+    while (true) {
+        switch (posix.errno(std.c.flock(fd, posix.LOCK.EX))) {
+            .SUCCESS => return fd,
+            .INTR => continue,
+            else => {
+                close(fd);
+                return error.Unexpected;
+            },
+        }
+    }
+}
+
 pub fn isatty(fd: fd_t) bool {
     return std.c.isatty(fd) == 1;
 }

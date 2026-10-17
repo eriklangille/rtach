@@ -365,6 +365,7 @@ pub const Master = struct {
     cmd_fifo_fd: posix.fd_t = -1,
     cmd_fifo_path: [512]u8 = undefined,
     cmd_fifo_path_len: usize = 0,
+    cmd_fifo_inode: ?std.Io.File.INode = null,
     cmd_fifo_stream: xev.Stream = undefined,
     cmd_fifo_completion: xev.Completion = .{},
     cmd_fifo_buf: [512]u8 = undefined,
@@ -377,6 +378,9 @@ pub const Master = struct {
 
     // Unix socket (using TCP abstraction which works for any socket)
     socket_fd: posix.fd_t = -1,
+    /// The socket file this master created. On exit it removes the path only if
+    /// that's still the file: a newer master may have replaced it.
+    socket_inode: ?std.Io.File.INode = null,
     socket: xev.TCP = undefined,
 
     // Scrollback buffer
@@ -502,7 +506,10 @@ pub const Master = struct {
         self.socket_fd = try sys.unixSocket(true);
         errdefer sys.close(self.socket_fd);
 
-        try sys.bindAndListen(self.socket_fd, self.options.socket_path, 5);
+        // A full backlog refuses connections on macOS, and `-A` takes a refused
+        // socket for a stale one
+        try sys.bindAndListen(self.socket_fd, self.options.socket_path, 64);
+        self.socket_inode = self.inodeOf(self.options.socket_path);
 
         // Wrap in TCP abstraction (works for Unix sockets too)
         self.socket = xev.TCP.initFd(self.socket_fd);
@@ -515,9 +522,21 @@ pub const Master = struct {
     fn closeSocket(self: *Master) void {
         if (self.socket_fd >= 0) {
             sys.close(self.socket_fd);
-            sys.unlink(self.options.socket_path);
+            self.unlinkIfOurs(self.options.socket_path, self.socket_inode);
             self.socket_fd = -1;
         }
+    }
+
+    fn inodeOf(self: *Master, path: []const u8) ?std.Io.File.INode {
+        const stat = std.Io.Dir.cwd().statFile(self.io, path, .{}) catch return null;
+        return stat.inode;
+    }
+
+    /// Remove a file this master created, unless another file has taken its path
+    fn unlinkIfOurs(self: *Master, path: []const u8, inode: ?std.Io.File.INode) void {
+        const ours = inode orelse return;
+        if (self.inodeOf(path) != ours) return;
+        sys.unlink(path);
     }
 
     fn createPty(self: *Master) !void {
@@ -560,6 +579,7 @@ pub const Master = struct {
             log.err("mkfifo failed for path '{s}': errno={}", .{ self.cmd_fifo_path[0..self.cmd_fifo_path_len], err });
             return error.MkfifoFailed;
         }
+        self.cmd_fifo_inode = self.inodeOf(self.cmd_fifo_path[0..self.cmd_fifo_path_len]);
         log.info("created command FIFO at {s}", .{self.cmd_fifo_path[0..self.cmd_fifo_path_len]});
 
         // Open FIFO with O_RDWR | O_NONBLOCK
@@ -705,8 +725,7 @@ pub const Master = struct {
         // Remove the FIFO file
         if (self.cmd_fifo_path_len > 0) {
             self.clearActivePointer();
-            const fifo_path_z: [*:0]const u8 = @ptrCast(&self.cmd_fifo_path);
-            _ = std.c.unlink(fifo_path_z);
+            self.unlinkIfOurs(self.cmd_fifo_path[0..self.cmd_fifo_path_len], self.cmd_fifo_inode);
             self.cmd_fifo_path_len = 0;
         }
         if (self.child_pid > 0) {
