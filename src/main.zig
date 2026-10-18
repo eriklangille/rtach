@@ -98,7 +98,9 @@ pub const Protocol = @import("protocol.zig");
 /// 2.13.1 - Fix: a session started without a terminal (the app's `rtach ws` over a
 ///          plain SSH command) got TERM=dumb and no locale, so zsh garbled typing.
 ///          Sessions default to TERM=xterm-256color and a UTF-8 LANG.
-pub const version = "2.13.1";
+/// 2.13.2 - Fix: also replace a TERM terminfo doesn't know (login gives commands run
+///          without a terminal a placeholder), and start the PTY at 80x24, not 0x0.
+pub const version = "2.13.2";
 
 pub const std_options: std.Options = .{
     .log_level = .info,

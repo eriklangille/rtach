@@ -95,19 +95,32 @@ describe("rtach ws", () => {
     expect(output).toContain(`id=${created.pane} dir=${project} home=${home}`);
   });
 
-  test("a pane started without a terminal still gets TERM and a locale", async () => {
-    // The app runs `rtach ws` over a plain SSH command: no TERM, often no LANG
-    const bare: Record<string, string> = { ...env() };
-    for (const key of ["TERM", "LANG", "LC_ALL", "LC_CTYPE"]) delete bare[key];
-    const result = spawnSync([RTACH_BIN, "ws", "new", "--cwd", project], { cwd: home, env: bare });
-    const { pane } = JSON.parse(result.stdout.toString());
+  // The app runs `rtach ws` over a plain SSH command: no TERM, or a placeholder
+  // like login's "network" that terminfo doesn't know, and often no LANG
+  for (const term of [undefined, "dumb", "network"]) {
+    test(`a pane started with TERM=${term ?? "(unset)"} gets a usable TERM and a locale`, async () => {
+      const bare: Record<string, string> = { ...env() };
+      for (const key of ["TERM", "LANG", "LC_ALL", "LC_CTYPE"]) delete bare[key];
+      if (term) bare.TERM = term;
+      const result = spawnSync([RTACH_BIN, "ws", "new", "--cwd", project], { cwd: home, env: bare });
+      const { pane } = JSON.parse(result.stdout.toString());
 
+      const client = attach(pane);
+      await waitForOutput(client, "$ ", 3000);
+      client.stdin.write('echo "term=$TERM lang=$LANG"\n');
+      // Not the echoed command line: its values are still $TERM and $LANG
+      const output = await waitForOutput(client, /term=[^$]*lang=[^$]/, 3000);
+      expect(output).toMatch(/term=xterm-256color lang=\S+UTF-8/);
+    });
+  }
+
+  test("a pane started with a TERM terminfo knows keeps it", async () => {
+    const result = spawnSync([RTACH_BIN, "ws", "new", "--cwd", project], { cwd: home, env: env({ TERM: "vt100" }) });
+    const { pane } = JSON.parse(result.stdout.toString());
     const client = attach(pane);
     await waitForOutput(client, "$ ", 3000);
-    client.stdin.write('echo "term=$TERM lang=$LANG"\n');
-    // Not the echoed command line: its values are still $TERM and $LANG
-    const output = await waitForOutput(client, /term=[^$]*lang=[^$]/, 3000);
-    expect(output).toMatch(/term=xterm-256color lang=\S+UTF-8/);
+    client.stdin.write('echo "term=$TERM"\n');
+    expect(await waitForOutput(client, /term=[^$]/, 3000)).toContain("term=vt100");
   });
 
   test("split defaults to the current pane and builds the layout tree", () => {

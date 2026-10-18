@@ -541,6 +541,40 @@ pub const Master = struct {
         sys.unlink(path);
     }
 
+    /// Whether this machine's terminfo has an entry for `term`. A command run over SSH
+    /// without a terminal can carry a placeholder (login's "network", "unknown") that
+    /// isn't one, and zsh then can't move the cursor or show colors.
+    fn terminfoHas(term: []const u8) bool {
+        if (term.len == 0 or std.mem.indexOfScalar(u8, term, '/') != null) return false;
+        var dirs_buf: [8][]const u8 = undefined;
+        var dirs: std.ArrayList([]const u8) = .initBuffer(&dirs_buf);
+        var home_buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (sys.getenv("TERMINFO")) |dir| dirs.appendAssumeCapacity(dir);
+        if (sys.getenv("HOME")) |home| {
+            if (std.fmt.bufPrint(&home_buf, "{s}/.terminfo", .{home})) |dir| dirs.appendAssumeCapacity(dir) else |_| {}
+        }
+        for ([_][]const u8{ "/etc/terminfo", "/lib/terminfo", "/usr/share/terminfo", "/usr/lib/terminfo" }) |dir| {
+            dirs.appendAssumeCapacity(dir);
+        }
+        var extra = std.mem.splitScalar(u8, sys.getenv("TERMINFO_DIRS") orelse "", ':');
+        while (extra.next()) |dir| {
+            if (dir.len > 0 and terminfoIn(dir, term)) return true;
+        }
+        for (dirs.items) |dir| {
+            if (terminfoIn(dir, term)) return true;
+        }
+        return false;
+    }
+
+    /// Entries live in <dir>/<first char>/<name> (Linux) or <dir>/<hex of it>/<name> (macOS)
+    fn terminfoIn(dir: []const u8, term: []const u8) bool {
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const by_char = std.fmt.bufPrintZ(&buf, "{s}/{c}/{s}", .{ dir, term[0], term }) catch return false;
+        if (std.c.access(by_char, std.c.F_OK) == 0) return true;
+        const by_hex = std.fmt.bufPrintZ(&buf, "{s}/{x:0>2}/{s}", .{ dir, term[0], term }) catch return false;
+        return std.c.access(by_hex, std.c.F_OK) == 0;
+    }
+
     fn stderrToPty(slave_fd: posix.fd_t) void {
         sys.dup2(slave_fd, 2);
         if (slave_fd > 2) sys.close(slave_fd);
@@ -562,6 +596,12 @@ pub const Master = struct {
         self.pty_slave_path[slave_len] = 0;
 
         self.pty_master = master_fd;
+        // A shell that starts before any client attaches (a `rtach ws` pane, or `-n`)
+        // mustn't see a 0x0 terminal: zsh then edits lines as if it can't move the
+        // cursor, and stays that way after the real size arrives
+        // (applyWinsize would skip it: self.winsize already says 80x24)
+        const initial = posix.winsize{ .row = self.winsize.rows, .col = self.winsize.cols, .xpixel = 0, .ypixel = 0 };
+        _ = std.c.ioctl(master_fd, getTIOCSWINSZ(), &initial);
         self.pty_stream = xev.Stream.initFd(master_fd);
 
         // Create command FIFO for scripts to send commands to Clauntty
@@ -636,7 +676,7 @@ pub const Master = struct {
             // run over a plain SSH command): zsh with no TERM edits lines like a dumb
             // terminal, and with no locale it mangles UTF-8
             const term = sys.getenv("TERM") orelse "";
-            if (term.len == 0 or std.mem.eql(u8, term, "dumb")) _ = setenv("TERM", "xterm-256color", 1);
+            if (std.mem.eql(u8, term, "dumb") or !terminfoHas(term)) _ = setenv("TERM", "xterm-256color", 1);
             if (sys.getenv("LANG") == null and sys.getenv("LC_ALL") == null and sys.getenv("LC_CTYPE") == null) {
                 _ = setenv("LANG", if (@import("builtin").os.tag == .macos) "en_US.UTF-8" else "C.UTF-8", 1);
             }
