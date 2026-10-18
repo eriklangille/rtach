@@ -632,6 +632,15 @@ pub const Master = struct {
             // Set RTACH_CMD_PIPE environment variable for scripts to send commands
             // This is the path to the FIFO that scripts can write to
             _ = setenv("RTACH_CMD_PIPE", fifo_path_z, 1);
+            // The session is a terminal even when whoever started it had none (`rtach ws`
+            // run over a plain SSH command): zsh with no TERM edits lines like a dumb
+            // terminal, and with no locale it mangles UTF-8
+            const term = sys.getenv("TERM") orelse "";
+            if (term.len == 0 or std.mem.eql(u8, term, "dumb")) _ = setenv("TERM", "xterm-256color", 1);
+            if (sys.getenv("LANG") == null and sys.getenv("LC_ALL") == null and sys.getenv("LC_CTYPE") == null) {
+                _ = setenv("LANG", if (@import("builtin").os.tag == .macos) "en_US.UTF-8" else "C.UTF-8", 1);
+            }
+
             // Which session this is, for `rtach ws` and scripts. The socket path came
             // from argv, so it's NUL-terminated (as createSocket assumes).
             var socket_buf: [std.fs.max_path_bytes]u8 = undefined;

@@ -95,7 +95,10 @@ pub const Protocol = @import("protocol.zig");
 ///          the top that code signing won't work in it, and how to fix that.
 /// 2.13.0 - `rtach ws`: workspaces, tabs and split layouts over sessions, in
 ///          ~/.clauntty/workspaces. Sessions get RTACH_SESSION_ID and RTACH_SOCKET.
-pub const version = "2.13.0";
+/// 2.13.1 - Fix: a session started without a terminal (the app's `rtach ws` over a
+///          plain SSH command) got TERM=dumb and no locale, so zsh garbled typing.
+///          Sessions default to TERM=xterm-256color and a UTF-8 LANG.
+pub const version = "2.13.1";
 
 pub const std_options: std.Options = .{
     .log_level = .info,
