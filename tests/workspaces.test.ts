@@ -17,7 +17,7 @@ type ListedWorkspace = {
   id: string;
   name: string;
   cwd: string;
-  tabs: { id: string; name: string; layout: Layout; panes: { id: string; title: string | null }[] }[];
+  tabs: { id: string; name: string; layout: Layout; panes: { id: string; title: string | null; state: any }[] }[];
 };
 
 describe("rtach ws", () => {
@@ -183,6 +183,21 @@ describe("rtach ws", () => {
     expect(codes.every((c) => c === 0)).toBe(true);
 
     expect(panesOf(list()[0].tabs[0].layout)).toHaveLength(9);
+  });
+
+  test("split starts in the pane's directory; list has each pane's state", async () => {
+    const { pane: a } = wsJson(["new", "proj", "--cwd", project]);
+    const client = attach(a);
+    await waitForOutput(client, "$ ", 3000);
+    client.stdin.write(`cd ${join(project, "src")} && sleep 3\n`);
+    expect(await waitFor(() => list()[0].tabs[0].panes[0].state?.fg === "sleep")).toBe(true);
+    expect(list()[0].tabs[0].panes[0].state.cwd).toBe(join(project, "src"));
+
+    const { pane: b } = wsJson(["split", a]);
+    const other = attach(b);
+    await waitForOutput(other, "$ ", 3000);
+    other.stdin.write('echo "dir=$(pwd)"\n');
+    expect(await waitForOutput(other, /dir=\//, 3000)).toContain(`dir=${join(project, "src")}`);
   });
 
   test("move and rename", () => {

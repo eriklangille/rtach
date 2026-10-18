@@ -402,6 +402,24 @@ fn paneTitle(arena: Allocator, io: std.Io, home: []const u8, pane: []const u8) ?
     return std.mem.trim(u8, title, " \n");
 }
 
+/// A pane's `<socket>.state` (see pane_state.zig), as JSON
+fn paneState(arena: Allocator, io: std.Io, home: []const u8, pane: []const u8) ?std.json.Value {
+    const path = std.fmt.allocPrint(arena, "{s}/.clauntty/sessions/{s}.state", .{ home, pane }) catch return null;
+    const data = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(16 * 1024)) catch return null;
+    return std.json.parseFromSliceLeaky(std.json.Value, arena, data, .{}) catch null;
+}
+
+/// The directory a pane's program is in, if its master has said
+fn paneCwd(arena: Allocator, io: std.Io, home: []const u8, pane: []const u8) ?[]const u8 {
+    const state = paneState(arena, io, home, pane) orelse return null;
+    const obj = switch (state) {
+        .object => |o| o,
+        else => return null,
+    };
+    const cwd = stringField(obj, "cwd") orelse return null;
+    return if (cwd.len > 0) cwd else null;
+}
+
 fn isDirectory(io: std.Io, path: []const u8) bool {
     const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch return false;
     return stat.kind == .directory;
@@ -647,8 +665,10 @@ fn cmdSplit(ctx: *Context, args: []const []const u8) !void {
     const p = try parse(ctx.arena, args);
     const target = try paneArg(ctx, p.positional.items, 0);
     var store = try Store.open(ctx.arena, ctx.io, ctx.home);
-    const cwd = (store.workspaceOf(target) orelse return error.NotInWorkspace).cwd;
+    const ws_cwd = (store.workspaceOf(target) orelse return error.NotInWorkspace).cwd;
     store.close();
+    // Next to the pane: in its directory
+    const cwd = paneCwd(ctx.arena, ctx.io, ctx.home, target) orelse ws_cwd;
 
     const pane = try startPane(ctx.arena, ctx.io, ctx.home, cwd);
     store = try Store.open(ctx.arena, ctx.io, ctx.home);
@@ -801,6 +821,8 @@ fn cmdRename(ctx: *Context, args: []const []const u8) !void {
 const PaneInfo = struct {
     id: []const u8,
     title: ?[]const u8,
+    /// Its master's <socket>.state: fg, cwd, agent, state, note
+    state: ?std.json.Value,
 };
 
 const TabInfo = struct {
@@ -843,7 +865,11 @@ fn cmdList(ctx: *Context, args: []const []const u8) !void {
             var ids: std.ArrayList([]const u8) = .empty;
             try tab.layout.panes(ctx.arena, &ids);
             var panes: std.ArrayList(PaneInfo) = .empty;
-            for (ids.items) |id| try panes.append(ctx.arena, .{ .id = id, .title = paneTitle(ctx.arena, ctx.io, ctx.home, id) });
+            for (ids.items) |id| try panes.append(ctx.arena, .{
+                .id = id,
+                .title = paneTitle(ctx.arena, ctx.io, ctx.home, id),
+                .state = paneState(ctx.arena, ctx.io, ctx.home, id),
+            });
             try tabs.append(ctx.arena, .{ .id = tab.id, .name = tab.name, .panes = panes.items, .layout = tab.layout });
         }
         try infos.append(ctx.arena, .{ .id = ws.id, .name = ws.name, .cwd = ws.cwd, .tabs = tabs.items });

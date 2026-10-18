@@ -92,6 +92,7 @@ fn run(allocator: std.mem.Allocator, io: std.Io, sub: []const u8, args: []const 
     }
 
     if (eql(sub, "show")) return show(allocator, io, args);
+    if (eql(sub, "agent-state")) return agentState(allocator, io, args);
 
     return fail("unknown command: {s} (see clauntty --help)", .{sub});
 }
@@ -99,6 +100,58 @@ fn run(allocator: std.mem.Allocator, io: std.Io, sub: []const u8, args: []const 
 /// Leave each image in the inbox, then send `image;<id>;<path>` to the session. With
 /// every image in the inbox, no reachable session isn't an error: the app picks them
 /// up when it connects.
+/// `clauntty agent-state working|blocked|done|idle|end`, run by an agent's hooks
+/// (Claude Code's: see RtachDeployer.deployClaudeHook). Tells this session's master,
+/// which shows it in the app; a hook's JSON on stdin can carry a "message", kept as
+/// the note. Quiet and always exit 0: a failing hook would bother the agent. Outside
+/// an rtach session it does nothing (Claude in a Herdr pane or another terminal).
+fn agentState(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
+    if (args.len != 1) return 0;
+    const target = envTarget() orelse return 0;
+
+    var note: []const u8 = "";
+    if (!sys.isatty(posix.STDIN_FILENO)) {
+        var buf: [16 * 1024]u8 = undefined;
+        var len: usize = 0;
+        while (len < buf.len) {
+            const n = sys.read(posix.STDIN_FILENO, buf[len..]) catch break;
+            if (n == 0) break;
+            len += n;
+        }
+        note = hookMessage(allocator, buf[0..len]) orelse "";
+    }
+    // Claude's "waiting for your input" reminder isn't a question for the user
+    if (std.mem.indexOf(u8, note, "waiting for your input") != null) return 0;
+
+    var line_buf: [1024]u8 = undefined;
+    // The note can't break the line format
+    var clean: [512]u8 = undefined;
+    var n: usize = 0;
+    for (note) |c| {
+        if (n == clean.len) break;
+        clean[n] = if (c == '\n' or c == ';') ' ' else c;
+        n += 1;
+    }
+    const line = std.fmt.bufPrint(&line_buf, "state;{s};{s}\n", .{ args[0], clean[0..n] }) catch return 0;
+    const fd = openFifo(target.fifo) catch return 0;
+    defer sys.close(fd);
+    writeAllFd(io, fd, line) catch {};
+    return 0;
+}
+
+/// The "message" of a hook's JSON input
+fn hookMessage(allocator: std.mem.Allocator, input: []const u8) ?[]const u8 {
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, allocator, input, .{}) catch return null;
+    const obj = switch (parsed) {
+        .object => |o| o,
+        else => return null,
+    };
+    return switch (obj.get("message") orelse return null) {
+        .string => |m| m,
+        else => null,
+    };
+}
+
 fn show(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
     if (args.len == 0) return fail("usage: clauntty show <image>...", .{});
 

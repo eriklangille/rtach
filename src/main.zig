@@ -105,7 +105,11 @@ pub const Protocol = @import("protocol.zig");
 /// 2.14.1 - Outside rtach, `rtach ws` PANE arguments default to the pane the app shows.
 /// 2.15.0 - `rtach ws add SESSION...` (sessions become one-pane workspaces) and
 ///          `rtach ws end WS`: the app makes every tab a workspace.
-pub const version = "2.15.0";
+/// 2.16.0 - Pane state: the master tracks the foreground program and its directory,
+///          and an agent's state from `clauntty agent-state` hooks or Claude Code's
+///          title. It writes <socket>.state and sends `pane;<id>;<json>` to the app.
+///          `ws list` includes it; `ws split` starts in the pane's directory.
+pub const version = "2.16.0";
 
 pub const std_options: std.Options = .{
     .log_level = .info,
@@ -540,6 +544,7 @@ test {
     _ = @import("history.zig");
     _ = @import("term_modes.zig");
     _ = @import("ws.zig");
+    _ = @import("pane_state.zig");
     _ = @import("active.zig");
     _ = @import("inbox.zig");
     _ = @import("cli.zig");

@@ -20,6 +20,9 @@ const QueryFilter = @import("query_filter.zig").QueryFilter;
 const history = @import("history.zig");
 const TermModes = @import("term_modes.zig").TermModes;
 const active = @import("active.zig");
+const cli = @import("cli.zig");
+const pane_state = @import("pane_state.zig");
+const PaneState = pane_state.PaneState;
 
 const log = std.log.scoped(.master);
 
@@ -411,6 +414,11 @@ pub const Master = struct {
     // Window size
     winsize: Protocol.Winsize = .{ .rows = 24, .cols = 80 },
 
+    /// What's happening in the session (foreground process, agent state), for the app
+    pane: PaneState = .{},
+    pane_dirty: bool = false,
+    last_pane_probe_ns: i128 = 0,
+
     // Terminal mode tracking (alternate screen, cursor visibility, mouse, bracketed paste...)
     // In the alternate screen (vim, less, Claude Code, etc.) we skip sending scrollback on
     // attach since the TUI will redraw itself; the other modes are restored on attach
@@ -448,6 +456,7 @@ pub const Master = struct {
     const IDLE_THRESHOLD_NS: i128 = 2 * std.time.ns_per_s; // 2 seconds
     const IDLE_CHECK_INTERVAL_MS: u64 = 500; // Check every 500ms
     const TITLE_WRITE_DEBOUNCE_NS: i128 = 500 * std.time.ns_per_ms; // 500ms
+    const PANE_PROBE_INTERVAL_NS: i128 = std.time.ns_per_s;
     const HEARTBEAT_INTERVAL_TICKS: u32 = 600; // Log heartbeat every 600 ticks (5 minutes at 500ms)
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, options: MasterOptions) !*Master {
@@ -1033,6 +1042,7 @@ pub const Master = struct {
 
         // Write title to file if dirty (debounced)
         self.writeTitleToFile();
+        self.probePane();
 
         // Re-arm timer
         self.idle_timer.run(
@@ -1091,9 +1101,14 @@ pub const Master = struct {
         const data = self.cmd_fifo_buf[0..n];
         for (data) |byte| {
             if (byte == '\n') {
-                // Complete command - send to clients
+                // Complete command - send to clients, except agent state, which is ours
                 if (self.cmd_line_len > 0) {
-                    self.sendCommandToClients(self.cmd_line_buf[0..self.cmd_line_len]);
+                    const line = self.cmd_line_buf[0..self.cmd_line_len];
+                    if (std.mem.startsWith(u8, line, "state;")) {
+                        self.handleAgentState(line["state;".len..]);
+                    } else {
+                        self.sendCommandToClients(line);
+                    }
                     self.cmd_line_len = 0;
                 }
             } else {
@@ -2018,7 +2033,65 @@ pub const Master = struct {
             self.terminal_title_len = self.osc_buf_len;
             self.title_dirty = true;
             log.debug("title set: \"{s}\"", .{self.terminal_title[0..self.terminal_title_len]});
+            if (self.pane.applyTitle(self.terminal_title[0..self.terminal_title_len])) self.pane_dirty = true;
         }
+    }
+
+    /// `state;<status>;<note>` from an agent hook (`clauntty agent-state`)
+    fn handleAgentState(self: *Master, args: []const u8) void {
+        var parts = std.mem.splitScalar(u8, args, ';');
+        const status = parts.next() orelse return;
+        const note = parts.rest();
+        log.info("agent state: {s}", .{status});
+        if (self.pane.applyHook(status, note)) {
+            // Right away: the app may notify the user
+            self.pane_dirty = true;
+            self.flushPaneState();
+        }
+    }
+
+    /// Check the foreground process (every second, from the idle tick), and flush
+    fn probePane(self: *Master) void {
+        const now = self.nowNs();
+        if (now - self.last_pane_probe_ns >= PANE_PROBE_INTERVAL_NS and self.pty_master >= 0) {
+            self.last_pane_probe_ns = now;
+            var name: [64]u8 = undefined;
+            var cwd: [1024]u8 = undefined;
+            if (pane_state.probe(self.pty_master, &name, &cwd)) |fg| {
+                if (self.pane.setForeground(fg.name, fg.cwd)) self.pane_dirty = true;
+            }
+        }
+        self.flushPaneState();
+    }
+
+    /// Write <socket>.state and tell the app (`pane;<id>;<json>`), if anything changed
+    fn flushPaneState(self: *Master) void {
+        if (!self.pane_dirty) return;
+        self.pane_dirty = false;
+
+        var json_buf: [2048]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&json_buf);
+        self.pane.writeJson(&w, self.terminal_title[0..self.terminal_title_len]) catch return;
+        const json = w.buffered();
+
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "{s}.state", .{self.options.socket_path}) catch return;
+        const tmp = std.fmt.bufPrint(&tmp_buf, "{s}.state.tmp", .{self.options.socket_path}) catch return;
+        const cwd = std.Io.Dir.cwd();
+        cwd.writeFile(self.io, .{ .sub_path = tmp, .data = json }) catch return;
+        cwd.rename(tmp, cwd, path, self.io) catch return;
+
+        // Only the app's sessions (~/.clauntty/sessions), not tests or sockets elsewhere
+        const home = sys.getenv("HOME") orelse return;
+        var sessions_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const sessions = std.fmt.bufPrint(&sessions_buf, "{s}/.clauntty/sessions/", .{home}) catch return;
+        if (!std.mem.startsWith(u8, self.options.socket_path, sessions)) return;
+
+        var msg_buf: [2200]u8 = undefined;
+        const id = std.fs.path.basename(self.options.socket_path);
+        const msg = std.fmt.bufPrint(&msg_buf, "{s};{s}", .{ id, json }) catch return;
+        cli.notify(self.io, "pane", msg);
     }
 
     /// Write title to .title file (debounced, called from idle timer)
