@@ -433,6 +433,8 @@ const usage =
     \\  split [PANE] [-h|-v]        New pane next to PANE (-h side by side, default;
     \\                              -v stacked)
     \\  close [PANE]                End PANE and take it out of its tab
+    \\  end WS                      End a workspace and all its panes
+    \\  add SESSION...              Make each existing session a one-pane workspace
     \\  move PANE TAB               Move PANE into TAB, next to its last pane
     \\  rename ID NAME              Rename a workspace or tab
     \\  list [--json]               Workspaces, tabs and panes
@@ -510,6 +512,10 @@ pub fn main(allocator: Allocator, io: std.Io, process_args: std.process.Args) u8
         cmdSplit(&ctx, rest)
     else if (eql(u8, command, "close"))
         cmdClose(&ctx, rest)
+    else if (eql(u8, command, "end"))
+        cmdEnd(&ctx, rest)
+    else if (eql(u8, command, "add"))
+        cmdAdd(&ctx, rest)
     else if (eql(u8, command, "move"))
         cmdMove(&ctx, rest)
     else if (eql(u8, command, "rename"))
@@ -535,6 +541,8 @@ fn errorText(err: anyerror) []const u8 {
         error.NoSuchWorkspace => "no such workspace",
         error.NoSuchTab => "no such tab",
         error.NoSuchId => "no workspace or tab with that id",
+        error.NotASession => "no session answers with that id",
+        error.AlreadyInWorkspace => "that session is already in a workspace",
         error.PaneDidntStart => "the new pane's session didn't start",
         error.Usage => "wrong arguments (see rtach ws)",
         else => @errorName(err),
@@ -591,7 +599,9 @@ fn cmdNew(ctx: *Context, args: []const []const u8) !void {
     var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
     const here = std.mem.sliceTo(std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.NoCwd, 0);
     const dir = p.cwd orelse projectRoot(ctx.arena, ctx.io, try ctx.arena.dupe(u8, here));
-    const name = if (p.positional.items.len > 0) p.positional.items[0] else std.fs.path.basename(dir);
+    // The home folder is "~", as in a prompt, not the user's name
+    const at_home = std.mem.eql(u8, std.mem.trimEnd(u8, dir, "/"), std.mem.trimEnd(u8, ctx.home, "/"));
+    const name = if (p.positional.items.len > 0) p.positional.items[0] else if (at_home) "~" else std.fs.path.basename(dir);
 
     // Start the pane before taking the lock: masters started by spawnd take it on exit
     const pane = try startPane(ctx.arena, ctx.io, ctx.home, dir);
@@ -669,6 +679,53 @@ fn cmdClose(ctx: *Context, args: []const []const u8) !void {
     ctx.json(.{ .closed = pane });
     ctx.notify(null, null);
 }
+
+fn cmdEnd(ctx: *Context, args: []const []const u8) !void {
+    const p = try parse(ctx.arena, args);
+    if (p.positional.items.len != 1) return error.Usage;
+    var panes: std.ArrayList([]const u8) = .empty;
+    {
+        var store = try Store.open(ctx.arena, ctx.io, ctx.home);
+        defer store.close();
+        const ws = store.find(p.positional.items[0]) orelse return error.NoSuchWorkspace;
+        for (ws.tabs.items) |tab| try tab.layout.panes(ctx.arena, &panes);
+        for (panes.items) |pane| store.removePane(pane);
+        try store.save();
+    }
+    // After the lock is released: each master takes it on exit
+    for (panes.items) |pane| stopPane(ctx.arena, ctx.home, pane);
+    ctx.json(.{ .ended = p.positional.items[0] });
+    ctx.notify(null, null);
+}
+
+fn cmdAdd(ctx: *Context, args: []const []const u8) !void {
+    const p = try parse(ctx.arena, args);
+    if (p.positional.items.len == 0) return error.Usage;
+    var store = try Store.open(ctx.arena, ctx.io, ctx.home);
+    defer store.close();
+    var added: std.ArrayList(Created) = .empty;
+    for (p.positional.items) |pane| {
+        if (store.workspaceOf(pane) != null) return error.AlreadyInWorkspace;
+        if (!paneAlive(ctx.arena, ctx.home, pane)) return error.NotASession;
+        const title = paneTitle(ctx.arena, ctx.io, ctx.home, pane);
+        var ws: Workspace = .{
+            .id = try newId(ctx.io, ctx.arena),
+            .name = p.name orelse if (title) |t| (if (t.len > 0) t else "shell") else "shell",
+            // Where the session is isn't known; new panes start at home
+            .cwd = p.cwd orelse ctx.home,
+            .tabs = .empty,
+        };
+        const tab: Tab = .{ .id = try newId(ctx.io, ctx.arena), .name = "1", .layout = .{ .pane = pane } };
+        try ws.tabs.append(ctx.arena, tab);
+        try store.workspaces.append(ctx.arena, ws);
+        try added.append(ctx.arena, .{ .workspace = ws.id, .tab = tab.id, .pane = pane });
+    }
+    try store.save();
+    ctx.json(added.items);
+    ctx.notify(null, null);
+}
+
+const Created = struct { workspace: []const u8, tab: []const u8, pane: []const u8 };
 
 fn cmdMove(ctx: *Context, args: []const []const u8) !void {
     const p = try parse(ctx.arena, args);

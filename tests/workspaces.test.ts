@@ -123,6 +123,11 @@ describe("rtach ws", () => {
     expect(await waitForOutput(client, /term=[^$]/, 3000)).toContain("term=vt100");
   });
 
+  test("a workspace in the home folder is named ~", () => {
+    wsJson(["new", "--cwd", home]);
+    expect(list()[0].name).toBe("~");
+  });
+
   test("split defaults to the current pane and builds the layout tree", () => {
     const { pane: a } = wsJson(["new", "proj", "--cwd", project]);
     const { pane: b } = wsJson(["split"], { env: { RTACH_SESSION_ID: a } });
@@ -227,6 +232,30 @@ describe("rtach ws", () => {
     await Bun.write(join(home, ".clauntty/active"), `${socket(a)}.cmd\n`);
     const { pane: b } = wsJson(["split", "-v"]);
     expect(list()[0].tabs[0].layout).toEqual({ split: "v", ratio: 0.5, a, b });
+  });
+
+  test("add makes a running session a one-pane workspace", async () => {
+    const id = "ADD0BEEF-0000-4000-8000-000000000001";
+    mkdirSync(join(home, ".clauntty/sessions"), { recursive: true });
+    spawnSync([RTACH_BIN, "-n", socket(id), "/bin/sh"], { cwd: home, env: env() });
+
+    const [added] = wsJson(["add", id]);
+    expect(added.pane).toBe(id);
+    const [w] = list();
+    expect(w.id).toBe(added.workspace);
+    expect(w.tabs[0].layout).toBe(id);
+
+    const again = spawnSync([RTACH_BIN, "ws", "add", id], { cwd: home, env: env() });
+    expect(again.exitCode).toBe(1);
+    expect(again.stderr.toString()).toContain("already in a workspace");
+  });
+
+  test("end stops every pane and removes the workspace", async () => {
+    const { workspace, pane: a } = wsJson(["new", "proj", "--cwd", project]);
+    const { pane: b } = wsJson(["split", a]);
+    wsJson(["end", workspace]);
+    expect(list()).toEqual([]);
+    expect(await waitFor(() => !existsSync(socket(a)) && !existsSync(socket(b)))).toBe(true);
   });
 
   test("errors say what's wrong", () => {

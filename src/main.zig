@@ -103,7 +103,9 @@ pub const Protocol = @import("protocol.zig");
 /// 2.14.0 - `rtach ws` changes tell the Clauntty app (`workspace;<ws>/<pane>`), which
 ///          shows a new pane right away. `--quiet` for the app's own commands.
 /// 2.14.1 - Outside rtach, `rtach ws` PANE arguments default to the pane the app shows.
-pub const version = "2.14.1";
+/// 2.15.0 - `rtach ws add SESSION...` (sessions become one-pane workspaces) and
+///          `rtach ws end WS`: the app makes every tab a workspace.
+pub const version = "2.15.0";
 
 pub const std_options: std.Options = .{
     .log_level = .info,
