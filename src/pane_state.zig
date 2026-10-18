@@ -161,6 +161,9 @@ pub const PaneState = struct {
             try jw.objectField("task");
             try jw.write(self.taskText());
         }
+        // This master sends push notifications (2.18.0), so the app doesn't post its own
+        try jw.objectField("pushes");
+        try jw.write(true);
         try jw.endObject();
     }
 };
@@ -353,7 +356,7 @@ test "json line" {
     var w: std.Io.Writer = .fixed(&buf);
     try s.writeJson(&w, "✳ Fix it");
     try testing.expectEqualStrings(
-        \\{"v":1,"fg":"zsh","cwd":"/src/app","title":"✳ Fix it","agent":"claude","state":"blocked","note":"needs \"you\""}
+        \\{"v":1,"fg":"zsh","cwd":"/src/app","title":"✳ Fix it","agent":"claude","state":"blocked","note":"needs \"you\"","pushes":true}
     , w.buffered());
 }
 
