@@ -26,7 +26,7 @@ describe("push", () => {
     mkdirSync(join(home, "bin"));
     writeFileSync(
       join(home, "bin/curl"),
-      `#!/bin/sh\necho "$@" > "$HOME/curl.$$.args"\ncat > "$HOME/curl.$$.json"\n`,
+      `#!/bin/sh\necho "$@" > "$HOME/curl.$$.args"\n/bin/cat > "$HOME/curl.$$.json"\n`,
     );
     chmodSync(join(home, "bin/curl"), 0o755);
     writeFileSync(
@@ -113,6 +113,22 @@ describe("push", () => {
     const lines = readFileSync(appLog, "utf8").split("\n").filter((l) => l.startsWith("push;"));
     expect(lines).toEqual([`push;${id};done;Claude;Finished`]);
     expect((await pushes(1, 300)).length).toBe(0);
+  });
+
+  test("without curl, BusyBox wget posts it", async () => {
+    rmSync(join(home, "bin/curl"));
+    writeFileSync(join(home, "bin/wget"), `#!/bin/sh\necho "$@" > "$HOME/curl.$$.args"\n/bin/cat > "$HOME/curl.$$.json"\n`);
+    chmodSync(join(home, "bin/wget"), 0o755);
+    // Only the stand-in: no real curl on PATH (the shell and hooks go by full path)
+    spawnSync([RTACH_BIN, "-n", sock, "/bin/sh"], { cwd: home, env: { ...env(), PATH: join(home, "bin") } });
+    const client = trackProcess(spawn([RTACH_BIN, "-a", sock, "-E"], { env: env(), stdin: "pipe", stdout: "pipe", stderr: "pipe" }));
+    await waitForOutput(client, "$ ", 3000);
+    client.stdin.write("~/.clauntty/bin/clauntty agent-state done < /dev/null\n");
+
+    const calls = await pushes(2);
+    expect(calls.length).toBe(2);
+    expect(calls[0].args).toContain("--post-file /dev/stdin https://push.example/notify");
+    expect(calls[0].body).toMatchObject({ pane: id, kind: "done" });
   });
 
   test("no push file, no curl", async () => {

@@ -1,7 +1,7 @@
 //! Push notifications, for when an agent finishes or needs the user while the app is
 //! away (suspended phones can't hear the session). Each phone that connected here left
 //! a line in ~/.clauntty/push: `<worker url> <device key> <phone id>`. For each, curl
-//! posts the notice to Clauntty's push Worker, which sends it on through APNs.
+//! (or wget) posts the notice to Clauntty's push Worker, which sends it on through APNs.
 //!
 //! A pane's master works out the notice (`line`) when its agent's status changes; the
 //! master of the session the app shows sends it, if no app is attached there (see
@@ -54,8 +54,9 @@ pub fn send(io: std.Io, notice: []const u8) void {
     }
 }
 
-/// curl, with the JSON on its stdin (not in its arguments, where `ps` shows it). A
-/// grandchild runs it so nobody has to wait for it to finish.
+/// curl (or BusyBox wget, on minimal Linux without curl), with the JSON on its stdin
+/// (not in its arguments, where `ps` shows it). A grandchild runs it so nobody has to
+/// wait for it to finish.
 fn post(url: [*:0]const u8, json: []const u8) void {
     const fds = sys.pipe() catch return;
     const pid = sys.fork() catch {
@@ -73,13 +74,20 @@ fn post(url: [*:0]const u8, json: []const u8) void {
         // Not the master's sockets and terminal
         var fd: sys.fd_t = 3;
         while (fd < 1024) : (fd += 1) sys.close(fd);
-        const argv = [_:null]?[*:0]const u8{
+        const curl = [_:null]?[*:0]const u8{
             "curl", "-s", "-m", "10", "-o", "/dev/null",
             "-H",   "content-type: application/json",
             "--data-binary", "@-",
             url,
         };
-        sys.execvpZ("curl", &argv);
+        sys.execvpZ("curl", &curl);
+        const wget = [_:null]?[*:0]const u8{
+            "wget", "-q", "-T", "10", "-O", "/dev/null",
+            "--header", "content-type: application/json",
+            "--post-file", "/dev/stdin",
+            url,
+        };
+        sys.execvpZ("wget", &wget);
         std.process.exit(127);
     }
     sys.close(fds[0]);
