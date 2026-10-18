@@ -11,6 +11,7 @@ const posix = std.posix;
 const sys = @import("sys.zig");
 const active = @import("active.zig");
 const inbox = @import("inbox.zig");
+const pane_state = @import("pane_state.zig");
 
 /// Names rtach answers to as this command
 pub fn isCommandName(argv0: []const u8) bool {
@@ -110,15 +111,18 @@ fn agentState(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8
     const target = envTarget() orelse return 0;
 
     var note: []const u8 = "";
+    // UserPromptSubmit's prompt: the agent's task, for the app's title
+    var prompt: ?[]const u8 = null;
     if (!sys.isatty(posix.STDIN_FILENO)) {
-        var buf: [16 * 1024]u8 = undefined;
+        var buf: [64 * 1024]u8 = undefined;
         var len: usize = 0;
         while (len < buf.len) {
             const n = sys.read(posix.STDIN_FILENO, buf[len..]) catch break;
             if (n == 0) break;
             len += n;
         }
-        note = hookMessage(allocator, buf[0..len]) orelse "";
+        note = hookField(allocator, buf[0..len], "message") orelse "";
+        prompt = hookField(allocator, buf[0..len], "prompt");
     }
     // Claude's "waiting for your input" reminder isn't a question for the user
     if (std.mem.indexOf(u8, note, "waiting for your input") != null) return 0;
@@ -135,18 +139,28 @@ fn agentState(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8
     const line = std.fmt.bufPrint(&line_buf, "state;{s};{s}\n", .{ args[0], clean[0..n] }) catch return 0;
     const fd = openFifo(target.fifo) catch return 0;
     defer sys.close(fd);
+    // The task first: the state line flushes the pane's state to the app
+    if (prompt) |p| {
+        var task_buf: [pane_state.task_max]u8 = undefined;
+        const task = pane_state.taskFromPrompt(p, &task_buf);
+        if (task.len > 0) {
+            var task_line: [pane_state.task_max + 8]u8 = undefined;
+            const tl = std.fmt.bufPrint(&task_line, "task;{s}\n", .{task}) catch "";
+            writeAllFd(io, fd, tl) catch {};
+        }
+    }
     writeAllFd(io, fd, line) catch {};
     return 0;
 }
 
-/// The "message" of a hook's JSON input
-fn hookMessage(allocator: std.mem.Allocator, input: []const u8) ?[]const u8 {
+/// A string field of a hook's JSON input
+fn hookField(allocator: std.mem.Allocator, input: []const u8, name: []const u8) ?[]const u8 {
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, allocator, input, .{}) catch return null;
     const obj = switch (parsed) {
         .object => |o| o,
         else => return null,
     };
-    return switch (obj.get("message") orelse return null) {
+    return switch (obj.get(name) orelse return null) {
         .string => |m| m,
         else => null,
     };

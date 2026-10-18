@@ -109,7 +109,9 @@ pub const Protocol = @import("protocol.zig");
 ///          and an agent's state from `clauntty agent-state` hooks or Claude Code's
 ///          title. It writes <socket>.state and sends `pane;<id>;<json>` to the app.
 ///          `ws list` includes it; `ws split` starts in the pane's directory.
-pub const version = "2.16.0";
+/// 2.17.0 - Pane state has the agent's task: the last prompt the user sent (from the
+///          UserPromptSubmit hook), for the app's title when Claude hasn't named one.
+pub const version = "2.17.0";
 
 pub const std_options: std.Options = .{
     .log_level = .info,

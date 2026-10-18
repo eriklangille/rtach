@@ -1106,6 +1106,9 @@ pub const Master = struct {
                     const line = self.cmd_line_buf[0..self.cmd_line_len];
                     if (std.mem.startsWith(u8, line, "state;")) {
                         self.handleAgentState(line["state;".len..]);
+                    } else if (std.mem.startsWith(u8, line, "task;")) {
+                        // Goes out with the state line after it
+                        if (self.pane.setTask(line["task;".len..])) self.pane_dirty = true;
                     } else {
                         self.sendCommandToClients(line);
                     }

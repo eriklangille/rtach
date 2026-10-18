@@ -92,6 +92,25 @@ describe("pane state", () => {
     expect(lines.some((l) => l.startsWith(`pane;${id};`) && l.includes('"state":"blocked"'))).toBe(true);
   });
 
+  test("the prompt hook gives the agent its task; a new session clears it", async () => {
+    const client = await start();
+    // What Claude Code's UserPromptSubmit hook gets on stdin
+    writeFileSync(join(home, "prompt.json"), JSON.stringify({ prompt: "[Image #2] fix the keyboard flicker\nwhen switching" }));
+    client.stdin.write("~/.clauntty/bin/clauntty agent-state working < ~/prompt.json\n");
+    const s = await waitForState((s) => s.task !== undefined);
+    expect(s.state).toBe("working");
+    expect(s.task).toBe("fix the keyboard flicker");
+
+    // A slash command keeps the task
+    writeFileSync(join(home, "prompt.json"), JSON.stringify({ prompt: "/compact" }));
+    client.stdin.write("~/.clauntty/bin/clauntty agent-state done < ~/prompt.json\n");
+    expect((await waitForState((s) => s.state === "done")).task).toBe("fix the keyboard flicker");
+
+    // SessionStart (a new session, or /clear)
+    client.stdin.write("~/.clauntty/bin/clauntty agent-state idle < /dev/null\n");
+    expect((await waitForState((s) => s.state === "idle")).task).toBeUndefined();
+  });
+
   test("outside an rtach session, agent-state does nothing", () => {
     const r = spawnSync([join(home, ".clauntty/bin/clauntty"), "agent-state", "working"], {
       env: { ...env(), RTACH_CMD_PIPE: "" },

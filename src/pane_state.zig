@@ -3,7 +3,8 @@
 //!
 //! The master probes the foreground process every second or so (`probe`). Agent state
 //! comes from the agent's hooks (`clauntty agent-state`, a `state;` line on the
-//! command pipe), with the terminal title as a fallback for Claude Code. The master
+//! command pipe), with the terminal title as a fallback for Claude Code. Its task is the
+//! last prompt the user sent it (a `task;` line from the same hook). The master
 //! writes it all to `<socket>.state` as one JSON line and sends the same line to the
 //! app as `pane;<id>;<json>`.
 
@@ -34,6 +35,9 @@ pub const PaneState = struct {
     status: Status = .none,
     note: [256]u8 = undefined,
     note_len: usize = 0,
+    /// The last prompt sent to the agent, tidied (`taskFromPrompt`)
+    task: [task_max]u8 = undefined,
+    task_len: usize = 0,
     /// Set by a hook: then the title doesn't override the status
     from_hook: bool = false,
 
@@ -47,6 +51,19 @@ pub const PaneState = struct {
 
     pub fn noteText(self: *const PaneState) []const u8 {
         return self.note[0..self.note_len];
+    }
+
+    pub fn taskText(self: *const PaneState) []const u8 {
+        return self.task[0..self.task_len];
+    }
+
+    /// Record the agent's task. True if it changed.
+    pub fn setTask(self: *PaneState, task: []const u8) bool {
+        const n = @min(task.len, self.task.len);
+        if (std.mem.eql(u8, self.taskText(), task[0..n])) return false;
+        @memcpy(self.task[0..n], task[0..n]);
+        self.task_len = n;
+        return true;
     }
 
     /// Record the foreground process. True if anything changed.
@@ -69,17 +86,20 @@ pub const PaneState = struct {
             self.agent = .none;
             self.status = .none;
             self.from_hook = false;
+            self.task_len = 0;
         } else {
             const status = std.meta.stringToEnum(Status, status_name) orelse return false;
             self.agent = .claude;
             self.status = status;
             self.from_hook = true;
+            // A new session (or /clear) starts idle, with nothing asked yet
+            if (status == .idle) self.task_len = 0;
         }
         const n = @min(note.len, self.note.len);
         @memcpy(self.note[0..n], note[0..n]);
         self.note_len = if (self.status == .blocked) n else 0;
         return !std.meta.eql(before.agent, self.agent) or before.status != self.status or
-            !std.mem.eql(u8, before.note[0..before.note_len], self.noteText());
+            !std.mem.eql(u8, before.note[0..before.note_len], self.noteText()) or before.task_len != self.task_len;
     }
 
     /// Claude Code's title, when no hook reports: a spinner first means working, "✳"
@@ -124,9 +144,64 @@ pub const PaneState = struct {
             try jw.objectField("note");
             try jw.write(self.noteText());
         }
+        if (self.task_len > 0) {
+            try jw.objectField("task");
+            try jw.write(self.taskText());
+        }
         try jw.endObject();
     }
 };
+
+/// The longest task kept (bytes)
+pub const task_max = 120;
+
+/// A prompt as a task for a title: its first line with text, without the `[Image #1]` and
+/// `[Pasted text #1 +20 lines]` placeholders Claude Code puts in, spaces collapsed,
+/// cut to `task_max` bytes on a character boundary. Empty for a slash command
+/// (`/clear`, `/compact`), which isn't a task.
+pub fn taskFromPrompt(prompt: []const u8, out: *[task_max]u8) []const u8 {
+    var len: usize = 0;
+    var pending_space = false;
+    var i: usize = 0;
+    var started = false;
+    while (i < prompt.len) {
+        const c = prompt[i];
+        if (c == '[' and isPlaceholder(prompt[i + 1 ..])) {
+            const close = std.mem.indexOfScalarPos(u8, prompt, i, ']') orelse prompt.len - 1;
+            i = close + 1;
+            pending_space = started;
+            continue;
+        }
+        if (c == '\n' or c == '\r') {
+            // The first line with text is the task
+            if (started) break;
+            i += 1;
+            continue;
+        }
+        if (c == ' ' or c == '\t') {
+            pending_space = started;
+            i += 1;
+            continue;
+        }
+        if (!started and c == '/') return out[0..0];
+        // Whole characters only
+        const char_len = std.unicode.utf8ByteSequenceLength(c) catch 1;
+        const extra: usize = if (pending_space) 1 else 0;
+        if (len + extra + char_len > out.len or i + char_len > prompt.len) break;
+        if (pending_space) out[len] = ' ';
+        len += extra;
+        @memcpy(out[len .. len + char_len], prompt[i .. i + char_len]);
+        len += char_len;
+        i += char_len;
+        started = true;
+        pending_space = false;
+    }
+    return out[0..len];
+}
+
+fn isPlaceholder(rest: []const u8) bool {
+    return std.mem.startsWith(u8, rest, "Image #") or std.mem.startsWith(u8, rest, "Pasted text");
+}
 
 /// Braille spinner (U+2800 block) or the half circles Claude Code also uses
 fn startsWithSpinner(title: []const u8) bool {
@@ -214,6 +289,31 @@ test "hooks set the status; the title only counts without them" {
     try testing.expect(!s.applyHook("done", ""));
     try testing.expect(s.applyHook("end", ""));
     try testing.expectEqual(Agent.none, s.agent);
+}
+
+test "the task is the last prompt; a new session clears it" {
+    var s: PaneState = .{};
+    _ = s.applyHook("working", "");
+    try testing.expect(s.setTask("Fix the login redirect"));
+    try testing.expect(!s.setTask("Fix the login redirect"));
+    _ = s.applyHook("done", "");
+    try testing.expectEqualStrings("Fix the login redirect", s.taskText());
+    try testing.expect(s.applyHook("idle", ""));
+    try testing.expectEqual(@as(usize, 0), s.task_len);
+}
+
+test "prompts as tasks" {
+    var buf: [task_max]u8 = undefined;
+    try testing.expectEqualStrings("shouldnt it exist with a terminal pane?", taskFromPrompt("[Image #30] shouldnt it exist with a terminal pane?", &buf));
+    try testing.expectEqualStrings("fix this", taskFromPrompt("\n  fix   this\nand more lines", &buf));
+    try testing.expectEqualStrings("see and this", taskFromPrompt("see [Pasted text #1 +20 lines] and this", &buf));
+    try testing.expectEqualStrings("", taskFromPrompt("/compact keep the plan", &buf));
+    try testing.expectEqualStrings("", taskFromPrompt("[Image #1]", &buf));
+    // Cut on a character boundary
+    const long = "é" ** 100;
+    const cut = taskFromPrompt(long, &buf);
+    try testing.expectEqual(@as(usize, task_max), cut.len);
+    try testing.expect(std.unicode.utf8ValidateSlice(cut));
 }
 
 test "a plain title clears a title-detected agent" {
