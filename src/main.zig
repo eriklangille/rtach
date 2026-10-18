@@ -118,7 +118,12 @@ pub const Protocol = @import("protocol.zig");
 ///          exec the newer binary with `--resume`, keeping the PTY, shell and scrollback.
 ///          `rtach upgrade` asks every older master on the machine. Pane state has the
 ///          master's version (`"rtach"`).
-pub const version = "2.19.0";
+/// 2.19.1 - `-a` exits 3 when the session doesn't exist, so the app can tell a closed
+///          session from a dropped connection (it no longer re-creates one with -A)
+pub const version = "2.19.1";
+
+/// `-a`'s exit code when the session doesn't exist (it ended)
+pub const no_session_exit: u8 = 3;
 
 pub const std_options: std.Options = .{
     .log_level = .info,
@@ -239,8 +244,13 @@ pub fn main(init: std.process.Init) void {
             }
         },
         .attach => {
-            // Attach only, fail if doesn't exist
-            attach(allocator, args) catch std.process.exit(1);
+            // Attach only, fail if doesn't exist: with `no_session_exit` when there's no
+            // session (no socket, or no master on it), so the app can tell a closed
+            // session from a failed connection
+            attach(allocator, args) catch |err| std.process.exit(switch (err) {
+                error.FileNotFound, error.ConnectionRefused => no_session_exit,
+                else => 1,
+            });
         },
         .create_detached => {
             // Create detached (master only, no client)

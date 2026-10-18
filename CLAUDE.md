@@ -46,7 +46,7 @@ The master keeps each client's last `winch` size. The PTY takes the size of the 
 
 ### Session start
 
-`-A` takes an exclusive `flock` on `<socket>.lock`, then connects to the socket. If a master answers, it attaches. Otherwise (no socket, or a stale one) it forks a master and holds the lock until the master signals, over a pipe, that it listens. The lock file is never removed (that would let two processes hold different "locks"). A master removes its socket and `.cmd` FIFO on exit only if the path still has the inode it created. Tests: `tests/session-lock.test.ts`.
+`-A` takes an exclusive `flock` on `<socket>.lock`, then connects to the socket. If a master answers, it attaches. Otherwise (no socket, or a stale one) it forks a master and holds the lock until the master signals, over a pipe, that it listens. The lock file is never removed (that would let two processes hold different "locks"). A master removes its socket and `.cmd` FIFO on exit only if the path still has the inode it created. Tests: `tests/session-lock.test.ts`. `-a` (attach only) exits 3 when there's no session (no socket, or no master on it), so the app can tell a session that ended from a dropped connection. The app's workspace tabs attach with `-a`: with `-A`, a tab reconnecting just after its pane was closed (or its shell exited) re-created the session. Tests: `tests/attach-missing.test.ts`.
 
 ### Workspaces (`rtach ws`)
 
