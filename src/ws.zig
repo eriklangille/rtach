@@ -325,6 +325,19 @@ pub fn paneEnded(allocator: Allocator, io: std.Io, socket_path: []const u8) void
     store.save() catch {};
 }
 
+/// The name of the workspace holding `pane`, copied into `buf`
+pub fn workspaceName(allocator: Allocator, io: std.Io, pane: []const u8, buf: []u8) ?[]const u8 {
+    const home = sys.getenv("HOME") orelse return null;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    var store = Store.open(arena_state.allocator(), io, home) catch return null;
+    defer store.close();
+    const name = (store.workspaceOf(pane) orelse return null).name;
+    if (name.len > buf.len) return null;
+    @memcpy(buf[0..name.len], name);
+    return buf[0..name.len];
+}
+
 // MARK: Panes
 
 /// Ids sort by creation: seconds since the epoch, then random bits

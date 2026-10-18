@@ -22,6 +22,8 @@ const TermModes = @import("term_modes.zig").TermModes;
 const active = @import("active.zig");
 const cli = @import("cli.zig");
 const pane_state = @import("pane_state.zig");
+const push = @import("push.zig");
+const workspaces = @import("ws.zig");
 const PaneState = pane_state.PaneState;
 
 const log = std.log.scoped(.master);
@@ -418,6 +420,12 @@ pub const Master = struct {
     pane: PaneState = .{},
     pane_dirty: bool = false,
     last_pane_probe_ns: i128 = 0,
+    /// The status last sent to the app, to see what changed
+    flushed_status: pane_state.Status = .none,
+    /// The last push this pane asked for, and when: an agent going blocked, working,
+    /// blocked again within PUSH_REPEAT_NS pushes once
+    pushed_status: pane_state.Status = .none,
+    pushed_ns: i128 = 0,
 
     // Terminal mode tracking (alternate screen, cursor visibility, mouse, bracketed paste...)
     // In the alternate screen (vim, less, Claude Code, etc.) we skip sending scrollback on
@@ -457,6 +465,7 @@ pub const Master = struct {
     const IDLE_CHECK_INTERVAL_MS: u64 = 500; // Check every 500ms
     const TITLE_WRITE_DEBOUNCE_NS: i128 = 500 * std.time.ns_per_ms; // 500ms
     const PANE_PROBE_INTERVAL_NS: i128 = std.time.ns_per_s;
+    const PUSH_REPEAT_NS: i128 = 10 * std.time.ns_per_s;
     const HEARTBEAT_INTERVAL_TICKS: u32 = 600; // Log heartbeat every 600 ticks (5 minutes at 500ms)
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, options: MasterOptions) !*Master {
@@ -1109,6 +1118,8 @@ pub const Master = struct {
                     } else if (std.mem.startsWith(u8, line, "task;")) {
                         // Goes out with the state line after it
                         if (self.pane.setTask(line["task;".len..])) self.pane_dirty = true;
+                    } else if (std.mem.startsWith(u8, line, "push;")) {
+                        self.handlePush(line["push;".len..]);
                     } else {
                         self.sendCommandToClients(line);
                     }
@@ -2071,6 +2082,8 @@ pub const Master = struct {
     fn flushPaneState(self: *Master) void {
         if (!self.pane_dirty) return;
         self.pane_dirty = false;
+        const status_changed = self.pane.status != self.flushed_status;
+        self.flushed_status = self.pane.status;
 
         var json_buf: [2048]u8 = undefined;
         var w: std.Io.Writer = .fixed(&json_buf);
@@ -2095,6 +2108,47 @@ pub const Master = struct {
         const id = std.fs.path.basename(self.options.socket_path);
         const msg = std.fmt.bufPrint(&msg_buf, "{s};{s}", .{ id, json }) catch return;
         cli.notify(self.io, "pane", msg);
+        if (status_changed) self.announce(id);
+    }
+
+    /// The agent finished or wants the user: a push, if the app isn't looking. The
+    /// master of the session the app shows decides (it's where the app would be told),
+    /// or this one when there's no such session.
+    fn announce(self: *Master, id: []const u8) void {
+        const status = self.pane.status;
+        if (status != .done and status != .blocked) return;
+        const now = self.nowNs();
+        if (status == self.pushed_status and now - self.pushed_ns < PUSH_REPEAT_NS) return;
+        self.pushed_status = status;
+        self.pushed_ns = now;
+
+        var label_buf: [160]u8 = undefined;
+        const label = self.pane.agentLabel(self.terminal_title[0..self.terminal_title_len]);
+        var name_buf: [128]u8 = undefined;
+        const title = if (workspaces.workspaceName(self.allocator, self.io, id, &name_buf)) |name|
+            if (std.mem.eql(u8, name, label)) name else std.fmt.bufPrint(&label_buf, "{s} · {s}", .{ name, label[0..@min(label.len, 120)] }) catch name
+        else
+            label;
+        const body = if (status == .blocked)
+            (if (self.pane.note_len > 0) self.pane.noteText() else "Needs you")
+        else
+            "Finished";
+
+        var line_buf: [900]u8 = undefined;
+        const notice = push.line(&line_buf, id, @tagName(status), title, body) orelse return;
+        if (!cli.notifyActive(self.io, "push", notice)) self.handlePush(notice);
+    }
+
+    /// A pane's push notice (`push.line`): sent on unless the app is here and in the
+    /// foreground (a paused client is an app in the background)
+    fn handlePush(self: *Master, notice: []const u8) void {
+        for (self.clients.items) |client| {
+            if (client.attached and !client.paused and !client.pending_remove and client.supports_commands) {
+                log.info("push: the app is here, not sending", .{});
+                return;
+            }
+        }
+        push.send(self.io, notice);
     }
 
     /// Write title to .title file (debounced, called from idle timer)

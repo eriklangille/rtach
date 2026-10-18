@@ -111,7 +111,9 @@ pub const Protocol = @import("protocol.zig");
 ///          `ws list` includes it; `ws split` starts in the pane's directory.
 /// 2.17.0 - Pane state has the agent's task: the last prompt the user sent (from the
 ///          UserPromptSubmit hook), for the app's title when Claude hasn't named one.
-pub const version = "2.17.0";
+/// 2.18.0 - Push notifications: an agent that finishes or is blocked while the app is
+///          away is posted, with curl, to each phone's push Worker in ~/.clauntty/push.
+pub const version = "2.18.0";
 
 pub const std_options: std.Options = .{
     .log_level = .info,

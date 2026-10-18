@@ -57,6 +57,19 @@ pub const PaneState = struct {
         return self.task[0..self.task_len];
     }
 
+    /// An agent pane's name, as the app titles it: the conversation's name from Claude
+    /// Code's title (after its spinner or "✳"), else the task, else "Claude"
+    pub fn agentLabel(self: *const PaneState, title: []const u8) []const u8 {
+        const fallback = if (self.task_len > 0) self.taskText() else "Claude";
+        const view = std.unicode.Utf8View.init(title) catch return fallback;
+        var it = view.iterator();
+        const first = it.nextCodepoint() orelse return fallback;
+        if (first < 0x2000) return fallback;
+        const topic = std.mem.trim(u8, title[it.i..], " ");
+        if (topic.len == 0 or std.mem.eql(u8, topic, "Claude Code")) return fallback;
+        return topic;
+    }
+
     /// Record the agent's task. True if it changed.
     pub fn setTask(self: *PaneState, task: []const u8) bool {
         const n = @min(task.len, self.task.len);
@@ -321,6 +334,15 @@ test "a plain title clears a title-detected agent" {
     _ = s.applyTitle("✳ Claude Code");
     try testing.expect(s.applyTitle("~/src"));
     try testing.expectEqual(Agent.none, s.agent);
+}
+
+test "agent label" {
+    var p: PaneState = .{};
+    try std.testing.expectEqualStrings("Claude", p.agentLabel("✳ Claude Code"));
+    _ = p.setTask("fix the build");
+    try std.testing.expectEqualStrings("fix the build", p.agentLabel("✳ Claude Code"));
+    try std.testing.expectEqualStrings("fix the build", p.agentLabel("zsh"));
+    try std.testing.expectEqualStrings("Refactor login", p.agentLabel("⠂ Refactor login"));
 }
 
 test "json line" {

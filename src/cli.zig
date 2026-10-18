@@ -270,15 +270,25 @@ pub fn activeSessionId(io: std.Io, buf: []u8) ?[]const u8 {
 pub fn notify(io: std.Io, kind: []const u8, value: []const u8) void {
     var pointer_buf: [std.fs.max_path_bytes]u8 = undefined;
     const targets = [_]?Target{ activeTarget(io, &pointer_buf), envTarget() };
-    var buf: [1024]u8 = undefined;
-    const text = std.fmt.bufPrint(&buf, "{s};{s}\n", .{ kind, value }) catch return;
     for (targets) |maybe| {
-        const target = maybe orelse continue;
-        const fd = openFifo(target.fifo) catch continue;
-        defer sys.close(fd);
-        writeAllFd(io, fd, text) catch continue;
-        return;
+        if (sendQuietly(io, maybe orelse continue, kind, value)) return;
     }
+}
+
+/// Tell the session the app shows on this machine something. False if there's none, or
+/// its master is gone.
+pub fn notifyActive(io: std.Io, kind: []const u8, value: []const u8) bool {
+    var pointer_buf: [std.fs.max_path_bytes]u8 = undefined;
+    return sendQuietly(io, activeTarget(io, &pointer_buf) orelse return false, kind, value);
+}
+
+fn sendQuietly(io: std.Io, target: Target, kind: []const u8, value: []const u8) bool {
+    var buf: [1024]u8 = undefined;
+    const text = std.fmt.bufPrint(&buf, "{s};{s}\n", .{ kind, value }) catch return false;
+    const fd = openFifo(target.fifo) catch return false;
+    defer sys.close(fd);
+    writeAllFd(io, fd, text) catch return false;
+    return true;
 }
 
 const no_target_msg = "no Clauntty session is active on this machine (open a Clauntty tab connected to it)";
