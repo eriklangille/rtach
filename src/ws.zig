@@ -17,6 +17,7 @@
 const std = @import("std");
 const posix = std.posix;
 const sys = @import("sys.zig");
+const cli = @import("cli.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -435,7 +436,8 @@ const usage =
     \\  rename ID NAME              Rename a workspace or tab
     \\  list [--json]               Workspaces, tabs and panes
     \\
-    \\Changes print the new or affected ids as JSON.
+    \\Changes print the new or affected ids as JSON, and tell the Clauntty app,
+    \\which shows a new pane right away (--quiet: don't).
     \\
 ;
 
@@ -444,6 +446,8 @@ const Context = struct {
     io: std.Io,
     home: []const u8,
     out: std.ArrayList(u8) = .empty,
+    /// Don't tell the app (it ran the command itself)
+    quiet: bool = false,
 
     fn print(self: *Context, comptime format: []const u8, args: anytype) void {
         self.out.print(self.arena, format, args) catch {};
@@ -452,6 +456,17 @@ const Context = struct {
     fn json(self: *Context, value: anytype) void {
         const text = std.json.Stringify.valueAlloc(self.arena, value, .{}) catch return;
         self.print("{s}\n", .{text});
+    }
+
+    /// Tell the app the workspaces changed: `workspace;<ws>/<pane>` to show a new pane,
+    /// `workspace;` to refresh
+    fn notify(self: *Context, workspace: ?[]const u8, pane: ?[]const u8) void {
+        if (self.quiet) return;
+        const value = if (workspace != null and pane != null)
+            std.fmt.allocPrint(self.arena, "{s}/{s}", .{ workspace.?, pane.? }) catch return
+        else
+            "";
+        cli.notify(self.io, "workspace", value);
     }
 };
 
@@ -465,13 +480,20 @@ pub fn main(allocator: Allocator, io: std.Io, process_args: std.process.Args) u8
     var it = process_args.iterate();
     _ = it.skip(); // rtach
     _ = it.skip(); // ws
-    while (it.next()) |arg| args.append(arena, arg) catch return 1;
+    var quiet = false;
+    while (it.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--quiet")) {
+            quiet = true;
+            continue;
+        }
+        args.append(arena, arg) catch return 1;
+    }
 
     const home = sys.getenv("HOME") orelse {
         fail("HOME isn't set\n", .{});
         return 1;
     };
-    var ctx: Context = .{ .arena = arena, .io = io, .home = home };
+    var ctx: Context = .{ .arena = arena, .io = io, .home = home, .quiet = quiet };
     const command = if (args.items.len > 0) args.items[0] else {
         fail(usage, .{});
         return 2;
@@ -577,6 +599,7 @@ fn cmdNew(ctx: *Context, args: []const []const u8) !void {
     try store.workspaces.append(ctx.arena, ws);
     try store.save();
     ctx.json(.{ .workspace = ws.id, .tab = tab.id, .pane = pane });
+    ctx.notify(ws.id, pane);
 }
 
 fn cmdTab(ctx: *Context, args: []const []const u8) !void {
@@ -603,6 +626,7 @@ fn cmdTab(ctx: *Context, args: []const []const u8) !void {
     try ws.tabs.append(ctx.arena, tab);
     try store.save();
     ctx.json(.{ .workspace = ws.id, .tab = tab.id, .pane = pane });
+    ctx.notify(ws.id, pane);
 }
 
 fn cmdSplit(ctx: *Context, args: []const []const u8) !void {
@@ -623,6 +647,7 @@ fn cmdSplit(ctx: *Context, args: []const []const u8) !void {
     tab.layout = try tab.layout.splitPane(ctx.arena, target, p.dir, pane);
     try store.save();
     ctx.json(.{ .workspace = ws.id, .tab = tab.id, .pane = pane });
+    ctx.notify(ws.id, pane);
 }
 
 fn cmdClose(ctx: *Context, args: []const []const u8) !void {
@@ -638,6 +663,7 @@ fn cmdClose(ctx: *Context, args: []const []const u8) !void {
     // After the lock is released: the master takes it on exit
     stopPane(ctx.arena, ctx.home, pane);
     ctx.json(.{ .closed = pane });
+    ctx.notify(null, null);
 }
 
 fn cmdMove(ctx: *Context, args: []const []const u8) !void {
@@ -680,6 +706,7 @@ fn cmdMove(ctx: *Context, args: []const []const u8) !void {
     }
     try store.save();
     ctx.json(.{ .workspace = ws_id, .tab = tab_copy, .pane = pane });
+    ctx.notify(ws_id, pane);
 }
 
 fn cmdRename(ctx: *Context, args: []const []const u8) !void {
@@ -694,6 +721,7 @@ fn cmdRename(ctx: *Context, args: []const []const u8) !void {
             ws.name = name;
             try store.save();
             ctx.json(.{ .renamed = id });
+            ctx.notify(null, null);
             return;
         }
         for (ws.tabs.items) |*tab| {
@@ -701,6 +729,7 @@ fn cmdRename(ctx: *Context, args: []const []const u8) !void {
                 tab.name = name;
                 try store.save();
                 ctx.json(.{ .renamed = id });
+                ctx.notify(null, null);
                 return;
             }
         }

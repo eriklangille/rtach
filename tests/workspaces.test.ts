@@ -197,6 +197,30 @@ describe("rtach ws", () => {
     expect(after.tabs.map((t) => t.name)).toEqual(["1", "logs"]);
   });
 
+  test("changes tell the app; --quiet doesn't", async () => {
+    // Stand in for the app: the active pointer names a pipe we read
+    const fifo = join(home, "app.cmd");
+    spawnSync(["mkfifo", fifo]);
+    mkdirSync(join(home, ".clauntty"), { recursive: true });
+    await Bun.write(join(home, ".clauntty/active"), `${fifo}\n`);
+    const listen = () => spawn(["cat", fifo], { stdout: "pipe" });
+
+    const { workspace, pane: a } = wsJson(["new", "proj", "--cwd", project, "--quiet"]);
+    let app = listen();
+    const { pane: b } = wsJson(["split", a]);
+    expect((await new Response(app.stdout).text()).trim()).toBe(`workspace;${workspace}/${b}`);
+
+    app = listen();
+    wsJson(["close", b]);
+    expect((await new Response(app.stdout).text()).trim()).toBe("workspace;");
+
+    app = listen();
+    wsJson(["split", a, "--quiet"]);
+    await Bun.sleep(200);
+    expect(app.exitCode).toBeNull();
+    app.kill();
+  });
+
   test("errors say what's wrong", () => {
     const result = spawnSync([RTACH_BIN, "ws", "split"], { cwd: home, env: env() });
     expect(result.exitCode).toBe(1);

@@ -169,14 +169,39 @@ const Target = struct {
 };
 
 fn resolveTarget(io: std.Io, pointer_buf: []u8) ?Target {
-    if (sys.getenv("RTACH_CMD_PIPE")) |pipe| {
-        if (pipe.len > 0) return .{ .fifo = pipe, .from_env = true };
-    }
+    return envTarget() orelse activeTarget(io, pointer_buf);
+}
+
+/// This session's pipe
+fn envTarget() ?Target {
+    const pipe = sys.getenv("RTACH_CMD_PIPE") orelse return null;
+    return if (pipe.len > 0) .{ .fifo = pipe, .from_env = true } else null;
+}
+
+/// The pipe of the session Clauntty last had active on this machine
+fn activeTarget(io: std.Io, pointer_buf: []u8) ?Target {
     const home = sys.getenv("HOME") orelse return null;
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const pointer = std.fmt.bufPrint(&path_buf, "{s}/.clauntty/active", .{home}) catch return null;
     const fifo = active.read(io, pointer, pointer_buf) orelse return null;
     return .{ .fifo = fifo, .from_env = false };
+}
+
+/// Tell the app something, quietly: nothing is printed when no app is listening.
+/// Goes to the session the app shows on this machine first (it may not be attached
+/// to this one), then to this session.
+pub fn notify(io: std.Io, kind: []const u8, value: []const u8) void {
+    var pointer_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const targets = [_]?Target{ activeTarget(io, &pointer_buf), envTarget() };
+    var buf: [1024]u8 = undefined;
+    const text = std.fmt.bufPrint(&buf, "{s};{s}\n", .{ kind, value }) catch return;
+    for (targets) |maybe| {
+        const target = maybe orelse continue;
+        const fd = openFifo(target.fifo) catch continue;
+        defer sys.close(fd);
+        writeAllFd(io, fd, text) catch continue;
+        return;
+    }
 }
 
 const no_target_msg = "no Clauntty session is active on this machine (open a Clauntty tab connected to it)";

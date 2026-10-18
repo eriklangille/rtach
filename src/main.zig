@@ -100,7 +100,9 @@ pub const Protocol = @import("protocol.zig");
 ///          Sessions default to TERM=xterm-256color and a UTF-8 LANG.
 /// 2.13.2 - Fix: also replace a TERM terminfo doesn't know (login gives commands run
 ///          without a terminal a placeholder), and start the PTY at 80x24, not 0x0.
-pub const version = "2.13.2";
+/// 2.14.0 - `rtach ws` changes tell the Clauntty app (`workspace;<ws>/<pane>`), which
+///          shows a new pane right away. `--quiet` for the app's own commands.
+pub const version = "2.14.0";
 
 pub const std_options: std.Options = .{
     .log_level = .info,
