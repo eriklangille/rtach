@@ -20,6 +20,7 @@ zig build cross             # Cross-compile all targets
 - `src/compression.zig` - zlib wrapper for terminal data compression
 - `src/ringbuffer.zig` - Scrollback buffer
 - `src/shell_integration.zig` - Shell integration scripts
+- `src/ws.zig` - `rtach ws`: workspaces, tabs and split layouts over sessions
 - `src/spawnd.zig` - macOS LaunchAgent that starts masters in the desktop session
 - `src/sys.zig` - Thin wrappers for fd, socket and process calls (Zig 0.16 removed most `std.posix` ones; files go through `std.Io`)
 
@@ -46,6 +47,10 @@ The master keeps each client's last `winch` size. The PTY takes the size of the 
 ### Session start
 
 `-A` takes an exclusive `flock` on `<socket>.lock`, then connects to the socket. If a master answers, it attaches. Otherwise (no socket, or a stale one) it forks a master and holds the lock until the master signals, over a pipe, that it listens. The lock file is never removed (that would let two processes hold different "locks"). A master removes its socket and `.cmd` FIFO on exit only if the path still has the inode it created. Tests: `tests/session-lock.test.ts`.
+
+### Workspaces (`rtach ws`)
+
+A pane is an ordinary session. `~/.clauntty/workspaces/<id>.json` groups panes: `{id, name, cwd, tabs: [{id, name, layout}]}`, where `layout` is a pane id or `{"split":"h|v","ratio","a","b"}` and a tab's panes are its leaves in order. Changes go through `rtach ws new|tab|split|close|move|rename|list [--json]`, under one flock on `workspaces/.lock`, with temp file plus rename. PANE arguments default to `$RTACH_SESSION_ID` (set in every session, with `RTACH_SOCKET`). New panes start in the workspace's `cwd` (the git root for `ws new`) by running this binary's `-n`, so they go through spawnd. Don't start them with `std.process.run`: its children get the Io's environment, which is empty. A master that exits takes its pane out (`ws.paneEnded`); `list` drops panes whose master doesn't answer. A tab's last pane takes the tab, a workspace's last tab the workspace. Tests: `tests/workspaces.test.ts`, each with its own HOME under /tmp (socket paths max 104 bytes on macOS).
 
 ### spawnd (macOS)
 

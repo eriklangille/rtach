@@ -245,6 +245,27 @@ pub fn setCloexec(fd: fd_t) void {
     _ = system.fcntl(fd, posix.F.SETFD, @as(c_int, posix.FD_CLOEXEC));
 }
 
+/// The pid of the process on the other end of a Unix socket
+pub fn peerPid(fd: fd_t) ?pid_t {
+    switch (@import("builtin").os.tag) {
+        .macos => {
+            // SOL_LOCAL, LOCAL_PEERPID (sys/un.h)
+            var pid: pid_t = 0;
+            var len: posix.socklen_t = @sizeOf(pid_t);
+            if (std.c.getsockopt(fd, 0, 0x002, @ptrCast(&pid), &len) != 0) return null;
+            return pid;
+        },
+        .linux => {
+            const Ucred = extern struct { pid: pid_t, uid: u32, gid: u32 };
+            var cred: Ucred = undefined;
+            var len: posix.socklen_t = @sizeOf(Ucred);
+            if (std.c.getsockopt(fd, posix.SOL.SOCKET, posix.SO.PEERCRED, @ptrCast(&cred), &len) != 0) return null;
+            return cred.pid;
+        },
+        else => return null,
+    }
+}
+
 extern "c" fn getpeereid(fd: fd_t, uid: *posix.uid_t, gid: *posix.gid_t) c_int;
 
 /// The uid of the process on the other end of a Unix socket (BSD and macOS)

@@ -10,6 +10,7 @@ const RingBuffer = @import("ringbuffer.zig").RingBuffer;
 const picker_mod = @import("picker.zig");
 const cli = @import("cli.zig");
 const spawnd = @import("spawnd.zig");
+const ws = @import("ws.zig");
 
 pub const Protocol = @import("protocol.zig");
 
@@ -92,7 +93,9 @@ pub const Protocol = @import("protocol.zig");
 ///          master started anyway.
 /// 2.12.2 - A macOS session started outside the desktop session without spawnd says at
 ///          the top that code signing won't work in it, and how to fix that.
-pub const version = "2.12.2";
+/// 2.13.0 - `rtach ws`: workspaces, tabs and split layouts over sessions, in
+///          ~/.clauntty/workspaces. Sessions get RTACH_SESSION_ID and RTACH_SOCKET.
+pub const version = "2.13.0";
 
 pub const std_options: std.Options = .{
     .log_level = .info,
@@ -161,6 +164,7 @@ pub fn main(init: std.process.Init) void {
     }
     if (argv.next()) |arg1| {
         if (std.mem.eql(u8, arg1, "spawnd")) std.process.exit(spawnd.main(allocator, io, init.minimal.args));
+        if (std.mem.eql(u8, arg1, "ws")) std.process.exit(ws.main(allocator, io, init.minimal.args));
     }
 
     const args = parseArgs(init.minimal.args) catch {
@@ -296,6 +300,7 @@ fn createAndAttach(allocator: std.mem.Allocator, io: std.Io, args: Args, detache
         // exit skips defers: clean up explicitly so the socket, FIFO and active
         // pointer don't outlive the session
         master.deinit();
+        ws.paneEnded(allocator, io, args.socket_path);
         std.process.exit(0);
     } else {
         // Parent becomes client (or exits if detached), once the master listens
@@ -499,6 +504,7 @@ fn printUsage() void {
         \\  -s SIZE     Scrollback buffer size in bytes (default: 1MB)
         \\  -C UUID     Client ID for deduplication
         \\
+        \\  rtach ws ...  Workspaces, tabs and split layouts (rtach ws for help)
         \\  rtach spawnd install|uninstall|status
         \\              macOS: start sessions in the desktop session (keychain)
         \\  -v          Print version
@@ -523,6 +529,7 @@ test {
     _ = @import("query_filter.zig");
     _ = @import("history.zig");
     _ = @import("term_modes.zig");
+    _ = @import("ws.zig");
     _ = @import("active.zig");
     _ = @import("inbox.zig");
     _ = @import("cli.zig");

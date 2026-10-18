@@ -632,6 +632,15 @@ pub const Master = struct {
             // Set RTACH_CMD_PIPE environment variable for scripts to send commands
             // This is the path to the FIFO that scripts can write to
             _ = setenv("RTACH_CMD_PIPE", fifo_path_z, 1);
+            // Which session this is, for `rtach ws` and scripts. The socket path came
+            // from argv, so it's NUL-terminated (as createSocket assumes).
+            var socket_buf: [std.fs.max_path_bytes]u8 = undefined;
+            if (std.c.realpath(@ptrCast(self.options.socket_path.ptr), &socket_buf)) |socket_z| {
+                _ = setenv("RTACH_SOCKET", socket_z, 1);
+                const socket = std.mem.span(socket_z);
+                const id = std.fs.path.basename(socket);
+                _ = setenv("RTACH_SESSION_ID", @ptrCast(socket[socket.len - id.len ..].ptr), 1);
+            }
 
             // Set BROWSER to open-browser so CLI tools use iOS browser
             if (sys.getenv("HOME")) |home| {
