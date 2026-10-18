@@ -102,7 +102,8 @@ pub const Protocol = @import("protocol.zig");
 ///          without a terminal a placeholder), and start the PTY at 80x24, not 0x0.
 /// 2.14.0 - `rtach ws` changes tell the Clauntty app (`workspace;<ws>/<pane>`), which
 ///          shows a new pane right away. `--quiet` for the app's own commands.
-pub const version = "2.14.0";
+/// 2.14.1 - Outside rtach, `rtach ws` PANE arguments default to the pane the app shows.
+pub const version = "2.14.1";
 
 pub const std_options: std.Options = .{
     .log_level = .info,

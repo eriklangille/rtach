@@ -221,9 +221,17 @@ describe("rtach ws", () => {
     app.kill();
   });
 
+  test("outside rtach, PANE defaults to the pane the app shows", async () => {
+    const { pane: a } = wsJson(["new", "proj", "--cwd", project]);
+    // What a master writes while its Clauntty client is the active one
+    await Bun.write(join(home, ".clauntty/active"), `${socket(a)}.cmd\n`);
+    const { pane: b } = wsJson(["split", "-v"]);
+    expect(list()[0].tabs[0].layout).toEqual({ split: "v", ratio: 0.5, a, b });
+  });
+
   test("errors say what's wrong", () => {
     const result = spawnSync([RTACH_BIN, "ws", "split"], { cwd: home, env: env() });
     expect(result.exitCode).toBe(1);
-    expect(result.stderr.toString()).toContain("not inside an rtach session");
+    expect(result.stderr.toString()).toContain("not inside an rtach session, and Clauntty shows none");
   });
 });

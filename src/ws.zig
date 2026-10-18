@@ -423,7 +423,8 @@ const usage =
     \\Usage: rtach ws <command> [args]
     \\
     \\Workspaces group rtach sessions (panes) into tabs with split layouts.
-    \\PANE defaults to the current session ($RTACH_SESSION_ID).
+    \\PANE defaults to the current session ($RTACH_SESSION_ID), else the one the
+    \\Clauntty app shows on this machine.
     \\
     \\Commands:
     \\  new [NAME] [--cwd DIR]      New workspace with one tab and pane. DIR defaults
@@ -529,7 +530,7 @@ pub fn main(allocator: Allocator, io: std.Io, process_args: std.process.Args) u8
 
 fn errorText(err: anyerror) []const u8 {
     return switch (err) {
-        error.NoPane => "no pane given, and not inside an rtach session",
+        error.NoPane => "no pane given, not inside an rtach session, and Clauntty shows none",
         error.NotInWorkspace => "that pane isn't in a workspace",
         error.NoSuchWorkspace => "no such workspace",
         error.NoSuchTab => "no such tab",
@@ -546,10 +547,13 @@ fn fail(comptime format: []const u8, args: anytype) void {
     _ = sys.write(posix.STDERR_FILENO, msg) catch {};
 }
 
-/// The PANE argument, else the current session
-fn paneArg(positional: []const []const u8, index: usize) ![]const u8 {
+/// The PANE argument, else the current session, else the one the app shows (so an
+/// agent outside rtach can act on what the user is looking at)
+fn paneArg(ctx: *Context, positional: []const []const u8, index: usize) ![]const u8 {
     if (positional.len > index) return positional[index];
-    return sys.getenv("RTACH_SESSION_ID") orelse error.NoPane;
+    if (sys.getenv("RTACH_SESSION_ID")) |id| return id;
+    const buf = try ctx.arena.alloc(u8, 64);
+    return cli.activeSessionId(ctx.io, buf) orelse error.NoPane;
 }
 
 const Parsed = struct {
@@ -607,7 +611,7 @@ fn cmdTab(ctx: *Context, args: []const []const u8) !void {
     var store = try Store.open(ctx.arena, ctx.io, ctx.home);
     const ws_id = blk: {
         if (p.positional.items.len > 0) break :blk p.positional.items[0];
-        const current = try paneArg(&.{}, 0);
+        const current = try paneArg(ctx, &.{}, 0);
         break :blk (store.workspaceOf(current) orelse return error.NotInWorkspace).id;
     };
     const cwd = (store.find(ws_id) orelse return error.NoSuchWorkspace).cwd;
@@ -631,7 +635,7 @@ fn cmdTab(ctx: *Context, args: []const []const u8) !void {
 
 fn cmdSplit(ctx: *Context, args: []const []const u8) !void {
     const p = try parse(ctx.arena, args);
-    const target = try paneArg(p.positional.items, 0);
+    const target = try paneArg(ctx, p.positional.items, 0);
     var store = try Store.open(ctx.arena, ctx.io, ctx.home);
     const cwd = (store.workspaceOf(target) orelse return error.NotInWorkspace).cwd;
     store.close();
@@ -652,7 +656,7 @@ fn cmdSplit(ctx: *Context, args: []const []const u8) !void {
 
 fn cmdClose(ctx: *Context, args: []const []const u8) !void {
     const p = try parse(ctx.arena, args);
-    const pane = try paneArg(p.positional.items, 0);
+    const pane = try paneArg(ctx, p.positional.items, 0);
     {
         var store = try Store.open(ctx.arena, ctx.io, ctx.home);
         defer store.close();

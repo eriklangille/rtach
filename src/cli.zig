@@ -187,6 +187,16 @@ fn activeTarget(io: std.Io, pointer_buf: []u8) ?Target {
     return .{ .fifo = fifo, .from_env = false };
 }
 
+/// The session the app shows on this machine (the active pointer), copied into `buf`
+pub fn activeSessionId(io: std.Io, buf: []u8) ?[]const u8 {
+    var pointer_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const target = activeTarget(io, &pointer_buf) orelse return null;
+    const id = sessionId(target.fifo);
+    if (id.len == 0 or id.len > buf.len) return null;
+    @memcpy(buf[0..id.len], id);
+    return buf[0..id.len];
+}
+
 /// Tell the app something, quietly: nothing is printed when no app is listening.
 /// Goes to the session the app shows on this machine first (it may not be attached
 /// to this one), then to this session.
