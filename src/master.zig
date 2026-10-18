@@ -23,6 +23,8 @@ const active = @import("active.zig");
 const cli = @import("cli.zig");
 const pane_state = @import("pane_state.zig");
 const push = @import("push.zig");
+const live = @import("upgrade.zig");
+const version = @import("main.zig").version;
 const workspaces = @import("ws.zig");
 const PaneState = pane_state.PaneState;
 
@@ -426,6 +428,10 @@ pub const Master = struct {
     /// blocked again within PUSH_REPEAT_NS pushes once
     pushed_status: pane_state.Status = .none,
     pushed_ns: i128 = 0,
+    /// From `upgrade;<path>`: the rtach to replace this one with, once the pipe's
+    /// current read is handled (see upgrade.zig)
+    upgrade_to: [std.fs.max_path_bytes]u8 = undefined,
+    upgrade_to_len: usize = 0,
 
     // Terminal mode tracking (alternate screen, cursor visibility, mouse, bracketed paste...)
     // In the alternate screen (vim, less, Claude Code, etc.) we skip sending scrollback on
@@ -501,6 +507,87 @@ pub const Master = struct {
             self.active_pointer_len = path.len;
         }
 
+        return self;
+    }
+
+    /// A master that replaced an older one (upgradeTo): the session's fds and shell are
+    /// already there, the rest comes from the state file if it can be read
+    pub fn resumeFrom(allocator: std.mem.Allocator, io: std.Io, kept: live.Kept) !*Master {
+        for ([_]posix.fd_t{ kept.pty, kept.socket, kept.fifo }) |fd| {
+            if (!sys.isOpen(fd)) return error.NotUpgrading;
+        }
+        if (comptime builtin.os.tag == .linux) try xev.detect();
+
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const loaded = live.load(io, arena.allocator(), kept.socket_path);
+        const state: live.State = if (loaded) |l| l.state else .{};
+        // For logs only; kept as long as the master
+        const command = try allocator.dupe(u8, if (state.command.len > 0) state.command else "(resumed)");
+
+        const self = try allocator.create(Master);
+        errdefer allocator.destroy(self);
+        self.* = .{
+            .allocator = allocator,
+            .io = io,
+            .options = .{
+                .socket_path = kept.socket_path,
+                .command = command,
+                .scrollback_size = if (state.scrollback_capacity > 0) state.scrollback_capacity else 1024 * 1024,
+            },
+            .scrollback = try RingBuffer.init(allocator, if (state.scrollback_capacity > 0) state.scrollback_capacity else 1024 * 1024),
+            .clients = .empty,
+            .loop = try xev.Loop.init(.{}),
+            .cmd_line_len = 0,
+        };
+
+        // The session's fds: closed on exec again, so a later upgrade starts clean
+        self.pty_master = kept.pty;
+        self.socket_fd = kept.socket;
+        self.cmd_fifo_fd = kept.fifo;
+        for ([_]posix.fd_t{ kept.pty, kept.socket, kept.fifo }) |fd| sys.setCloexec(fd);
+        self.child_pid = kept.child_pid;
+        self.pty_stream = xev.Stream.initFd(kept.pty);
+        self.socket = xev.TCP.initFd(kept.socket);
+        self.cmd_fifo_stream = xev.Stream.initFd(kept.fifo);
+        self.socket_inode = self.inodeOf(kept.socket_path);
+        const fifo_path = std.fmt.bufPrint(&self.cmd_fifo_path, "{s}.cmd", .{kept.socket_path}) catch return error.FifoPathTooLong;
+        self.cmd_fifo_path_len = fifo_path.len;
+        self.cmd_fifo_path[fifo_path.len] = 0;
+        self.cmd_fifo_inode = self.inodeOf(fifo_path);
+        if (ptsname(kept.pty)) |slave| {
+            const slave_path = std.mem.span(slave);
+            @memcpy(self.pty_slave_path[0..slave_path.len], slave_path);
+            self.pty_slave_path[slave_path.len] = 0;
+        }
+        if (active.pointerPath(kept.socket_path, &self.active_pointer_path)) |path| {
+            self.active_pointer_len = path.len;
+        }
+
+        if (loaded) |l| {
+            self.scrollback.write(l.scrollback);
+            self.scrollback_total_written = @max(state.scrollback_total_written, l.scrollback.len);
+            self.winsize = .{ .rows = state.rows, .cols = state.cols };
+            self.modes.alt_screen = state.alt_screen;
+            self.modes.cursor_visible = state.cursor_visible;
+            self.modes.flags.mask = @truncate(state.mode_flags);
+            self.modes.mouse_event = state.mouse_event;
+            self.modes.mouse_format = state.mouse_format;
+            const title_len = @min(state.title.len, self.terminal_title.len);
+            @memcpy(self.terminal_title[0..title_len], state.title[0..title_len]);
+            self.terminal_title_len = @intCast(title_len);
+            self.pane.restore(state.fg, state.cwd, state.agent, state.status, state.note, state.task, state.from_hook);
+            self.flushed_status = std.meta.stringToEnum(pane_state.Status, state.flushed_status) orelse .none;
+            self.pushed_status = std.meta.stringToEnum(pane_state.Status, state.pushed_status) orelse .none;
+            const partial = @min(state.cmd_partial.len, self.cmd_line_buf.len);
+            @memcpy(self.cmd_line_buf[0..partial], state.cmd_partial[0..partial]);
+            self.cmd_line_len = partial;
+            log.info("resumed from {s}: {} bytes of scrollback", .{ if (state.rtach.len > 0) state.rtach else "?", l.scrollback.len });
+        } else {
+            log.warn("resumed without the previous master's state (scrollback, modes and title start empty)", .{});
+        }
+        // Tell the app, and `rtach upgrade`, which version runs now
+        self.pane_dirty = true;
         return self;
     }
 
@@ -1120,6 +1207,12 @@ pub const Master = struct {
                         if (self.pane.setTask(line["task;".len..])) self.pane_dirty = true;
                     } else if (std.mem.startsWith(u8, line, "push;")) {
                         self.handlePush(line["push;".len..]);
+                    } else if (std.mem.startsWith(u8, line, "upgrade;")) {
+                        const path = line["upgrade;".len..];
+                        if (path.len < self.upgrade_to.len) {
+                            @memcpy(self.upgrade_to[0..path.len], path);
+                            self.upgrade_to_len = path.len;
+                        }
                     } else {
                         self.sendCommandToClients(line);
                     }
@@ -1134,6 +1227,13 @@ pub const Master = struct {
             }
         }
 
+        // Only returns if it didn't happen
+        if (self.upgrade_to_len > 0) {
+            const path = self.upgrade_to[0..self.upgrade_to_len];
+            self.upgrade_to_len = 0;
+            self.upgradeTo(path);
+        }
+
         // Re-arm command FIFO read
         self.cmd_fifo_stream.read(
             loop,
@@ -1144,6 +1244,95 @@ pub const Master = struct {
             cmdFifoReadCallback,
         );
         return .disarm;
+    }
+
+    /// Replace this process with the rtach at `path`, keeping the session: its PTY,
+    /// socket, command pipe and shell (upgrade.zig). Returns only if that didn't happen,
+    /// and then this master carries on as it was.
+    fn upgradeTo(self: *Master, path: []const u8) void {
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path_z = std.fmt.bufPrintZ(&path_buf, "{s}", .{path}) catch return;
+        if (std.c.access(path_z, std.c.X_OK) != 0) {
+            log.warn("upgrade: {s} isn't an executable, staying on {s}", .{ path, version });
+            return;
+        }
+        // The same binary (a second upgrade request, already handled)
+        var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+        var real_buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (std.process.executablePath(self.io, &exe_buf)) |exe_len| {
+            if (std.c.realpath(path_z, &real_buf)) |real| {
+                if (std.mem.eql(u8, std.mem.span(real), exe_buf[0..exe_len])) {
+                    log.info("upgrade: already running {s}", .{path});
+                    return;
+                }
+            }
+        } else |_| {}
+
+        const pane = &self.pane;
+        const state: live.State = .{
+            .rtach = version,
+            .command = self.options.command,
+            .scrollback_capacity = self.scrollback.capacity(),
+            .scrollback_total_written = self.scrollback_total_written,
+            .rows = self.winsize.rows,
+            .cols = self.winsize.cols,
+            .alt_screen = self.modes.alt_screen,
+            .cursor_visible = self.modes.cursor_visible,
+            .mode_flags = @intCast(self.modes.flags.mask),
+            .mouse_event = self.modes.mouse_event,
+            .mouse_format = self.modes.mouse_format,
+            .title = self.terminal_title[0..self.terminal_title_len],
+            .fg = pane.fgName(),
+            .cwd = pane.cwdPath(),
+            .agent = @tagName(pane.agent),
+            .status = @tagName(pane.status),
+            .note = pane.noteText(),
+            .task = pane.taskText(),
+            .from_hook = pane.from_hook,
+            .flushed_status = @tagName(self.flushed_status),
+            .pushed_status = @tagName(self.pushed_status),
+            .cmd_partial = self.cmd_line_buf[0..self.cmd_line_len],
+        };
+        const stored = self.scrollback.slices();
+        live.save(self.io, self.allocator, self.options.socket_path, state, stored.first, stored.second) catch |err| {
+            log.warn("upgrade: couldn't save the session's state ({}), staying on {s}", .{ err, version });
+            return;
+        };
+
+        var args: [4][32:0]u8 = undefined;
+        const values = [_]i64{ self.pty_master, self.socket_fd, self.cmd_fifo_fd, self.child_pid };
+        var argv: [8:null]?[*:0]const u8 = undefined;
+        argv[0] = path_z;
+        argv[1] = "--resume";
+        argv[2] = @ptrCast(self.options.socket_path.ptr); // NUL-terminated: from argv
+        for (values, 0..) |value, i| {
+            _ = std.fmt.bufPrintZ(&args[i], "{d}", .{value}) catch return;
+            argv[3 + i] = &args[i];
+        }
+        argv[7] = null;
+
+        // Clients reconnect to the new master. Shut down, not closed: if the exec fails,
+        // their callbacks clean them up as usual.
+        for (self.clients.items) |client| {
+            if (client.pending_remove) continue;
+            sys.shutdown(client.fd);
+            client.pending_remove = true;
+        }
+        // Everything else closes on exec: the event loop's fds above all, which could
+        // otherwise hold reads on the PTY
+        var fd: posix.fd_t = 3;
+        while (fd < 4096) : (fd += 1) {
+            if (sys.isOpen(fd)) sys.setCloexec(fd);
+        }
+        for ([_]posix.fd_t{ self.pty_master, self.socket_fd, self.cmd_fifo_fd }) |kept| sys.clearCloexec(kept);
+
+        log.info("upgrade: {s} -> {s}", .{ version, path });
+        sys.execveZ(path_z, &argv, @ptrCast(std.c.environ));
+
+        // Still here: the exec failed
+        log.err("upgrade: exec {s} failed, staying on {s}", .{ path, version });
+        var state_buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (live.statePath(&state_buf, self.options.socket_path)) |state_path| sys.unlink(state_path);
     }
 
     /// Send a command to all attached clients via protocol message
@@ -2087,7 +2276,7 @@ pub const Master = struct {
 
         var json_buf: [2048]u8 = undefined;
         var w: std.Io.Writer = .fixed(&json_buf);
-        self.pane.writeJson(&w, self.terminal_title[0..self.terminal_title_len]) catch return;
+        self.pane.writeJson(&w, self.terminal_title[0..self.terminal_title_len], version) catch return;
         const json = w.buffered();
 
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;

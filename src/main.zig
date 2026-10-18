@@ -11,6 +11,7 @@ const picker_mod = @import("picker.zig");
 const cli = @import("cli.zig");
 const spawnd = @import("spawnd.zig");
 const ws = @import("ws.zig");
+const upgrade = @import("upgrade.zig");
 
 pub const Protocol = @import("protocol.zig");
 
@@ -113,7 +114,11 @@ pub const Protocol = @import("protocol.zig");
 ///          UserPromptSubmit hook), for the app's title when Claude hasn't named one.
 /// 2.18.0 - Push notifications: an agent that finishes or is blocked while the app is
 ///          away is posted, with curl, to each phone's push Worker in ~/.clauntty/push.
-pub const version = "2.18.0";
+/// 2.19.0 - Live upgrade: `upgrade;<rtach>` on a session's command pipe makes its master
+///          exec the newer binary with `--resume`, keeping the PTY, shell and scrollback.
+///          `rtach upgrade` asks every older master on the machine. Pane state has the
+///          master's version (`"rtach"`).
+pub const version = "2.19.0";
 
 pub const std_options: std.Options = .{
     .log_level = .info,
@@ -183,6 +188,8 @@ pub fn main(init: std.process.Init) void {
     if (argv.next()) |arg1| {
         if (std.mem.eql(u8, arg1, "spawnd")) std.process.exit(spawnd.main(allocator, io, init.minimal.args));
         if (std.mem.eql(u8, arg1, "ws")) std.process.exit(ws.main(allocator, io, init.minimal.args));
+        if (std.mem.eql(u8, arg1, "upgrade")) std.process.exit(upgrade.main(allocator, io, init.minimal.args));
+        if (std.mem.eql(u8, arg1, "--resume")) resumeMaster(allocator, io, init.minimal.args);
     }
 
     const args = parseArgs(init.minimal.args) catch {
@@ -336,6 +343,30 @@ fn createAndAttach(allocator: std.mem.Allocator, io: std.Io, args: Args, detache
         // Attach to the session we just created
         try attach(allocator, args);
     }
+}
+
+/// `--resume <socket> <pty fd> <socket fd> <pipe fd> <shell pid>`: an older master
+/// exec'd this binary to upgrade (upgrade.zig). Same process as before, so stdin,
+/// stdout and the session log are already in place.
+fn resumeMaster(allocator: std.mem.Allocator, io: std.Io, process_args: std.process.Args) noreturn {
+    var rest: [5][]const u8 = undefined;
+    var count: usize = 0;
+    var it = process_args.iterate();
+    _ = it.skip(); // rtach
+    _ = it.skip(); // --resume
+    while (it.next()) |arg| : (count += 1) {
+        if (count == rest.len) std.process.exit(1);
+        rest[count] = arg;
+    }
+    const kept = upgrade.parseResumeArgs(rest[0..count]) orelse std.process.exit(1);
+    var master = Master.resumeFrom(allocator, io, kept) catch |err| {
+        std.log.err("resume failed: {}", .{err});
+        std.process.exit(1);
+    };
+    master.run() catch std.process.exit(1);
+    master.deinit();
+    ws.paneEnded(allocator, io, kept.socket_path);
+    std.process.exit(0);
 }
 
 fn attach(allocator: std.mem.Allocator, args: Args) !void {
@@ -525,6 +556,8 @@ fn printUsage() void {
         \\  rtach ws ...  Workspaces, tabs and split layouts (rtach ws for help)
         \\  rtach spawnd install|uninstall|status
         \\              macOS: start sessions in the desktop session (keychain)
+        \\  rtach upgrade [--json] [SESSION...]
+        \\              Move running sessions to this rtach without ending them
         \\  -v          Print version
         \\  -h          Print this help
         \\

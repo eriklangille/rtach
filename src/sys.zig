@@ -245,6 +245,15 @@ pub fn setCloexec(fd: fd_t) void {
     _ = system.fcntl(fd, posix.F.SETFD, @as(c_int, posix.FD_CLOEXEC));
 }
 
+/// Keep `fd` open across exec
+pub fn clearCloexec(fd: fd_t) void {
+    _ = system.fcntl(fd, posix.F.SETFD, @as(c_int, 0));
+}
+
+pub fn isOpen(fd: fd_t) bool {
+    return posix.errno(system.fcntl(fd, posix.F.GETFD, @as(c_int, 0))) == .SUCCESS;
+}
+
 /// The pid of the process on the other end of a Unix socket
 pub fn peerPid(fd: fd_t) ?pid_t {
     switch (@import("builtin").os.tag) {

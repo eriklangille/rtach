@@ -70,6 +70,19 @@ pub const PaneState = struct {
         return topic;
     }
 
+    /// Back as it was before a live upgrade (upgrade.zig): fields by name, unknown names
+    /// leave the default
+    pub fn restore(self: *PaneState, fg: []const u8, cwd: []const u8, agent: []const u8, status: []const u8, note: []const u8, task: []const u8, from_hook: bool) void {
+        _ = self.setForeground(fg, cwd);
+        self.agent = std.meta.stringToEnum(Agent, agent) orelse .none;
+        self.status = std.meta.stringToEnum(Status, status) orelse .none;
+        const n = @min(note.len, self.note.len);
+        @memcpy(self.note[0..n], note[0..n]);
+        self.note_len = n;
+        _ = self.setTask(task);
+        self.from_hook = from_hook;
+    }
+
     /// Record the agent's task. True if it changed.
     pub fn setTask(self: *PaneState, task: []const u8) bool {
         const n = @min(task.len, self.task.len);
@@ -137,12 +150,15 @@ pub const PaneState = struct {
         return true;
     }
 
-    /// One JSON line, for the .state file and the app
-    pub fn writeJson(self: *const PaneState, writer: *std.Io.Writer, title: []const u8) !void {
+    /// One JSON line, for the .state file and the app. `rtach` is the master's version
+    /// (`rtach upgrade` reads it).
+    pub fn writeJson(self: *const PaneState, writer: *std.Io.Writer, title: []const u8, rtach: []const u8) !void {
         var jw: std.json.Stringify = .{ .writer = writer };
         try jw.beginObject();
         try jw.objectField("v");
         try jw.write(1);
+        try jw.objectField("rtach");
+        try jw.write(rtach);
         try jw.objectField("fg");
         try jw.write(self.fgName());
         try jw.objectField("cwd");
@@ -354,9 +370,9 @@ test "json line" {
     _ = s.applyHook("blocked", "needs \"you\"");
     var buf: [512]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
-    try s.writeJson(&w, "✳ Fix it");
+    try s.writeJson(&w, "✳ Fix it", "2.19.0");
     try testing.expectEqualStrings(
-        \\{"v":1,"fg":"zsh","cwd":"/src/app","title":"✳ Fix it","agent":"claude","state":"blocked","note":"needs \"you\"","pushes":true}
+        \\{"v":1,"rtach":"2.19.0","fg":"zsh","cwd":"/src/app","title":"✳ Fix it","agent":"claude","state":"blocked","note":"needs \"you\"","pushes":true}
     , w.buffered());
 }
 
