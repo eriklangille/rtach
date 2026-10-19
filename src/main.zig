@@ -126,7 +126,9 @@ pub const Protocol = @import("protocol.zig");
 /// 2.21.0 - `clauntty show` says which pane sent the image (`image;<id>;<pane>;<path>`,
 ///          and a second line in the inbox entry) and goes through the session the app
 ///          shows, so the app puts it in that pane's window right away
-pub const version = "2.21.0";
+/// 2.22.0 - A session that ends (its shell exits, or it's stopped) sends `ended` to its
+///          clients first, so the app ends the window without reconnecting to check
+pub const version = "2.22.0";
 
 /// `-a`'s exit code when the session doesn't exist (it ended)
 pub const no_session_exit: u8 = 3;

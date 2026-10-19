@@ -966,6 +966,18 @@ pub const Master = struct {
         try self.loop.run(.until_done);
 
         log.info("master shutting down", .{});
+        self.announceEnded();
+    }
+
+    /// The session is over (its shell exited, or the master was told to stop): say so
+    /// to every framed client before they're closed, so the app ends the window now
+    /// instead of reconnecting to find no session. Not on a live upgrade, which execs
+    /// before the loop returns. Terminal clients ignore command frames.
+    fn announceEnded(self: *Master) void {
+        for (self.clients.items) |client| {
+            if (client.pending_remove or !client.framed_mode) continue;
+            writeFramed(client.fd, .command, "ended");
+        }
     }
 
     fn ptyReadCallback(
