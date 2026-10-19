@@ -132,7 +132,9 @@ pub const Protocol = @import("protocol.zig");
 /// 2.22.1 - A session that ends removes its .state and .title files (they piled up)
 /// 2.23.0 - A session that ends normally removes its .log too. `rtach sweep` clears
 ///          what crashed or killed sessions left, keeping their logs for 7 days.
-pub const version = "2.23.0";
+/// 2.23.1 - A session's shell doesn't get the Claude Code session variables of whoever
+///          started it (an agent running `clauntty ws new -- claude`)
+pub const version = "2.23.1";
 
 /// `-a`'s exit code when the session doesn't exist (it ended)
 pub const no_session_exit: u8 = 3;

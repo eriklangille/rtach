@@ -95,6 +95,19 @@ describe("rtach ws", () => {
     expect(output).toContain(`id=${created.pane} dir=${project} home=${home}`);
   });
 
+  test("a pane started by a Claude Code session doesn't get its session variables", async () => {
+    const agent = { CLAUDECODE: "1", CLAUDE_CODE_SESSION_ID: "x", CLAUDE_CODE_CHILD_SESSION: "1", CLAUDE_CODE_USE_BEDROCK: "1" };
+    const { pane } = wsJson(["new", "--cwd", project], { env: agent });
+
+    const client = attach(pane);
+    await waitForOutput(client, "$ ", 3000);
+    client.stdin.write(
+      'echo "agent=${CLAUDECODE:-unset} ${CLAUDE_CODE_SESSION_ID:-unset} ${CLAUDE_CODE_CHILD_SESSION:-unset} config=${CLAUDE_CODE_USE_BEDROCK:-unset}"\n'
+    );
+    // The user's own settings still come through
+    expect(await waitForOutput(client, "config=1", 3000)).toContain("agent=unset unset unset config=1");
+  });
+
   // The app runs `rtach ws` over a plain SSH command: no TERM, or a placeholder
   // like login's "network" that terminfo doesn't know, and often no LANG
   for (const term of [undefined, "dumb", "network"]) {
