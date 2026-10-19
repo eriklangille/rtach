@@ -77,7 +77,7 @@ describe("ended", () => {
     expect(commands(other)).toContain("ended");
   });
 
-  test("an ended session takes its .state and .title along", async () => {
+  test("an ended session takes its .state, .title and .log along", async () => {
     startMaster();
     const shown = await client("shown", true);
     const send = (text: string) => {
@@ -95,6 +95,7 @@ describe("ended", () => {
     for (let i = 0; i < 20 && existsSync(`${sock}.state`); i++) await Bun.sleep(50);
     expect(existsSync(`${sock}.state`)).toBe(false);
     expect(existsSync(`${sock}.title`)).toBe(false);
+    expect(existsSync(`${sock}.log`)).toBe(false);
     expect(existsSync(sock)).toBe(false);
   });
 

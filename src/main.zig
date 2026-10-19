@@ -12,6 +12,7 @@ const cli = @import("cli.zig");
 const spawnd = @import("spawnd.zig");
 const ws = @import("ws.zig");
 const upgrade = @import("upgrade.zig");
+const sweep = @import("sweep.zig");
 
 pub const Protocol = @import("protocol.zig");
 
@@ -129,7 +130,9 @@ pub const Protocol = @import("protocol.zig");
 /// 2.22.0 - A session that ends (its shell exits, or it's stopped) sends `ended` to its
 ///          clients first, so the app ends the window without reconnecting to check
 /// 2.22.1 - A session that ends removes its .state and .title files (they piled up)
-pub const version = "2.22.1";
+/// 2.23.0 - A session that ends normally removes its .log too. `rtach sweep` clears
+///          what crashed or killed sessions left, keeping their logs for 7 days.
+pub const version = "2.23.0";
 
 /// `-a`'s exit code when the session doesn't exist (it ended)
 pub const no_session_exit: u8 = 3;
@@ -203,6 +206,7 @@ pub fn main(init: std.process.Init) void {
         if (std.mem.eql(u8, arg1, "spawnd")) std.process.exit(spawnd.main(allocator, io, init.minimal.args));
         if (std.mem.eql(u8, arg1, "ws")) std.process.exit(ws.main(allocator, io, init.minimal.args));
         if (std.mem.eql(u8, arg1, "upgrade")) std.process.exit(upgrade.main(allocator, io, init.minimal.args));
+        if (std.mem.eql(u8, arg1, "sweep")) std.process.exit(sweep.main(allocator, io, init.minimal.args));
         if (std.mem.eql(u8, arg1, "--resume")) resumeMaster(allocator, io, init.minimal.args);
     }
 
@@ -577,6 +581,8 @@ fn printUsage() void {
         \\              macOS: start sessions in the desktop session (keychain)
         \\  rtach upgrade [--json] [SESSION...]
         \\              Move running sessions to this rtach without ending them
+        \\  rtach sweep [--json]
+        \\              Clear files left by sessions that crashed (logs kept 7 days)
         \\  -v          Print version
         \\  -h          Print this help
         \\

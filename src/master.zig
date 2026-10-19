@@ -642,14 +642,15 @@ pub const Master = struct {
         return stat.inode;
     }
 
-    /// The session ended: its `.state` and `.title` describe a running session, so they
-    /// go with it (they piled up in ~/.clauntty/sessions). Only while the socket is
-    /// still this master's. `.lock` stays (see `-A`), and `.log` for finding out why.
+    /// The session ended normally: its `.state` and `.title` describe a running session
+    /// and its `.log` is only wanted when something went wrong, so they go with it (they
+    /// piled up in ~/.clauntty/sessions). Only while the socket is still this master's.
+    /// `.lock` stays (see `-A`). A master that crashes leaves its files for `rtach sweep`.
     fn removeSessionFiles(self: *Master) void {
         const ours = self.socket_inode orelse return;
         if (self.inodeOf(self.options.socket_path) != ours) return;
         var buf: [std.fs.max_path_bytes]u8 = undefined;
-        for ([_][]const u8{ ".state", ".state.tmp", ".title", ".title.tmp" }) |suffix| {
+        for ([_][]const u8{ ".state", ".state.tmp", ".title", ".title.tmp", ".log" }) |suffix| {
             const path = std.fmt.bufPrint(&buf, "{s}{s}", .{ self.options.socket_path, suffix }) catch continue;
             sys.unlink(path);
         }
