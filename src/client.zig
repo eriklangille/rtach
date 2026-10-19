@@ -360,11 +360,9 @@ pub const Client = struct {
         } else {
             // Raw mode: check for detach character and forward to master
             if (self.options.detach_char) |detach_char| {
-                for (data) |c| {
-                    if (c == detach_char) {
-                        self.stdin_buffered = 0;
-                        return true; // Detach
-                    }
+                if (hasDetachKey(data, detach_char)) {
+                    self.stdin_buffered = 0;
+                    return true; // Detach
                 }
             }
 
@@ -575,3 +573,84 @@ var winch_pending: bool = false;
 fn handleSigwinch(_: posix.SIG) callconv(.c) void {
     winch_pending = true;
 }
+
+/// Whether keyboard input has the detach key: the control character itself, or its
+/// encoding while the program has turned on an extended keyboard mode, where the
+/// terminal sends Ctrl+\ as `ESC [ 92 ; 5 u` (kitty's protocol, which Claude Code
+/// turns on) or `ESC [ 27 ; 5 ; 92 ~` (xterm's modifyOtherKeys). Presses only, with
+/// Ctrl and nothing else but Caps or Num Lock.
+pub fn hasDetachKey(data: []const u8, detach_char: u8) bool {
+    if (std.mem.indexOfScalar(u8, data, detach_char) != null) return true;
+    // The key Ctrl turns into the character: Ctrl+\ is 0x1c, Ctrl+A 0x01 ('a')
+    const key: u32 = switch (detach_char) {
+        0x01...0x1a => detach_char + 0x60,
+        0x00, 0x1b...0x1f => detach_char + 0x40,
+        else => return false,
+    };
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, data, i, "\x1b[")) |start| {
+        i = start + 2;
+        // Up to three ';' fields of ':' subfields, then the final byte
+        var fields: [3][2]u32 = .{ .{ 0, 1 }, .{ 1, 1 }, .{ 0, 0 } };
+        var field: usize = 0;
+        var sub: usize = 0;
+        var digits = false;
+        const final: u8 = while (i < data.len) : (i += 1) {
+            const c = data[i];
+            switch (c) {
+                '0'...'9' => {
+                    if (field < 3 and sub < 2) {
+                        if (!digits) fields[field][sub] = 0;
+                        fields[field][sub] = fields[field][sub] *| 10 +| (c - '0');
+                    }
+                    digits = true;
+                },
+                ';' => {
+                    field += 1;
+                    sub = 0;
+                    digits = false;
+                },
+                ':' => {
+                    sub += 1;
+                    digits = false;
+                },
+                0x40...0x7e => break c,
+                else => break 0,
+            }
+        } else 0;
+        const mods, const event, const code = switch (final) {
+            'u' => .{ fields[1][0], fields[1][1], fields[0][0] },
+            '~' => if (fields[0][0] == 27) .{ fields[1][0], 1, fields[2][0] } else continue,
+            else => continue,
+        };
+        // Modifiers are 1 + bits: Ctrl 4, Caps Lock 64, Num Lock 128. Event 3 is a release.
+        const ctrl_only = mods >= 1 and ((mods - 1) & ~@as(u32, 64 | 128)) == 4;
+        if (code == key and ctrl_only and event != 3) return true;
+    }
+    return false;
+}
+
+test "hasDetachKey: the control character, and its extended keyboard encodings" {
+    const t = std.testing;
+    try t.expect(hasDetachKey("ab\x1ccd", 0x1c));
+    try t.expect(!hasDetachKey("abcd", 0x1c));
+    // kitty: plain, with a press event, with Caps Lock, with alternate keys
+    try t.expect(hasDetachKey("\x1b[92;5u", 0x1c));
+    try t.expect(hasDetachKey("x\x1b[92;5:1u", 0x1c));
+    try t.expect(hasDetachKey("\x1b[92;69u", 0x1c));
+    try t.expect(hasDetachKey("\x1b[92:124;5u", 0x1c));
+    // Not a release, other modifiers, or another key
+    try t.expect(!hasDetachKey("\x1b[92;5:3u", 0x1c));
+    try t.expect(!hasDetachKey("\x1b[92;6u", 0x1c));
+    try t.expect(!hasDetachKey("\x1b[92u", 0x1c));
+    try t.expect(!hasDetachKey("\x1b[93;5u", 0x1c));
+    // modifyOtherKeys
+    try t.expect(hasDetachKey("\x1b[27;5;92~", 0x1c));
+    try t.expect(!hasDetachKey("\x1b[27;3;92~", 0x1c));
+    // Other detach characters (-e ^A)
+    try t.expect(hasDetachKey("\x1b[97;5u", 0x01));
+    // Other sequences around it
+    try t.expect(hasDetachKey("\x1b[A\x1b[1;5C\x1b[92;5u", 0x1c));
+    try t.expect(!hasDetachKey("\x1b[200~paste\x1b[201~", 0x1c));
+}
+

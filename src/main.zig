@@ -145,7 +145,9 @@ pub const Protocol = @import("protocol.zig");
 /// 2.26.0 - Clients that ask (`want_size`) are told the PTY's size and whether it's
 ///          theirs (`pty_size`), so the app can draw a pane a laptop is using at the
 ///          laptop's size instead of in its own columns
-pub const version = "2.26.0";
+/// 2.26.1 - Ctrl+\ detaches while the program uses kitty's keyboard protocol (Claude
+///          Code does), where the terminal sends it as `ESC [ 92 ; 5 u`
+pub const version = "2.26.1";
 
 /// `-a`'s exit code when the session doesn't exist (it ended)
 pub const no_session_exit: u8 = 3;

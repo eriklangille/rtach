@@ -113,7 +113,9 @@ describe("picker", () => {
     p.write("echo again=$RTACH_SESSION_ID\r");
     await p.waitFor(`again=${b}`, p.output);
 
-    p.write("\x1c");
+    // Ctrl+\ as a terminal sends it while the program uses kitty's keyboard protocol
+    // (Claude Code does)
+    p.write("\x1b[92;5u");
     await p.waitFor("enter attach");
     p.write("q");
     expect(await p.proc.exited).toBe(0);
