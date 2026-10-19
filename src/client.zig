@@ -184,6 +184,12 @@ pub const Client = struct {
                 self.sendWindowSize() catch {};
             }
 
+            // Typing waits for the handshake: it would reach the master ahead of the
+            // upgrade and attach, which then went to the shell as typed text and left
+            // this client never attached. (Proxy mode reads the app's upgrade from stdin.)
+            poll_fds[0].fd = if (self.handshake_received or self.options.proxy_mode) STDIN_FILENO else -1;
+            poll_fds[0].revents = 0;
+
             const ready = posix.poll(&poll_fds, -1) catch |err| {
                 if (err == error.Interrupted) {
                     continue; // Will check winch_pending at top of loop
