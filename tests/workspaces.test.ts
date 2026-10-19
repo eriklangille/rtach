@@ -1,6 +1,6 @@
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { spawn, spawnSync } from "bun";
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync } from "fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "fs";
 import { join } from "path";
 import { RTACH_BIN, cleanupAll, trackProcess, waitForOutput } from "./helpers";
 
@@ -271,6 +271,39 @@ describe("rtach ws", () => {
     wsJson(["end", workspace]);
     expect(list()).toEqual([]);
     expect(await waitFor(() => !existsSync(socket(a)) && !existsSync(socket(b)))).toBe(true);
+  });
+
+  test("clauntty ws is rtach ws", () => {
+    const bin = join(home, "bin");
+    mkdirSync(bin);
+    symlinkSync(RTACH_BIN, join(bin, "clauntty"));
+    const result = spawnSync([join(bin, "clauntty"), "ws", "new", "proj", "--cwd", project], { cwd: home, env: env() });
+    expect(result.exitCode).toBe(0);
+    const { workspace } = JSON.parse(result.stdout.toString());
+    expect(list().map((w) => w.id)).toEqual([workspace]);
+  });
+
+  // The command is typed at the new pane's first prompt; the shell stays after it
+  for (const shell of ["/bin/zsh", "/bin/bash"]) {
+    test(`-- CMD runs in the new pane's ${shell}`, async () => {
+      const { pane: a } = wsJson(["new", "proj", "--cwd", project]);
+      // From inside another pane, whose shell already has the integration
+      const { pane: b } = wsJson(["split", a, "--", "echo", "ran-$((6*7))"], {
+        env: { SHELL: shell, CLAUNTTY_SHELL_INTEGRATION: "1" },
+      });
+      const client = attach(b);
+      // Not the command line: that still says $((6*7))
+      await waitForOutput(client, "ran-42", 3000);
+      client.stdin.write("echo alive-$((1+1)) run=${CLAUNTTY_RUN:-unset}\n");
+      expect(await waitForOutput(client, "alive-2", 3000)).toContain("alive-2 run=unset");
+    });
+  }
+
+  test("-- CMD needs a shell with the integration", () => {
+    const { pane: a } = wsJson(["new", "proj", "--cwd", project]);
+    const result = spawnSync([RTACH_BIN, "ws", "split", a, "--", "true"], { cwd: home, env: env() });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr.toString()).toContain("needs bash, zsh or fish");
   });
 
   test("errors say what's wrong", () => {

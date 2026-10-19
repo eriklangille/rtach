@@ -13,6 +13,7 @@ const sys = @import("sys.zig");
 const active = @import("active.zig");
 const inbox = @import("inbox.zig");
 const pane_state = @import("pane_state.zig");
+const ws = @import("ws.zig");
 
 /// Names rtach answers to as this command
 pub fn isCommandName(argv0: []const u8) bool {
@@ -35,6 +36,7 @@ const usage =
     \\  show <image>...   Show images in Clauntty (png, jpg, gif, heic, webp); they
     \\                    wait on this machine until Clauntty connects
     \\  status            Show which session commands go to
+    \\  ws <command>      Workspaces, tabs and split panes (clauntty ws for help)
     \\
     \\Inside a Clauntty session, commands go to that session. Elsewhere (tmux,
     \\other terminals, ssh) they go to the session Clauntty last had active on
@@ -94,6 +96,7 @@ fn run(allocator: std.mem.Allocator, io: std.Io, sub: []const u8, args: []const 
     }
 
     if (eql(sub, "show")) return show(allocator, io, args);
+    if (eql(sub, "ws")) return ws.run(allocator, io, args);
     if (eql(sub, "agent-state")) return agentState(allocator, io, args);
 
     return fail("unknown command: {s} (see clauntty --help)", .{sub});

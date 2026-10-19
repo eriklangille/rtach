@@ -120,7 +120,10 @@ pub const Protocol = @import("protocol.zig");
 ///          master's version (`"rtach"`).
 /// 2.19.1 - `-a` exits 3 when the session doesn't exist, so the app can tell a closed
 ///          session from a dropped connection (it no longer re-creates one with -A)
-pub const version = "2.19.1";
+/// 2.20.0 - `clauntty ws` (same as `rtach ws`); `ws new|tab|split ... -- CMD` types CMD
+///          at the new pane's first prompt; a new session's shell always gets the
+///          integration, even when started from another pane
+pub const version = "2.20.0";
 
 /// `-a`'s exit code when the session doesn't exist (it ended)
 pub const no_session_exit: u8 = 3;

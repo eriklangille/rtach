@@ -309,6 +309,7 @@ extern "c" fn grantpt(fd: c_int) c_int;
 extern "c" fn unlockpt(fd: c_int) c_int;
 extern "c" fn ptsname(fd: c_int) ?[*:0]const u8;
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 extern "c" fn mkfifo(path: [*:0]const u8, mode: posix.mode_t) c_int;
 
 pub const MasterOptions = struct {
@@ -777,6 +778,9 @@ pub const Master = struct {
             // Set RTACH_CMD_PIPE environment variable for scripts to send commands
             // This is the path to the FIFO that scripts can write to
             _ = setenv("RTACH_CMD_PIPE", fifo_path_z, 1);
+            // A new shell gets the integration even when whoever started the session
+            // had it (`rtach ws split` run in another pane)
+            _ = unsetenv("CLAUNTTY_SHELL_INTEGRATION");
             // The session is a terminal even when whoever started it had none (`rtach ws`
             // run over a plain SSH command): zsh with no TERM edits lines like a dumb
             // terminal, and with no locale it mangles UTF-8

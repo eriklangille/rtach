@@ -18,6 +18,7 @@ const std = @import("std");
 const posix = std.posix;
 const sys = @import("sys.zig");
 const cli = @import("cli.zig");
+const ShellIntegration = @import("shell_integration.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -368,8 +369,9 @@ fn socketPath(arena: Allocator, home: []const u8, pane: []const u8) ![]const u8 
 }
 
 /// Start a pane's master in `cwd`: this binary's `-n`, which goes through spawnd
-/// where it runs
-fn startPane(arena: Allocator, io: std.Io, home: []const u8, cwd: []const u8) ![]const u8 {
+/// where it runs. `typed` goes to the shell's first prompt (shell integration
+/// reads it from CLAUNTTY_RUN), so the shell stays when it ends.
+fn startPane(arena: Allocator, io: std.Io, home: []const u8, cwd: []const u8, typed: ?[]const u8) ![]const u8 {
     const pane = try newPaneId(io, arena);
     const sessions = try std.fmt.allocPrint(arena, "{s}/.clauntty/sessions", .{home});
     try std.Io.Dir.cwd().createDirPath(io, sessions);
@@ -378,18 +380,22 @@ fn startPane(arena: Allocator, io: std.Io, home: []const u8, cwd: []const u8) ![
     const exe = try arena.dupeZ(u8, exe_buf[0..try std.process.executablePath(io, &exe_buf)]);
     const start_in = try arena.dupeZ(u8, if (isDirectory(io, cwd)) cwd else home);
     const argv = [_:null]?[*:0]const u8{ exe, "-n", try arena.dupeZ(u8, try socketPath(arena, home, pane)) };
+    const typed_z = if (typed) |command| try arena.dupeZ(u8, command) else null;
 
     // Not std.process.run: its children get the Io's environment, which is empty
     // here, and the pane needs ours (HOME, SHELL, PATH, ...)
     const pid = try sys.fork();
     if (pid == 0) {
         _ = std.c.chdir(start_in);
+        if (typed_z) |command| _ = setenv("CLAUNTTY_RUN", command, 1);
         sys.execveZ(exe, &argv, @ptrCast(std.c.environ));
         std.process.exit(127);
     }
     if (sys.waitExitCode(pid) != 0) return error.PaneDidntStart;
     return pane;
 }
+
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
 /// Stop a pane's master, which then ends its program
 fn stopPane(arena: Allocator, home: []const u8, pane: []const u8) void {
@@ -451,7 +457,7 @@ fn projectRoot(arena: Allocator, io: std.Io, dir: []const u8) []const u8 {
 // MARK: Commands
 
 const usage =
-    \\Usage: rtach ws <command> [args]
+    \\Usage: rtach ws <command> [args]  (or clauntty ws)
     \\
     \\Workspaces group rtach sessions (panes) into tabs with split layouts.
     \\PANE defaults to the current session ($RTACH_SESSION_ID), else the one the
@@ -463,6 +469,8 @@ const usage =
     \\  tab [WS] [--name NAME]      New tab with one pane (WS: the current one)
     \\  split [PANE] [-h|-v]        New pane next to PANE (-h side by side, default;
     \\                              -v stacked)
+    \\  new, tab, split ... -- CMD  Also type CMD at the new pane's prompt (bash,
+    \\                              zsh, fish); the shell stays when it ends
     \\  close [PANE]                End PANE and take it out of its tab
     \\  end WS                      End a workspace and all its panes
     \\  add SESSION...              Make each existing session a one-pane workspace
@@ -506,16 +514,29 @@ const Context = struct {
 
 /// `rtach ws <command>`
 pub fn main(allocator: Allocator, io: std.Io, process_args: std.process.Args) u8 {
+    var args: std.ArrayList([]const u8) = .empty;
+    defer args.deinit(allocator);
+    var it = process_args.iterate();
+    _ = it.skip(); // rtach
+    _ = it.skip(); // ws
+    while (it.next()) |arg| args.append(allocator, arg) catch return 1;
+    return run(allocator, io, args.items);
+}
+
+/// `rtach ws` or `clauntty ws`, with the arguments after `ws`
+pub fn run(allocator: Allocator, io: std.Io, raw_args: []const []const u8) u8 {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
     var args: std.ArrayList([]const u8) = .empty;
-    var it = process_args.iterate();
-    _ = it.skip(); // rtach
-    _ = it.skip(); // ws
     var quiet = false;
-    while (it.next()) |arg| {
+    for (raw_args, 0..) |arg, i| {
+        // The rest is a command for the new pane, --quiet included
+        if (std.mem.eql(u8, arg, "--")) {
+            args.appendSlice(arena, raw_args[i..]) catch return 1;
+            break;
+        }
         if (std.mem.eql(u8, arg, "--quiet")) {
             quiet = true;
             continue;
@@ -575,6 +596,7 @@ fn errorText(err: anyerror) []const u8 {
         error.NotASession => "no session answers with that id",
         error.AlreadyInWorkspace => "that session is already in a workspace",
         error.PaneDidntStart => "the new pane's session didn't start",
+        error.NoShellIntegration => "-- CMD needs bash, zsh or fish as $SHELL",
         error.Usage => "wrong arguments (see rtach ws)",
         else => @errorName(err),
     };
@@ -601,6 +623,8 @@ const Parsed = struct {
     cwd: ?[]const u8 = null,
     dir: Dir = .h,
     json: bool = false,
+    /// After `--`: a command to type in the new pane
+    run: ?[]const u8 = null,
 };
 
 fn parse(arena: Allocator, args: []const []const u8) !Parsed {
@@ -618,6 +642,17 @@ fn parse(arena: Allocator, args: []const []const u8) !Parsed {
             p.dir = .v;
         } else if (std.mem.eql(u8, arg, "--json")) {
             p.json = true;
+        } else if (std.mem.eql(u8, arg, "--")) {
+            const words = args[i + 1 ..];
+            if (words.len == 0) return error.Usage;
+            const command = try std.mem.join(arena, " ", words);
+            // One line: it's typed at a prompt
+            if (std.mem.indexOfAny(u8, command, "\r\n") != null) return error.Usage;
+            // Only shell integration runs it
+            const shell = sys.getenv("SHELL") orelse "/bin/sh";
+            if (ShellIntegration.detectShellType(shell) == .unknown) return error.NoShellIntegration;
+            p.run = command;
+            break;
         } else {
             try p.positional.append(arena, arg);
         }
@@ -635,7 +670,7 @@ fn cmdNew(ctx: *Context, args: []const []const u8) !void {
     const name = if (p.positional.items.len > 0) p.positional.items[0] else if (at_home) "~" else std.fs.path.basename(dir);
 
     // Start the pane before taking the lock: masters started by spawnd take it on exit
-    const pane = try startPane(ctx.arena, ctx.io, ctx.home, dir);
+    const pane = try startPane(ctx.arena, ctx.io, ctx.home, dir, p.run);
     var store = try Store.open(ctx.arena, ctx.io, ctx.home);
     defer store.close();
     var ws: Workspace = .{ .id = try newId(ctx.io, ctx.arena), .name = name, .cwd = dir, .tabs = .empty };
@@ -658,7 +693,7 @@ fn cmdTab(ctx: *Context, args: []const []const u8) !void {
     const cwd = (store.find(ws_id) orelse return error.NoSuchWorkspace).cwd;
     store.close();
 
-    const pane = try startPane(ctx.arena, ctx.io, ctx.home, cwd);
+    const pane = try startPane(ctx.arena, ctx.io, ctx.home, cwd, p.run);
     store = try Store.open(ctx.arena, ctx.io, ctx.home);
     defer store.close();
     // Gone while the pane started: end the pane again
@@ -683,7 +718,7 @@ fn cmdSplit(ctx: *Context, args: []const []const u8) !void {
     // Next to the pane: in its directory
     const cwd = paneCwd(ctx.arena, ctx.io, ctx.home, target) orelse ws_cwd;
 
-    const pane = try startPane(ctx.arena, ctx.io, ctx.home, cwd);
+    const pane = try startPane(ctx.arena, ctx.io, ctx.home, cwd, p.run);
     store = try Store.open(ctx.arena, ctx.io, ctx.home);
     defer store.close();
     const ws = store.workspaceOf(target) orelse {

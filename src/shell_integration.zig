@@ -35,6 +35,22 @@ pub const bash_integration =
     \\}
     \\trap '__clauntty_preexec "$BASH_COMMAND"' DEBUG
     \\
+    \\# The command `rtach ws ... -- CMD` started this pane with: run at the first
+    \\# prompt, in the history so it's an up-arrow away
+    \\if [[ -n "$CLAUNTTY_RUN" ]]; then
+    \\    __clauntty_run_cmd=$CLAUNTTY_RUN
+    \\    unset CLAUNTTY_RUN
+    \\    __clauntty_run() {
+    \\        PROMPT_COMMAND=${PROMPT_COMMAND#__clauntty_run;}
+    \\        local cmd=$__clauntty_run_cmd
+    \\        unset __clauntty_run_cmd
+    \\        history -s "$cmd"
+    \\        printf '\033]0;%s\007' "$cmd"
+    \\        eval "$cmd"
+    \\    }
+    \\    PROMPT_COMMAND="__clauntty_run;$PROMPT_COMMAND"
+    \\fi
+    \\
 ;
 
 pub const zsh_integration =
@@ -59,6 +75,22 @@ pub const zsh_integration =
     \\}
     \\preexec_functions+=(__clauntty_preexec)
     \\
+    \\# The command `rtach ws ... -- CMD` started this pane with: typed at the first
+    \\# prompt, as if the user had
+    \\if [[ -n "$CLAUNTTY_RUN" ]]; then
+    \\    __clauntty_run_cmd=$CLAUNTTY_RUN
+    \\    unset CLAUNTTY_RUN
+    \\    __clauntty_run() {
+    \\        add-zle-hook-widget -d line-init __clauntty_run
+    \\        BUFFER=$__clauntty_run_cmd
+    \\        unset __clauntty_run_cmd
+    \\        zle accept-line
+    \\    }
+    \\    autoload -Uz add-zle-hook-widget
+    \\    zle -N __clauntty_run
+    \\    add-zle-hook-widget line-init __clauntty_run
+    \\fi
+    \\
 ;
 
 pub const fish_integration =
@@ -77,6 +109,17 @@ pub const fish_integration =
     \\        echo (prompt_pwd): $argv[1]
     \\    else
     \\        prompt_pwd
+    \\    end
+    \\end
+    \\
+    \\# The command `rtach ws ... -- CMD` started this pane with: run at the first prompt
+    \\if set -q CLAUNTTY_RUN
+    \\    set -g __clauntty_run_cmd $CLAUNTTY_RUN
+    \\    set -e CLAUNTTY_RUN
+    \\    function __clauntty_run --on-event fish_prompt
+    \\        functions -e __clauntty_run
+    \\        eval $__clauntty_run_cmd
+    \\        set -e __clauntty_run_cmd
     \\    end
     \\end
     \\
