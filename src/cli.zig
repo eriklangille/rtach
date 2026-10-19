@@ -7,6 +7,7 @@
 //! machine's active session (see active.zig) everywhere else.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const posix = std.posix;
 const sys = @import("sys.zig");
 const active = @import("active.zig");
@@ -412,7 +413,9 @@ fn printOut(comptime fmt: []const u8, args: anytype) void {
 fn fail(comptime fmt: []const u8, args: anytype) u8 {
     var buf: [1024]u8 = undefined;
     const msg = std.fmt.bufPrint(&buf, "clauntty: " ++ fmt ++ "\n", args) catch "clauntty: error\n";
-    _ = sys.write(posix.STDERR_FILENO, msg) catch {};
+    // Not in tests that expect a failure: `zig build test` shows a test's stderr as a
+    // failed command, even when every test passes
+    if (!builtin.is_test) _ = sys.write(posix.STDERR_FILENO, msg) catch {};
     return 1;
 }
 
