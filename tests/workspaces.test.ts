@@ -91,21 +91,29 @@ describe("rtach ws", () => {
     await waitForOutput(client, "$ ", 3000);
     client.stdin.write('echo "id=$RTACH_SESSION_ID dir=$(pwd) home=$HOME"\n');
     const output = await waitForOutput(client, `home=${home}`, 3000);
-    // With the environment of whoever ran `ws new`
+    // With the HOME of whoever ran `ws new`
     expect(output).toContain(`id=${created.pane} dir=${project} home=${home}`);
   });
 
-  test("a pane started by a Claude Code session doesn't get its session variables", async () => {
-    const agent = { CLAUDECODE: "1", CLAUDE_CODE_SESSION_ID: "x", CLAUDE_CODE_CHILD_SESSION: "1", CLAUDE_CODE_USE_BEDROCK: "1" };
-    const { pane } = wsJson(["new", "--cwd", project], { env: agent });
+  test("a pane starts with a fresh environment, not its caller's", async () => {
+    // An agent's: a Claude in the pane took itself for that agent's child
+    const caller = {
+      CLAUDECODE: "1",
+      CLAUDE_CODE_SESSION_ID: "x",
+      FROM_CALLER: "1",
+      PATH: `/tmp/caller-bin:${process.env.PATH}`,
+      LANG: "en_US.UTF-8",
+    };
+    const { pane } = wsJson(["new", "--cwd", project], { env: caller });
 
     const client = attach(pane);
     await waitForOutput(client, "$ ", 3000);
-    client.stdin.write(
-      'echo "agent=${CLAUDECODE:-unset} ${CLAUDE_CODE_SESSION_ID:-unset} ${CLAUDE_CODE_CHILD_SESSION:-unset} config=${CLAUDE_CODE_USE_BEDROCK:-unset}"\n'
-    );
-    // The user's own settings still come through
-    expect(await waitForOutput(client, "config=1", 3000)).toContain("agent=unset unset unset config=1");
+    client.stdin.write('echo "agent=${CLAUDECODE:-unset} ${CLAUDE_CODE_SESSION_ID:-unset} caller=${FROM_CALLER:-unset} path=$PATH lang=$LANG home=$HOME"\n');
+    const output = await waitForOutput(client, "caller=unset", 3000);
+    expect(output).toContain(`agent=unset unset caller=unset`);
+    // Who the user is and the locale carry over; PATH starts over, as over SSH
+    expect(output).toContain(`lang=en_US.UTF-8 home=${home}`);
+    expect(output).not.toContain("/tmp/caller-bin");
   });
 
   // The app runs `rtach ws` over a plain SSH command: no TERM, or a placeholder

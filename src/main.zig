@@ -134,7 +134,10 @@ pub const Protocol = @import("protocol.zig");
 ///          what crashed or killed sessions left, keeping their logs for 7 days.
 /// 2.23.1 - A session's shell doesn't get the Claude Code session variables of whoever
 ///          started it (an agent running `clauntty ws new -- claude`)
-pub const version = "2.23.1";
+/// 2.24.0 - A `ws` pane starts with a fresh environment, as a session the app opens:
+///          who the user is, TERM and the locale from the caller, the system PATH, then
+///          the shell's startup files. Replaces 2.23.1's list of Claude Code variables.
+pub const version = "2.24.0";
 
 /// `-a`'s exit code when the session doesn't exist (it ended)
 pub const no_session_exit: u8 = 3;

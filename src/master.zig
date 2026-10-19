@@ -311,23 +311,6 @@ extern "c" fn ptsname(fd: c_int) ?[*:0]const u8;
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 
-/// What ties a process to one Claude Code session. A session started from one (`clauntty
-/// ws new -- claude` run by an agent) would otherwise pass them to its shell, and a
-/// Claude started there took itself for that session's child: no transcript, so not in
-/// /resume, and the parent's messaging socket. Not all of CLAUDE_CODE_*: users set
-/// config there (CLAUDE_CODE_USE_BEDROCK), which rc files don't always bring back.
-const agent_session_env = [_][*:0]const u8{
-    "CLAUDECODE",
-    "CLAUDE_CODE_SESSION_ID",
-    "CLAUDE_CODE_CHILD_SESSION",
-    "CLAUDE_CODE_SESSION_ATTENDED",
-    "CLAUDE_CODE_ENTRYPOINT",
-    "CLAUDE_CODE_EXECPATH",
-    "CLAUDE_CODE_MESSAGING_SOCKET",
-    "CLAUDE_CODE_MESSAGING_TOKEN",
-    "CLAUDE_PID",
-    "CLAUDE_EFFORT",
-};
 extern "c" fn mkfifo(path: [*:0]const u8, mode: posix.mode_t) c_int;
 
 pub const MasterOptions = struct {
@@ -815,8 +798,6 @@ pub const Master = struct {
             // A new shell gets the integration even when whoever started the session
             // had it (`rtach ws split` run in another pane)
             _ = unsetenv("CLAUNTTY_SHELL_INTEGRATION");
-            // A new terminal belongs to the user, not to the agent that started it
-            for (agent_session_env) |name| _ = unsetenv(name);
             // The session is a terminal even when whoever started it had none (`rtach ws`
             // run over a plain SSH command): zsh with no TERM edits lines like a dumb
             // terminal, and with no locale it mangles UTF-8

@@ -368,6 +368,40 @@ fn socketPath(arena: Allocator, home: []const u8, pane: []const u8) ![]const u8 
     return std.fmt.allocPrint(arena, "{s}/.clauntty/sessions/{s}", .{ home, pane });
 }
 
+/// What a new pane keeps from whoever ran `ws`: who the user is, the terminal and
+/// locale, and rtach's own setting. The rest comes from the shell's startup files, as
+/// in a session the app opens over SSH. The caller's whole environment made a pane an
+/// agent opened (`clauntty ws new -- claude`) part of that agent's session: a Claude
+/// there inherited CLAUDECODE, CLAUDE_CODE_SESSION_ID and the rest, and took itself for
+/// the agent's child (no transcript, the parent's messaging socket).
+const pane_env = [_][]const u8{
+    "HOME",          "USER",            "LOGNAME", "SHELL", "TERM", "LANG", "TMPDIR", "SSH_AUTH_SOCK",
+    "XDG_RUNTIME_DIR", "RTACH_SPAWND_SOCKET",
+};
+
+/// PATH before the shell's startup files: what sshd gives a session the app opens
+const default_path = if (@import("builtin").os.tag == .macos)
+    "PATH=/usr/bin:/bin:/usr/sbin:/sbin"
+else
+    "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+/// A new pane's environment (`pane_env` and the locale from ours, then `extra`)
+fn paneEnvironment(arena: Allocator, extra: ?[:0]const u8) ![:null]?[*:0]const u8 {
+    var env: std.ArrayList(?[*:0]const u8) = .empty;
+    var i: usize = 0;
+    while (std.c.environ[i]) |entry| : (i += 1) {
+        const line = std.mem.span(entry);
+        const name = line[0 .. std.mem.indexOfScalar(u8, line, '=') orelse continue];
+        const keep = std.mem.startsWith(u8, name, "LC_") or for (pane_env) |kept| {
+            if (std.mem.eql(u8, name, kept)) break true;
+        } else false;
+        if (keep) try env.append(arena, entry);
+    }
+    try env.append(arena, default_path);
+    if (extra) |line| try env.append(arena, line);
+    return env.toOwnedSliceSentinel(arena, null);
+}
+
 /// Start a pane's master in `cwd`: this binary's `-n`, which goes through spawnd
 /// where it runs. `typed` goes to the shell's first prompt (shell integration
 /// reads it from CLAUNTTY_RUN), so the shell stays when it ends.
@@ -380,22 +414,19 @@ fn startPane(arena: Allocator, io: std.Io, home: []const u8, cwd: []const u8, ty
     const exe = try arena.dupeZ(u8, exe_buf[0..try std.process.executablePath(io, &exe_buf)]);
     const start_in = try arena.dupeZ(u8, if (isDirectory(io, cwd)) cwd else home);
     const argv = [_:null]?[*:0]const u8{ exe, "-n", try arena.dupeZ(u8, try socketPath(arena, home, pane)) };
-    const typed_z = if (typed) |command| try arena.dupeZ(u8, command) else null;
+    const run_line = if (typed) |command| try std.fmt.allocPrintSentinel(arena, "CLAUNTTY_RUN={s}", .{command}, 0) else null;
+    const env = try paneEnvironment(arena, run_line);
 
     // Not std.process.run: its children get the Io's environment, which is empty
-    // here, and the pane needs ours (HOME, SHELL, PATH, ...)
     const pid = try sys.fork();
     if (pid == 0) {
         _ = std.c.chdir(start_in);
-        if (typed_z) |command| _ = setenv("CLAUNTTY_RUN", command, 1);
-        sys.execveZ(exe, &argv, @ptrCast(std.c.environ));
+        sys.execveZ(exe, &argv, env.ptr);
         std.process.exit(127);
     }
     if (sys.waitExitCode(pid) != 0) return error.PaneDidntStart;
     return pane;
 }
-
-extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
 /// Stop a pane's master, which then ends its program
 fn stopPane(arena: Allocator, home: []const u8, pane: []const u8) void {
