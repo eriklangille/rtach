@@ -1,6 +1,6 @@
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { spawnSync } from "bun";
-import { chmodSync, copyFileSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "fs";
+import { chmodSync, copyFileSync, existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "fs";
 import { join } from "path";
 import {
   RTACH_BIN,
@@ -75,6 +75,27 @@ describe("ended", () => {
     expect(await closedWithin(other)).toBe(true);
     expect(commands(shown)).toContain("ended");
     expect(commands(other)).toContain("ended");
+  });
+
+  test("an ended session takes its .state and .title along", async () => {
+    startMaster();
+    const shown = await client("shown", true);
+    const send = (text: string) => {
+      const input = Buffer.from(text);
+      shown.socket.write(Buffer.concat([Buffer.from([MessageType.PUSH, input.length]), input]));
+    };
+    // A title (written after a moment) and the pane state (probed every second)
+    send("printf '\\033]0;ended-test\\007'\n");
+    for (let i = 0; i < 50 && !(existsSync(`${sock}.state`) && existsSync(`${sock}.title`)); i++) await Bun.sleep(100);
+    expect(existsSync(`${sock}.state`)).toBe(true);
+    expect(existsSync(`${sock}.title`)).toBe(true);
+
+    send("exit\n");
+    expect(await closedWithin(shown)).toBe(true);
+    for (let i = 0; i < 20 && existsSync(`${sock}.state`); i++) await Bun.sleep(50);
+    expect(existsSync(`${sock}.state`)).toBe(false);
+    expect(existsSync(`${sock}.title`)).toBe(false);
+    expect(existsSync(sock)).toBe(false);
   });
 
   test("a master told to stop says so too", async () => {

@@ -128,7 +128,8 @@ pub const Protocol = @import("protocol.zig");
 ///          shows, so the app puts it in that pane's window right away
 /// 2.22.0 - A session that ends (its shell exits, or it's stopped) sends `ended` to its
 ///          clients first, so the app ends the window without reconnecting to check
-pub const version = "2.22.0";
+/// 2.22.1 - A session that ends removes its .state and .title files (they piled up)
+pub const version = "2.22.1";
 
 /// `-a`'s exit code when the session doesn't exist (it ended)
 pub const no_session_exit: u8 = 3;

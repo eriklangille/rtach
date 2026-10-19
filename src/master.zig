@@ -595,6 +595,8 @@ pub const Master = struct {
     pub fn deinit(self: *Master) void {
         self.idle_timer.deinit();
         self.loop.deinit();
+        // Before the socket: once it's gone a new session can start on this path
+        self.removeSessionFiles();
         self.closeSocket();
         self.closePty();
         self.scrollback.deinit();
@@ -638,6 +640,19 @@ pub const Master = struct {
     fn inodeOf(self: *Master, path: []const u8) ?std.Io.File.INode {
         const stat = std.Io.Dir.cwd().statFile(self.io, path, .{}) catch return null;
         return stat.inode;
+    }
+
+    /// The session ended: its `.state` and `.title` describe a running session, so they
+    /// go with it (they piled up in ~/.clauntty/sessions). Only while the socket is
+    /// still this master's. `.lock` stays (see `-A`), and `.log` for finding out why.
+    fn removeSessionFiles(self: *Master) void {
+        const ours = self.socket_inode orelse return;
+        if (self.inodeOf(self.options.socket_path) != ours) return;
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        for ([_][]const u8{ ".state", ".state.tmp", ".title", ".title.tmp" }) |suffix| {
+            const path = std.fmt.bufPrint(&buf, "{s}{s}", .{ self.options.socket_path, suffix }) catch continue;
+            sys.unlink(path);
+        }
     }
 
     /// Remove a file this master created, unless another file has taken its path
