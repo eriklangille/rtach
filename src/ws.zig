@@ -521,6 +521,9 @@ const Context = struct {
     out: std.ArrayList(u8) = .empty,
     /// Don't tell the app (it ran the command itself)
     quiet: bool = false,
+    /// Tell the app to refresh, not to show the new pane (the picker: each device
+    /// keeps its own place)
+    refresh_only: bool = false,
 
     fn print(self: *Context, comptime format: []const u8, args: anytype) void {
         self.out.print(self.arena, format, args) catch {};
@@ -535,7 +538,7 @@ const Context = struct {
     /// `workspace;` to refresh
     fn notify(self: *Context, workspace: ?[]const u8, pane: ?[]const u8) void {
         if (self.quiet) return;
-        const value = if (workspace != null and pane != null)
+        const value = if (workspace != null and pane != null and !self.refresh_only)
             std.fmt.allocPrint(self.arena, "{s}/{s}", .{ workspace.?, pane.? }) catch return
         else
             "";
@@ -584,32 +587,11 @@ pub fn run(allocator: Allocator, io: std.Io, raw_args: []const []const u8) u8 {
         fail(usage, .{});
         return 2;
     };
-    const rest = args.items[1..];
-
-    const eql = std.mem.eql;
-    const result = if (eql(u8, command, "new"))
-        cmdNew(&ctx, rest)
-    else if (eql(u8, command, "tab"))
-        cmdTab(&ctx, rest)
-    else if (eql(u8, command, "split"))
-        cmdSplit(&ctx, rest)
-    else if (eql(u8, command, "close"))
-        cmdClose(&ctx, rest)
-    else if (eql(u8, command, "end"))
-        cmdEnd(&ctx, rest)
-    else if (eql(u8, command, "add"))
-        cmdAdd(&ctx, rest)
-    else if (eql(u8, command, "move"))
-        cmdMove(&ctx, rest)
-    else if (eql(u8, command, "rename"))
-        cmdRename(&ctx, rest)
-    else if (eql(u8, command, "list") or eql(u8, command, "ls"))
-        cmdList(&ctx, rest)
-    else {
-        fail(usage, .{});
-        return 2;
-    };
-    result catch |err| {
+    dispatch(&ctx, command, args.items[1..]) catch |err| {
+        if (err == error.UnknownCommand) {
+            fail(usage, .{});
+            return 2;
+        }
         fail("rtach ws {s}: {s}\n", .{ command, errorText(err) });
         return 1;
     };
@@ -617,7 +599,40 @@ pub fn run(allocator: Allocator, io: std.Io, raw_args: []const []const u8) u8 {
     return 0;
 }
 
-fn errorText(err: anyerror) []const u8 {
+/// A `ws` command from the picker: its JSON output, in `arena`. The app refreshes
+/// but stays on its own pane.
+pub fn call(arena: Allocator, io: std.Io, args: []const []const u8) ![]const u8 {
+    const home = sys.getenv("HOME") orelse return error.NoHomeDir;
+    var ctx: Context = .{ .arena = arena, .io = io, .home = home, .refresh_only = true };
+    try dispatch(&ctx, args[0], args[1..]);
+    return ctx.out.items;
+}
+
+fn dispatch(ctx: *Context, command: []const u8, rest: []const []const u8) !void {
+    const eql = std.mem.eql;
+    return if (eql(u8, command, "new"))
+        cmdNew(ctx, rest)
+    else if (eql(u8, command, "tab"))
+        cmdTab(ctx, rest)
+    else if (eql(u8, command, "split"))
+        cmdSplit(ctx, rest)
+    else if (eql(u8, command, "close"))
+        cmdClose(ctx, rest)
+    else if (eql(u8, command, "end"))
+        cmdEnd(ctx, rest)
+    else if (eql(u8, command, "add"))
+        cmdAdd(ctx, rest)
+    else if (eql(u8, command, "move"))
+        cmdMove(ctx, rest)
+    else if (eql(u8, command, "rename"))
+        cmdRename(ctx, rest)
+    else if (eql(u8, command, "list") or eql(u8, command, "ls"))
+        cmdList(ctx, rest)
+    else
+        error.UnknownCommand;
+}
+
+pub fn errorText(err: anyerror) []const u8 {
     return switch (err) {
         error.NoPane => "no pane given, not inside an rtach session, and Clauntty shows none",
         error.NotInWorkspace => "that pane isn't in a workspace",
@@ -897,21 +912,21 @@ fn cmdRename(ctx: *Context, args: []const []const u8) !void {
     return error.NoSuchId;
 }
 
-const PaneInfo = struct {
+pub const PaneInfo = struct {
     id: []const u8,
     title: ?[]const u8,
     /// Its master's <socket>.state: fg, cwd, agent, state, note
     state: ?std.json.Value,
 };
 
-const TabInfo = struct {
+pub const TabInfo = struct {
     id: []const u8,
     name: []const u8,
     panes: []const PaneInfo,
     layout: Layout,
 };
 
-const WorkspaceInfo = struct {
+pub const WorkspaceInfo = struct {
     id: []const u8,
     name: []const u8,
     cwd: []const u8,
@@ -920,17 +935,38 @@ const WorkspaceInfo = struct {
 
 fn cmdList(ctx: *Context, args: []const []const u8) !void {
     const p = try parse(ctx.arena, args);
-    var store = try Store.open(ctx.arena, ctx.io, ctx.home);
+    const infos = try list(ctx.arena, ctx.io, ctx.home);
+    if (p.json) {
+        ctx.json(.{ .workspaces = infos });
+        return;
+    }
+    if (infos.len == 0) {
+        ctx.print("No workspaces. Start one with: rtach ws new\n", .{});
+        return;
+    }
+    for (infos) |ws| {
+        ctx.print("{s}  ({s})  {s}\n", .{ ws.name, ws.id, ws.cwd });
+        for (ws.tabs) |tab| {
+            ctx.print("  tab {s}  ({s})\n", .{ tab.name, tab.id });
+            for (tab.panes) |pane| ctx.print("    {s}  {s}\n", .{ pane.id, pane.title orelse "" });
+        }
+    }
+}
+
+/// Every workspace with its panes' titles and states, in `arena`. Drops panes whose
+/// master is gone.
+pub fn list(arena: Allocator, io: std.Io, home: []const u8) ![]const WorkspaceInfo {
+    var store = try Store.open(arena, io, home);
     defer store.close();
 
     // Drop panes whose master is gone (a crash, or an exit that couldn't update the file)
     var all: std.ArrayList([]const u8) = .empty;
     for (store.workspaces.items) |ws| {
-        for (ws.tabs.items) |tab| try tab.layout.panes(ctx.arena, &all);
+        for (ws.tabs.items) |tab| try tab.layout.panes(arena, &all);
     }
     var pruned = false;
     for (all.items) |pane| {
-        if (!paneAlive(ctx.arena, ctx.home, pane)) {
+        if (!paneAlive(arena, home, pane)) {
             store.removePane(pane);
             pruned = true;
         }
@@ -942,33 +978,18 @@ fn cmdList(ctx: *Context, args: []const []const u8) !void {
         var tabs: std.ArrayList(TabInfo) = .empty;
         for (ws.tabs.items) |tab| {
             var ids: std.ArrayList([]const u8) = .empty;
-            try tab.layout.panes(ctx.arena, &ids);
+            try tab.layout.panes(arena, &ids);
             var panes: std.ArrayList(PaneInfo) = .empty;
-            for (ids.items) |id| try panes.append(ctx.arena, .{
+            for (ids.items) |id| try panes.append(arena, .{
                 .id = id,
-                .title = paneTitle(ctx.arena, ctx.io, ctx.home, id),
-                .state = paneState(ctx.arena, ctx.io, ctx.home, id),
+                .title = paneTitle(arena, io, home, id),
+                .state = paneState(arena, io, home, id),
             });
-            try tabs.append(ctx.arena, .{ .id = tab.id, .name = tab.name, .panes = panes.items, .layout = tab.layout });
+            try tabs.append(arena, .{ .id = tab.id, .name = tab.name, .panes = panes.items, .layout = tab.layout });
         }
-        try infos.append(ctx.arena, .{ .id = ws.id, .name = ws.name, .cwd = ws.cwd, .tabs = tabs.items });
+        try infos.append(arena, .{ .id = ws.id, .name = ws.name, .cwd = ws.cwd, .tabs = tabs.items });
     }
-
-    if (p.json) {
-        ctx.json(.{ .workspaces = infos.items });
-        return;
-    }
-    if (infos.items.len == 0) {
-        ctx.print("No workspaces. Start one with: rtach ws new\n", .{});
-        return;
-    }
-    for (infos.items) |ws| {
-        ctx.print("{s}  ({s})  {s}\n", .{ ws.name, ws.id, ws.cwd });
-        for (ws.tabs) |tab| {
-            ctx.print("  tab {s}  ({s})\n", .{ tab.name, tab.id });
-            for (tab.panes) |pane| ctx.print("    {s}  {s}\n", .{ pane.id, pane.title orelse "" });
-        }
-    }
+    return infos.items;
 }
 
 // MARK: Tests

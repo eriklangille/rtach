@@ -21,6 +21,7 @@ zig build cross             # Cross-compile all targets
 - `src/ringbuffer.zig` - Scrollback buffer
 - `src/shell_integration.zig` - Shell integration scripts, and the startup-file wrappers in `~/.clauntty/shell-integration` (zsh: ZDOTDIR points there, so every zsh startup file needs a wrapper or the user's is skipped)
 - `src/ws.zig` - `rtach ws`: workspaces, tabs and split layouts over sessions
+- `src/picker.zig` - `rtach` with no arguments (or `clauntty` in a terminal): the workspaces and panes the app shows, for a laptop terminal. Enter attaches; the client returning (Ctrl+\ or the pane ending) comes back to the list after resetting the modes the program left on. `n`, `N` and `x` run `ws.call`, which tells the app to refresh but not to switch (each device keeps its own place). Tests: `tests/picker.test.ts`, in a Bun PTY.
 - `src/spawnd.zig` - macOS LaunchAgent that starts masters in the desktop session
 - `src/sys.zig` - Thin wrappers for fd, socket and process calls (Zig 0.16 removed most `std.posix` ones; files go through `std.Io`)
 

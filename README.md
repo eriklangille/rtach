@@ -38,6 +38,11 @@ dtach provides session persistence but lacks scrollback replay and uses outdated
 ## Usage
 
 ```bash
+# Pick a pane from the workspaces the Clauntty app shows (also: clauntty, in a
+# terminal). Enter attaches, Ctrl+\ detaches back to the list.
+rtach
+ssh -t host '~/.clauntty/bin/clauntty'   # from a laptop: the phone's panes
+
 # Create session or attach if exists (most common)
 rtach -A /tmp/session $SHELL
 

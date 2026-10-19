@@ -139,7 +139,10 @@ pub const Protocol = @import("protocol.zig");
 ///          the shell's startup files. Replaces 2.23.1's list of Claude Code variables.
 /// 2.24.1 - zsh reads the user's .zshenv, .zlogin and .zlogout too, and their ZDOTDIR
 ///          if .zshenv sets one; macOS's default history file is theirs, not ours
-pub const version = "2.24.1";
+/// 2.25.0 - The picker (`rtach`, or `clauntty` in a terminal) shows the app's
+///          workspaces and panes with their status; detaching comes back to it; new
+///          panes and closes go through `ws`, so the phone shows them in place
+pub const version = "2.25.0";
 
 /// `-a`'s exit code when the session doesn't exist (it ended)
 pub const no_session_exit: u8 = 3;
@@ -207,7 +210,12 @@ pub fn main(init: std.process.Init) void {
     // Invoked as `clauntty` (or an older helper name): send a command to the app
     var argv = init.minimal.args.iterate();
     if (argv.next()) |argv0| {
-        if (cli.isCommandName(argv0)) std.process.exit(cli.main(allocator, io, init.minimal.args));
+        // Bare `clauntty` in a terminal is the picker, as `rtach`
+        var rest = init.minimal.args.iterate();
+        _ = rest.skip();
+        const bare_in_terminal = rest.next() == null and sys.isatty(posix.STDIN_FILENO) and
+            std.mem.eql(u8, std.fs.path.basename(argv0), "clauntty");
+        if (cli.isCommandName(argv0) and !bare_in_terminal) std.process.exit(cli.main(allocator, io, init.minimal.args));
     }
     if (argv.next()) |arg1| {
         if (std.mem.eql(u8, arg1, "spawnd")) std.process.exit(spawnd.main(allocator, io, init.minimal.args));
@@ -226,25 +234,19 @@ pub fn main(init: std.process.Init) void {
     // and would corrupt the framed protocol. Exit codes indicate success/failure.
     switch (args.mode) {
         .picker => {
-            // Interactive session picker
-            const result = picker_mod.showPicker(allocator, io) catch std.process.exit(1);
-            switch (result) {
-                .new_session => {
-                    // Generate new session ID and create
-                    const session_id = generateSessionId(io) catch std.process.exit(1);
-                    var new_args = args;
-                    new_args.socket_path = buildSessionPath(allocator, &session_id) catch std.process.exit(1);
-                    new_args.mode = .create_or_attach;
-                    createAndAttach(allocator, io, new_args, false, null) catch std.process.exit(1);
-                },
-                .existing => |session_id| {
-                    // Attach to existing session
-                    var new_args = args;
-                    new_args.socket_path = buildSessionPath(allocator, session_id) catch std.process.exit(1);
-                    new_args.mode = .attach;
-                    attach(allocator, new_args) catch std.process.exit(1);
-                },
-                .quit => std.process.exit(0),
+            // Interactive picker: the workspaces and panes the app shows. Detaching
+            // from a pane comes back to it.
+            const picker = picker_mod.Picker.init(allocator, io) catch std.process.exit(1);
+            while (true) {
+                const socket_path = picker.choose() catch |err| {
+                    if (err == error.NotATty) _ = sys.write(posix.STDERR_FILENO, "rtach: the picker needs a terminal (ssh -t)\n") catch {};
+                    std.process.exit(1);
+                } orelse std.process.exit(0);
+                var pane_args = args;
+                pane_args.socket_path = socket_path;
+                pane_args.mode = .attach;
+                attach(allocator, pane_args) catch {};
+                picker.detached();
             }
         },
         .create => {
@@ -426,34 +428,6 @@ fn socketLive(path: []const u8) bool {
     defer sys.close(fd);
     sys.connect(fd, path) catch return false;
     return true;
-}
-
-/// Generate a new UUID-format session ID
-fn generateSessionId(io: std.Io) ![36]u8 {
-    var uuid_bytes: [16]u8 = undefined;
-    io.random(&uuid_bytes);
-
-    // Set version (4) and variant bits
-    uuid_bytes[6] = (uuid_bytes[6] & 0x0f) | 0x40; // Version 4
-    uuid_bytes[8] = (uuid_bytes[8] & 0x3f) | 0x80; // Variant 1
-
-    // Format as UUID string with dashes
-    var result: [36]u8 = undefined;
-    _ = std.fmt.bufPrint(&result, "{x:0>8}-{x:0>4}-{x:0>4}-{x:0>4}-{x:0>12}", .{
-        std.mem.readInt(u32, uuid_bytes[0..4], .big),
-        std.mem.readInt(u16, uuid_bytes[4..6], .big),
-        std.mem.readInt(u16, uuid_bytes[6..8], .big),
-        std.mem.readInt(u16, uuid_bytes[8..10], .big),
-        std.mem.readInt(u48, uuid_bytes[10..16], .big),
-    }) catch unreachable;
-
-    return result;
-}
-
-/// Build full socket path from session ID
-fn buildSessionPath(allocator: std.mem.Allocator, session_id: []const u8) ![]const u8 {
-    const home = sys.getenv("HOME") orelse return error.NoHome;
-    return std.fmt.allocPrint(allocator, "{s}/.clauntty/sessions/{s}", .{ home, session_id });
 }
 
 /// Parse UUID string (with or without dashes) to 16-byte array
