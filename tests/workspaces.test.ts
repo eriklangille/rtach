@@ -1,6 +1,6 @@
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { spawn, spawnSync } from "bun";
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "fs";
 import { join } from "path";
 import { RTACH_BIN, cleanupAll, trackProcess, waitForOutput } from "./helpers";
 
@@ -115,6 +115,25 @@ describe("rtach ws", () => {
     expect(output).toContain(`lang=en_US.UTF-8 home=${home}`);
     expect(output).not.toContain("/tmp/caller-bin");
   });
+
+  // zsh reads every startup file from ZDOTDIR, which points at the integration's
+  // wrappers; a .zshenv can move the rest of them with its own ZDOTDIR
+  for (const dotdir of ["", "zsh"]) {
+    test(`a zsh pane reads the user's startup files${dotdir ? " from their ZDOTDIR" : ""}`, async () => {
+      const dir = join(home, dotdir);
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(home, ".zshenv"), `export FROM_ZSHENV=1\n${dotdir ? `ZDOTDIR=${dir}\n` : ""}`);
+      for (const file of ["zprofile", "zshrc", "zlogin"]) writeFileSync(join(dir, `.${file}`), `FROM_${file.toUpperCase()}=1\n`);
+      const { pane } = wsJson(["new", "--cwd", project], { env: { SHELL: "/bin/zsh" } });
+
+      const client = attach(pane);
+      client.stdin.write('echo "env=${FROM_ZSHENV:-unset} profile=${FROM_ZPROFILE:-unset} rc=${FROM_ZSHRC:-unset} login=${FROM_ZLOGIN:-unset} integration=${CLAUNTTY_SHELL_INTEGRATION:-unset} hist=$HISTFILE"\n');
+      const output = await waitForOutput(client, /env=[^$]/, 3000);
+      expect(output).toContain("env=1 profile=1 rc=1 login=1 integration=1");
+      // macOS's /etc/zshrc puts it in ZDOTDIR
+      if (process.platform === "darwin") expect(output).toContain(`hist=${join(dir, ".zsh_history")}`);
+    });
+  }
 
   // The app runs `rtach ws` over a plain SSH command: no TERM, or a placeholder
   // like login's "network" that terminfo doesn't know, and often no LANG

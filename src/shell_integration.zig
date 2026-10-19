@@ -186,20 +186,47 @@ pub fn deployIntegrationFiles(io: std.Io) !void {
         \\
     , .{home}));
 
-    // Zsh wrappers (ZDOTDIR)
-    try writeFileAtomic(io, dir_path, ".zprofile",
-        \\# Clauntty zprofile wrapper - sources user config
-        \\[ -f ~/.zprofile ] && . ~/.zprofile
+    // Zsh wrappers (ZDOTDIR). zsh reads every startup file from ZDOTDIR, so each one
+    // needs a wrapper or the user's is skipped. The user's .zshenv may set its own
+    // ZDOTDIR for the rest (__clauntty_home); zsh stays on these wrappers.
+    try writeFileAtomic(io, dir_path, ".zshenv",
+        \\# Clauntty zshenv wrapper - sources user config
+        \\__clauntty_zdotdir=$ZDOTDIR
+        \\unset ZDOTDIR
+        \\[ -f ~/.zshenv ] && . ~/.zshenv
+        \\__clauntty_home=${ZDOTDIR:-$HOME}
+        \\export ZDOTDIR=$__clauntty_zdotdir
+        \\unset __clauntty_zdotdir
         \\
     );
 
+    try writeFileAtomic(io, dir_path, ".zprofile",
+        \\# Clauntty zprofile wrapper - sources user config
+        \\[ -f "${__clauntty_home:-$HOME}/.zprofile" ] && . "${__clauntty_home:-$HOME}/.zprofile"
+        \\
+    );
+
+    // macOS's /etc/zshrc puts the history in ZDOTDIR, which would be this directory
     try writeFileAtomic(io, dir_path, ".zshrc", try std.fmt.bufPrint(&content_buf,
         \\# Clauntty zshrc wrapper - sources user config then integration
         \\[ -f /etc/zsh/zshrc ] && . /etc/zsh/zshrc
-        \\[ -f ~/.zshrc ] && . ~/.zshrc
+        \\[[ "$HISTFILE" == "$ZDOTDIR/.zsh_history" ]] && HISTFILE="${{__clauntty_home:-$HOME}}/.zsh_history"
+        \\[ -f "${{__clauntty_home:-$HOME}}/.zshrc" ] && . "${{__clauntty_home:-$HOME}}/.zshrc"
         \\. {s}/.clauntty/shell-integration/clauntty.zsh
         \\
     , .{home}));
+
+    try writeFileAtomic(io, dir_path, ".zlogin",
+        \\# Clauntty zlogin wrapper - sources user config
+        \\[ -f "${__clauntty_home:-$HOME}/.zlogin" ] && . "${__clauntty_home:-$HOME}/.zlogin"
+        \\
+    );
+
+    try writeFileAtomic(io, dir_path, ".zlogout",
+        \\# Clauntty zlogout wrapper - sources user config
+        \\[ -f "${__clauntty_home:-$HOME}/.zlogout" ] && . "${__clauntty_home:-$HOME}/.zlogout"
+        \\
+    );
 }
 
 /// Write to a temp file and rename it into place. Every new session rewrites these

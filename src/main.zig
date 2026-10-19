@@ -137,7 +137,9 @@ pub const Protocol = @import("protocol.zig");
 /// 2.24.0 - A `ws` pane starts with a fresh environment, as a session the app opens:
 ///          who the user is, TERM and the locale from the caller, the system PATH, then
 ///          the shell's startup files. Replaces 2.23.1's list of Claude Code variables.
-pub const version = "2.24.0";
+/// 2.24.1 - zsh reads the user's .zshenv, .zlogin and .zlogout too, and their ZDOTDIR
+///          if .zshenv sets one; macOS's default history file is theirs, not ours
+pub const version = "2.24.1";
 
 /// `-a`'s exit code when the session doesn't exist (it ended)
 pub const no_session_exit: u8 = 3;
