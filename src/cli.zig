@@ -196,6 +196,9 @@ fn show(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
     const now_ms: i64 = @intCast(@divFloor(sys.realtimeNs(), std.time.ns_per_ms));
     if (inbox_dir) |dir| inbox.prune(io, dir, now_ms);
 
+    // The pane that sent it, so the app shows it in that pane's window
+    const pane = paneId();
+
     var lines: std.ArrayList([2][]const u8) = .empty;
     defer {
         for (lines.items) |line| allocator.free(line[1]);
@@ -206,21 +209,26 @@ fn show(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
         var id_buf: [64]u8 = undefined;
         const id = inbox.makeId(&id_buf, now_ms, std.c.getpid(), i);
         const in_inbox = if (inbox_dir) |dir| blk: {
-            inbox.add(io, dir, id, path) catch break :blk false;
+            inbox.add(io, dir, id, path, pane) catch break :blk false;
             break :blk true;
         } else false;
         if (in_inbox) queued += 1;
         // Without an entry, send the plain path: there's nothing for the app to delete
         const value = if (in_inbox)
-            std.fmt.allocPrint(allocator, "{s};{s}", .{ id, path })
+            std.fmt.allocPrint(allocator, "{s};{s};{s}", .{ id, pane, path })
         else
             allocator.dupe(u8, path);
         lines.append(allocator, .{ "image", value catch return fail("out of memory", .{}) }) catch return fail("out of memory", .{});
     }
 
     const plural = if (lines.items.len == 1) "" else "s";
+    // The session the app shows first: the app is attached there even when this pane
+    // is off screen
     var pointer_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const target = resolveTarget(io, &pointer_buf);
+    const target = blk: {
+        if (activeTarget(io, &pointer_buf)) |t| if (fifoOpen(t.fifo)) break :blk t;
+        break :blk envTarget();
+    };
     const reachable = if (target) |t| fifoOpen(t.fifo) else false;
     if (!reachable and queued == lines.items.len) {
         printOut("Queued {d} image{s} (shown when Clauntty connects)\n", .{ lines.items.len, plural });
@@ -229,6 +237,14 @@ fn show(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
     const code = sendLines(io, lines.items, target);
     if (code == 0) printOut("Sent {d} image{s} to Clauntty\n", .{ lines.items.len, plural });
     return code;
+}
+
+/// This session's ID (`$RTACH_SESSION_ID`), or empty outside rtach or if it isn't one
+/// that fits in a command
+fn paneId() []const u8 {
+    const id = sys.getenv("RTACH_SESSION_ID") orelse return "";
+    if (id.len > 64 or std.mem.indexOfAny(u8, id, ";\n\t") != null) return "";
+    return id;
 }
 
 // MARK: Target

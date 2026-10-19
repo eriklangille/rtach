@@ -1,5 +1,5 @@
 //! Image inbox: ~/.clauntty/inbox/<id> holds the path of an image `clauntty show`
-//! sent to the phone.
+//! sent to the phone, and on a second line the pane that sent it (none outside rtach).
 //!
 //! The live `image;<id>;<path>` command can be lost while Clauntty is in the
 //! background (no client attached, or a dead connection rtach hasn't noticed). The app
@@ -29,7 +29,7 @@ pub fn idTime(id: []const u8) ?i64 {
 
 /// Add an entry. Written to a hidden temp file and renamed so the app never reads a
 /// partial path.
-pub fn add(io: std.Io, dir: []const u8, id: []const u8, image_path: []const u8) !void {
+pub fn add(io: std.Io, dir: []const u8, id: []const u8, image_path: []const u8, pane: []const u8) !void {
     const cwd = std.Io.Dir.cwd();
     try cwd.createDirPath(io, dir);
 
@@ -38,7 +38,9 @@ pub fn add(io: std.Io, dir: []const u8, id: []const u8, image_path: []const u8) 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const entry_path = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir, id });
 
-    try cwd.writeFile(io, .{ .sub_path = tmp_path, .data = image_path, .flags = .{ .permissions = .fromMode(0o600) } });
+    var data_buf: [std.fs.max_path_bytes + 128]u8 = undefined;
+    const data = if (pane.len == 0) image_path else try std.fmt.bufPrint(&data_buf, "{s}\n{s}", .{ image_path, pane });
+    try cwd.writeFile(io, .{ .sub_path = tmp_path, .data = data, .flags = .{ .permissions = .fromMode(0o600) } });
     cwd.rename(tmp_path, cwd, entry_path, io) catch |err| {
         cwd.deleteFile(io, tmp_path) catch {};
         return err;
@@ -90,13 +92,18 @@ test "add writes the path; prune drops old entries" {
     const inbox = try std.fmt.bufPrint(&inbox_buf, "{s}/inbox", .{base});
 
     const now: i64 = 1760000000000;
-    try add(io, inbox, "1760000000000-1-0", "/tmp/new.png");
-    try add(io, inbox, "1750000000000-1-0", "/tmp/old.png");
+    try add(io, inbox, "1760000000000-1-0", "/tmp/new.png", "");
+    try add(io, inbox, "1750000000000-1-0", "/tmp/old.png", "");
+    try add(io, inbox, "1760000000001-1-0", "/tmp/pane.png", "5E55A000-0000-4000-8000-000000000001");
 
     var buf: [64]u8 = undefined;
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const fresh = try std.fmt.bufPrint(&path_buf, "{s}/1760000000000-1-0", .{inbox});
     try testing.expectEqualStrings("/tmp/new.png", try std.Io.Dir.cwd().readFile(io, fresh, &buf));
+    var pane_buf: [128]u8 = undefined;
+    var pane_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const with_pane = try std.fmt.bufPrint(&pane_path_buf, "{s}/1760000000001-1-0", .{inbox});
+    try testing.expectEqualStrings("/tmp/pane.png\n5E55A000-0000-4000-8000-000000000001", try std.Io.Dir.cwd().readFile(io, with_pane, &pane_buf));
 
     prune(io, inbox, now);
 

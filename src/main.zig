@@ -123,7 +123,10 @@ pub const Protocol = @import("protocol.zig");
 /// 2.20.0 - `clauntty ws` (same as `rtach ws`); `ws new|tab|split ... -- CMD` types CMD
 ///          at the new pane's first prompt; a new session's shell always gets the
 ///          integration, even when started from another pane
-pub const version = "2.20.0";
+/// 2.21.0 - `clauntty show` says which pane sent the image (`image;<id>;<pane>;<path>`,
+///          and a second line in the inbox entry) and goes through the session the app
+///          shows, so the app puts it in that pane's window right away
+pub const version = "2.21.0";
 
 /// `-a`'s exit code when the session doesn't exist (it ended)
 pub const no_session_exit: u8 = 3;
