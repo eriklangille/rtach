@@ -358,6 +358,10 @@ const ClientConn = struct {
     /// PTY size until it's used again, so a background pre-fetch (resume, then pause)
     /// doesn't take the size back
     yielded: bool = false,
+    /// Sent want_size: told the PTY's size when it or the client in use changes
+    wants_size: bool = false,
+    /// The last pty_size sent, so an unchanged one isn't sent again
+    sent_size: ?Protocol.PtySize = null,
 };
 
 pub const Master = struct {
@@ -1477,6 +1481,26 @@ pub const Master = struct {
             self.size_client = chosen;
         }
         if (chosen) |client| self.applyWinsize(client.size.?);
+        self.tellSizes();
+    }
+
+    /// Tell the clients that asked (want_size) the PTY's size and whether it's theirs,
+    /// when that changed. A client whose size it isn't gets output drawn for another
+    /// client's size: the app then draws the terminal at this size, scaled to fit.
+    fn tellSizes(self: *Master) void {
+        for (self.clients.items) |client| {
+            if (!client.wants_size or !client.framed_mode or client.pending_remove) continue;
+            const size = Protocol.PtySize{
+                .rows = self.winsize.rows,
+                .cols = self.winsize.cols,
+                .yours = self.size_client == client,
+            };
+            if (client.sent_size) |sent| {
+                if (std.meta.eql(sent, size)) continue;
+            }
+            client.sent_size = size;
+            writeFramed(client.fd, .pty_size, &size.toBytes());
+        }
     }
 
     /// Resize the PTY, and signal the program when the size changed
@@ -1525,7 +1549,7 @@ pub const Master = struct {
 
     /// Send handshake to client after attach
     fn sendHandshake(client_fd: posix.fd_t) void {
-        const handshake = Protocol.Handshake{ .flags = Protocol.HANDSHAKE_FLAG_HISTORY };
+        const handshake = Protocol.Handshake{ .flags = Protocol.HANDSHAKE_FLAG_HISTORY | Protocol.HANDSHAKE_FLAG_PTY_SIZE };
         const header = Protocol.ResponseHeader{
             .type = .handshake,
             .len = Protocol.Handshake.WIRE_SIZE,
@@ -1924,6 +1948,12 @@ pub const Master = struct {
                 const client = self.clients.items[idx];
                 client.size = ws;
                 self.updateSizeClient();
+            },
+            .want_size => {
+                const client = self.clients.items[idx];
+                client.wants_size = true;
+                client.sent_size = null;
+                self.tellSizes();
             },
             .redraw => {
                 if (self.modes.alt_screen) {

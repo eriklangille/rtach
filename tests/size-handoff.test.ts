@@ -10,6 +10,7 @@ import {
   sendAttachPacket,
   MessageType,
   ResponseType,
+  HANDSHAKE_FLAG_PTY_SIZE,
   type RawRtachConnection,
 } from "./helpers";
 
@@ -72,19 +73,35 @@ describe("size handoff", () => {
     return conn;
   }
 
-  /** Terminal output a client received since the last call */
+  /** Terminal output a client received since the last call (pty_size frames go to `told`) */
   function drain(conn: RawRtachConnection): string {
     let text = "";
     while (conn.dataBuffer.length >= 5) {
       const type = conn.dataBuffer[0];
       const len = conn.dataBuffer.readUInt32LE(1);
       if (conn.dataBuffer.length < 5 + len) break;
+      const payload = conn.dataBuffer.subarray(5, 5 + len);
       if (type === ResponseType.TERMINAL_DATA) {
-        text += conn.dataBuffer.subarray(5, 5 + len).toString();
+        text += payload.toString();
+      } else if (type === ResponseType.PTY_SIZE) {
+        const yours = (payload[4] & 1) !== 0;
+        told.set(conn, [...(told.get(conn) ?? []), `${payload.readUInt16LE(0)}x${payload.readUInt16LE(2)}${yours ? " yours" : ""}`]);
       }
       conn.dataBuffer = conn.dataBuffer.subarray(5 + len);
     }
     return text;
+  }
+
+  /** The pty_size frames each client got */
+  const told = new Map<RawRtachConnection, string[]>();
+
+  /** pty_size frames a client got since the last call */
+  async function sizesTold(conn: RawRtachConnection, waitMs = 200): Promise<string[]> {
+    await Bun.sleep(waitMs);
+    drain(conn);
+    const sizes = told.get(conn) ?? [];
+    told.set(conn, []);
+    return sizes;
   }
 
   /** The WINCH lines the program printed after an action, read through `watcher` */
@@ -172,5 +189,36 @@ describe("size handoff", () => {
     expect(await winches(() => send(b, MessageType.CLAIM_ACTIVE))).toEqual([size(later)]);
     a.close();
     b.close();
+  });
+
+  test("a client that asks is told the PTY's size and whether it's its own", async () => {
+    const phone = await client("aaaaaaaa-size-test", A);
+    const laptop = await client("bbbbbbbb-size-test", B);
+    send(phone, MessageType.CLAIM_ACTIVE);
+    await sizesTold(phone);
+
+    // The handshake says the master answers want_size
+    expect(phone.handshakeFlags! & HANDSHAKE_FLAG_PTY_SIZE).toBe(HANDSHAKE_FLAG_PTY_SIZE);
+
+    // Right away, then on every change
+    send(phone, MessageType.WANT_SIZE);
+    expect(await sizesTold(phone)).toEqual([`${size(A)} yours`]);
+    send(laptop, MessageType.PUSH, Buffer.from(" "));
+    expect(await sizesTold(phone)).toEqual([size(B)]);
+    // Same size, but now the phone's: still worth telling
+    winch(phone, B);
+    send(phone, MessageType.CLAIM_ACTIVE);
+    expect(await sizesTold(phone)).toEqual([`${size(B)} yours`]);
+    // Nothing changed: nothing sent
+    send(phone, MessageType.CLAIM_ACTIVE);
+    expect(await sizesTold(phone)).toEqual([]);
+    // The phone pauses (the app in the background): the laptop's size, not the phone's
+    send(phone, MessageType.PAUSE);
+    expect(await sizesTold(phone)).toEqual([size(B)]);
+
+    // A client that didn't ask (older apps, the CLI) gets none
+    expect(await sizesTold(laptop)).toEqual([]);
+    phone.close();
+    laptop.close();
   });
 });

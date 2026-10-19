@@ -142,7 +142,10 @@ pub const Protocol = @import("protocol.zig");
 /// 2.25.0 - The picker (`rtach`, or `clauntty` in a terminal) shows the app's
 ///          workspaces and panes with their status; detaching comes back to it; new
 ///          panes and closes go through `ws`, so the phone shows them in place
-pub const version = "2.25.0";
+/// 2.26.0 - Clients that ask (`want_size`) are told the PTY's size and whether it's
+///          theirs (`pty_size`), so the app can draw a pane a laptop is using at the
+///          laptop's size instead of in its own columns
+pub const version = "2.26.0";
 
 /// `-a`'s exit code when the session doesn't exist (it ended)
 pub const no_session_exit: u8 = 3;

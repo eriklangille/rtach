@@ -43,7 +43,7 @@ The iOS app uses the version to determine when to redeploy the binary to remote 
 
 ### Terminal size
 
-The master keeps each client's last `winch` size. The PTY takes the size of the client in use: the latest claim or input, else the latest attach, among clients that are attached and not paused. A `pause` also gives up the size until the client claims or types again, so a background pre-fetch (resume, then pause) doesn't take it back. When the client in use pauses, detaches or disconnects, the next one's size applies right away. With no such client, the size stays. Tests: `tests/size-handoff.test.ts`.
+The master keeps each client's last `winch` size. The PTY takes the size of the client in use: the latest claim or input, else the latest attach, among clients that are attached and not paused. A `pause` also gives up the size until the client claims or types again, so a background pre-fetch (resume, then pause) doesn't take it back. When the client in use pauses, detaches or disconnects, the next one's size applies right away. With no such client, the size stays. A client that sends `want_size` (type 12; the handshake has flag `1 << 1` when the master answers it) gets `pty_size` (response 7: rows u16, cols u16, flags u8 with bit 0 "yours") right away and whenever the PTY's size, or whether it's that client's, changes. The app then draws a pane a laptop is using at the laptop's size, scaled to fit, and says it's in use on another device; older clients never ask, because they don't skip unknown response types. The proxy forwards `want_size`. Tests: `tests/size-handoff.test.ts`.
 
 ### Session start
 

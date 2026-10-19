@@ -569,6 +569,7 @@ export const MessageType = {
   RESUME: 9,
   CLAIM_ACTIVE: 10,
   REQUEST_HISTORY: 11,
+  WANT_SIZE: 12,
 } as const;
 
 export const ResponseType = {
@@ -579,9 +580,11 @@ export const ResponseType = {
   IDLE: 4,
   HANDSHAKE: 5,
   HISTORY_PAGE: 6,
+  PTY_SIZE: 7,
 } as const;
 
 export const HANDSHAKE_FLAG_HISTORY = 1;
+export const HANDSHAKE_FLAG_PTY_SIZE = 2;
 export const HISTORY_BEFORE_REPLAY = 0xffffffffffffffffn;
 
 // Protocol constants
@@ -597,6 +600,8 @@ export interface RawRtachConnection {
   socket: Socket;
   dataBuffer: Buffer;
   close: () => void;
+  /** The handshake's flags, once handleProtocolUpgrade has seen it */
+  handshakeFlags?: number;
 }
 
 // Connect to rtach socket directly (bypassing CLI)
@@ -641,6 +646,7 @@ export async function handleProtocolUpgrade(
         // Parse and validate handshake
         const magic = conn.dataBuffer.readUInt32LE(RESPONSE_HEADER_SIZE);
         if (magic === HANDSHAKE_MAGIC) {
+          conn.handshakeFlags = conn.dataBuffer.readUInt16LE(RESPONSE_HEADER_SIZE + 6);
           // Remove handshake from buffer
           conn.dataBuffer = conn.dataBuffer.subarray(handshakeFrameSize);
 

@@ -29,6 +29,9 @@ pub const MessageType = enum(u8) {
     /// Request a page of scrollback history before a stream position (HistoryRequest).
     /// Only sent to masters whose handshake has HANDSHAKE_FLAG_HISTORY.
     request_history = 11,
+    /// Tell me the PTY's size from now on (pty_size). Only sent to masters whose
+    /// handshake has HANDSHAKE_FLAG_PTY_SIZE.
+    want_size = 12,
     /// Unknown types are ignored. The enum used to be exhaustive, so an unknown value
     /// from a newer client was undefined behavior in an older master.
     _,
@@ -56,6 +59,9 @@ pub const ResponseType = enum(u8) {
     handshake = 5,
     /// A page of scrollback history: HistoryPageMeta, then the data
     history_page = 6,
+    /// The PTY's size and whether it's this client's (PtySize). Only to clients that
+    /// sent want_size: older clients don't skip unknown types.
+    pty_size = 7,
 };
 
 /// Response header size (type: 1 byte + len: 4 bytes)
@@ -134,6 +140,28 @@ pub const HistoryPageMeta = struct {
 
 /// Handshake flag: the master supports request_history
 pub const HANDSHAKE_FLAG_HISTORY: u16 = 1 << 0;
+/// Handshake flag: the master answers want_size
+pub const HANDSHAKE_FLAG_PTY_SIZE: u16 = 1 << 1;
+
+/// pty_size payload: the PTY's size, and whether it's this client's (the client in
+/// use, see Master.pickSizeClient). When it isn't, the output is drawn for another
+/// client's size. Wire format: rows u16, cols u16, flags u8 (little-endian), 5 bytes.
+pub const PtySize = struct {
+    rows: u16,
+    cols: u16,
+    yours: bool,
+
+    pub const WIRE_SIZE = 5;
+    pub const FLAG_YOURS: u8 = 1 << 0;
+
+    pub fn toBytes(self: PtySize) [WIRE_SIZE]u8 {
+        var out: [WIRE_SIZE]u8 = undefined;
+        std.mem.writeInt(u16, out[0..2], self.rows, .little);
+        std.mem.writeInt(u16, out[2..4], self.cols, .little);
+        out[4] = if (self.yours) FLAG_YOURS else 0;
+        return out;
+    }
+};
 
 /// Handshake sent immediately after client attaches
 /// Identifies rtach protocol and version for compatibility checking
