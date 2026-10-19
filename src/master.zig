@@ -402,6 +402,9 @@ pub const Master = struct {
     scrollback: RingBuffer,
     /// Monotonic counter of total bytes written to scrollback
     scrollback_total_written: u64 = 0,
+    /// Where the stream was when this master took over from an older one (live
+    /// upgrade); clients that reattach with ATTACH_FLAG_RESUME get what came after
+    resumed_at: ?u64 = null,
 
     // Connected clients
     clients: std.ArrayList(*ClientConn) = .empty,
@@ -592,6 +595,7 @@ pub const Master = struct {
         } else {
             log.warn("resumed without the previous master's state (scrollback, modes and title start empty)", .{});
         }
+        self.resumed_at = self.scrollback_total_written;
         // Tell the app, and `rtach upgrade`, which version runs now
         self.pane_dirty = true;
         return self;
@@ -1831,6 +1835,7 @@ pub const Master = struct {
             .attach => {
                 // Get client ID from attach packet (if provided)
                 const client_id = pkt.getClientId();
+                const resuming = pkt.getAttachFlags() & Protocol.ATTACH_FLAG_RESUME != 0;
 
                 // If client ID provided, kick any existing connection with same ID
                 if (client_id) |id| {
@@ -1862,10 +1867,21 @@ pub const Master = struct {
 
                 // Handshake already sent on connect, now send scrollback
 
-                // Skip sending scrollback if in alternate screen mode (vim, less, Claude Code, etc.)
-                // The TUI app will redraw itself when it receives SIGWINCH
-                // Sending old scrollback would corrupt the display
-                if (self.modes.alt_screen) {
+                if (resuming) {
+                    // Back after this master's live upgrade: its terminal has everything
+                    // up to then, modes included. Only what came after.
+                    const client = self.clients.items[idx];
+                    const stored = self.storedOutput();
+                    const from = @max(self.resumed_at orelse stored.end(), stored.oldest);
+                    client.replay_start = from;
+                    const offset: usize = @intCast(from - stored.oldest);
+                    const range = self.scrollback.sliceRange(offset, stored.len() - offset);
+                    writeFramedSlicesMaybeCompressed(client.fd, .terminal_data, range.first, range.second, client.compression_enabled);
+                    log.info("client {} resumed after the upgrade: {} bytes since", .{ idx, stored.len() - offset });
+                } else if (self.modes.alt_screen) {
+                    // Skip sending scrollback if in alternate screen mode (vim, less, Claude Code, etc.)
+                    // The TUI app will redraw itself when it receives SIGWINCH
+                    // Sending old scrollback would corrupt the display
                     log.info("skipping scrollback (alternate screen active)", .{});
                     self.clients.items[idx].replay_start = self.scrollback_total_written;
                     // Switch client to alternate screen mode so it knows to interpret

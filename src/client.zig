@@ -39,6 +39,17 @@ pub const Client = struct {
     // 4KB buffer handles packets up to ~16 max-size push packets
     stdin_buffer: [4096]u8 = undefined,
     stdin_buffered: usize = 0,
+    /// The master said the session ended (`ended`): a closed connection is the end,
+    /// not a live upgrade to reattach after
+    ended: bool = false,
+    /// A command frame being read, to spot `ended`
+    command_buf: [16]u8 = undefined,
+    command_len: usize = 0,
+    /// Reattaching after a live upgrade: the attach asks for only what's new
+    reattaching: bool = false,
+    /// Reattaches in a row without output in between, so a master that keeps closing
+    /// the connection doesn't keep this client reconnecting
+    reattach_tries: u8 = 0,
 
     pub fn init(allocator: std.mem.Allocator, options: ClientOptions) !*Client {
         const self = try allocator.create(Client);
@@ -134,6 +145,12 @@ pub const Client = struct {
 
     fn sendPostUpgradeSetup(self: *Client) !void {
         const client_id_ptr: ?*const [Protocol.CLIENT_ID_SIZE]u8 = if (self.options.client_id) |*id| id else null;
+        if (self.reattaching) {
+            self.reattaching = false;
+            const attach_pkt = Protocol.Packet.initAttachFlags(client_id_ptr, Protocol.ATTACH_FLAG_RESUME);
+            _ = try sys.write(self.socket_fd, attach_pkt.serialize());
+            return self.sendWindowSize();
+        }
         const attach_pkt = Protocol.Packet.initAttach(client_id_ptr);
         _ = try sys.write(self.socket_fd, attach_pkt.serialize());
 
@@ -213,13 +230,19 @@ pub const Client = struct {
             }
 
             // Check socket
+            var closed = false;
             if (poll_fds[1].revents & posix.POLL.IN != 0) {
-                self.handleSocket() catch break;
+                self.handleSocket() catch {
+                    closed = true;
+                };
             }
-
-            if (poll_fds[1].revents & (posix.POLL.HUP | posix.POLL.ERR) != 0) {
+            if (!closed and poll_fds[1].revents & (posix.POLL.HUP | posix.POLL.ERR) != 0) {
+                closed = true;
+            }
+            if (closed) {
                 log.info("connection closed", .{});
-                break;
+                if (!self.reattach()) break;
+                poll_fds[1].fd = self.socket_fd;
             }
         }
 
@@ -229,6 +252,27 @@ pub const Client = struct {
 
         self.restoreTerminal();
         log.info("detached", .{});
+    }
+
+    /// After the connection closed: if the session didn't end, its master was replaced
+    /// by a newer rtach (live upgrade), which listens on the same socket. Attach to it
+    /// again, so the terminal stays in the session. A master that's gone (crashed,
+    /// killed) refuses the connection, and this returns false.
+    fn reattach(self: *Client) bool {
+        if (self.options.proxy_mode or self.ended or self.reattach_tries >= 3) return false;
+        self.reattach_tries += 1;
+        sys.close(self.socket_fd);
+        self.socket_fd = -1;
+        self.connect() catch return false;
+        self.handshake_received = false;
+        self.raw_socket_buffer.items.len = 0;
+        self.socket_header_read = 0;
+        self.socket_payload_remaining = 0;
+        self.socket_payload_type = 0;
+        self.command_len = 0;
+        self.reattaching = true;
+        log.info("reattaching after the master closed the connection", .{});
+        return true;
     }
 
     fn handleStdin(self: *Client) !bool {
@@ -554,12 +598,25 @@ pub const Client = struct {
                 response_type == @intFromEnum(Protocol.ResponseType.scrollback)))
             {
                 _ = sys.write(STDOUT_FILENO, chunk) catch {};
+                self.reattach_tries = 0;
+            } else if (response_type == @intFromEnum(Protocol.ResponseType.command)) {
+                // Only `ended` matters: longer commands just count their length
+                if (self.command_len + chunk.len <= self.command_buf.len) {
+                    @memcpy(self.command_buf[self.command_len..][0..chunk.len], chunk);
+                }
+                self.command_len += chunk.len;
             }
 
             self.socket_payload_remaining -= take;
             offset += take;
 
             if (self.socket_payload_remaining == 0) {
+                if (compression.getResponseType(self.socket_payload_type) == @intFromEnum(Protocol.ResponseType.command)) {
+                    if (self.command_len == "ended".len and std.mem.eql(u8, self.command_buf[0..self.command_len], "ended")) {
+                        self.ended = true;
+                    }
+                    self.command_len = 0;
+                }
                 self.socket_payload_type = 0;
             }
         }

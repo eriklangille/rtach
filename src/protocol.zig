@@ -138,6 +138,11 @@ pub const HistoryPageMeta = struct {
     }
 };
 
+/// Attach flag: this client was attached until the master's live upgrade and has
+/// everything up to it. Instead of the usual replay, it gets only what the new master
+/// wrote since it took over (nothing from a master that wasn't upgraded), and no modes.
+pub const ATTACH_FLAG_RESUME: u8 = 1 << 0;
+
 /// Handshake flag: the master supports request_history
 pub const HANDSHAKE_FLAG_HISTORY: u16 = 1 << 0;
 /// Handshake flag: the master answers want_size
@@ -279,6 +284,25 @@ pub const Packet = struct {
             @memcpy(pkt.payload[0..CLIENT_ID_SIZE], id);
         }
         return pkt;
+    }
+
+    /// An attach with flags (ATTACH_FLAG_*): payload [client id (16)][flags (1)], or
+    /// just [flags] without an id. Older masters read the id and ignore the flags.
+    pub fn initAttachFlags(client_id: ?*const [CLIENT_ID_SIZE]u8, flags: u8) Packet {
+        var pkt = initAttach(client_id);
+        pkt.payload[pkt.header.len] = flags;
+        pkt.header.len += 1;
+        return pkt;
+    }
+
+    /// The attach's flags (0 without)
+    pub fn getAttachFlags(self: *const Packet) u8 {
+        if (self.header.type != .attach) return 0;
+        return switch (self.header.len) {
+            1 => self.payload[0],
+            CLIENT_ID_SIZE + 1 => self.payload[CLIENT_ID_SIZE],
+            else => 0,
+        };
     }
 
     /// Get client ID from attach packet payload (returns null if no client ID)
@@ -733,4 +757,19 @@ test "claim_active packet format" {
     try testing.expectEqual(@as(usize, 2), data.len);
     try testing.expectEqual(@as(u8, 10), data[0]); // type
     try testing.expectEqual(@as(u8, 0), data[1]); // len
+}
+
+test "attach flags, with and without a client id" {
+    const id: [CLIENT_ID_SIZE]u8 = @splat(7);
+    const with_id = Packet.initAttachFlags(&id, ATTACH_FLAG_RESUME);
+    try testing.expectEqual(@as(u8, CLIENT_ID_SIZE + 1), with_id.header.len);
+    try testing.expectEqual(id, with_id.getClientId().?);
+    try testing.expectEqual(ATTACH_FLAG_RESUME, with_id.getAttachFlags());
+
+    const without = Packet.initAttachFlags(null, ATTACH_FLAG_RESUME);
+    try testing.expectEqual(@as(?[CLIENT_ID_SIZE]u8, null), without.getClientId());
+    try testing.expectEqual(ATTACH_FLAG_RESUME, without.getAttachFlags());
+
+    try testing.expectEqual(@as(u8, 0), Packet.initAttach(&id).getAttachFlags());
+    try testing.expectEqual(@as(u8, 0), Packet.initAttach(null).getAttachFlags());
 }

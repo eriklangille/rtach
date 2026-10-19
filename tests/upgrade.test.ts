@@ -9,8 +9,9 @@ import { RTACH_BIN, cleanupAll, trackProcess, waitForOutput } from "./helpers";
  *
  * `upgrade;<rtach>` on a session's command pipe makes its master exec that binary with
  * `--resume`: the same process keeps the PTY, the shell and (through a state file) the
- * scrollback, modes and pane state. Clients are dropped and reattach. `rtach upgrade`
- * sends it to every older master. Each test has its own HOME.
+ * scrollback, modes and pane state. Clients are dropped and reattach: a terminal client
+ * by itself, getting only what the new master wrote since. `rtach upgrade` sends it to
+ * every older master. Each test has its own HOME.
  */
 
 describe("live upgrade", () => {
@@ -74,7 +75,7 @@ describe("live upgrade", () => {
 
   const state = (path = sock) => (existsSync(`${path}.state`) ? JSON.parse(readFileSync(`${path}.state`, "utf8")) : null);
 
-  test("a master upgrades in place: same process, shell and scrollback", async () => {
+  test("a master upgrades in place: same process, shell and scrollback; its clients stay", async () => {
     startMaster();
     const before = await attach();
     before.stdin.write("echo shell=$$ marker-$((40+2))\n");
@@ -85,8 +86,11 @@ describe("live upgrade", () => {
     send(`upgrade;${next}`);
     expect(await until(() => command(pid).includes("rtach-next --resume"))).toBe(true);
     expect(masterPid()).toBe(pid);
-    // The old client was dropped
-    expect(await until(() => before.exitCode !== null)).toBe(true);
+    // The client reattached by itself, and didn't get what it had again
+    before.stdin.write("echo after-$((50+5))\n");
+    const out = await waitForOutput(before, "after-55", 3000);
+    expect(out.split("marker-42").length - 1).toBe(1);
+    expect(before.exitCode).toBeNull();
 
     // A new client gets the scrollback from before, and the same shell
     const after = await attach();
@@ -175,4 +179,35 @@ describe("live upgrade", () => {
     expect(command(pids[1])).not.toContain("--resume");
     expect(command(pids[2])).not.toContain("--resume");
   });
+
+  test("a client attached through an upgrade gets output from around it exactly once", async () => {
+    startMaster();
+    const client = await attach();
+    client.stdin.write("for i in $(seq 1 40); do echo tick-$i; sleep 0.05; done; echo done-$((1+1))\n");
+    await waitForOutput(client, "tick-5", 3000);
+    const pid = masterPid();
+    send(`upgrade;${next}`);
+    expect(await until(() => command(pid).includes("--resume"))).toBe(true);
+
+    const out = await waitForOutput(client, "done-2", 5000);
+    for (let i = 1; i <= 40; i++) {
+      expect(out.match(new RegExp(`tick-${i}\\r?\\n`, "g"))?.length ?? 0).toBe(1);
+    }
+  });
+
+  test("a terminal client ends with its session, or a master that's gone without a word", async () => {
+    // The shell exits: the master says `ended`, and the client doesn't reattach
+    startMaster();
+    const client = await attach();
+    client.stdin.write("exit\n");
+    expect(await until(() => client.exitCode !== null)).toBe(true);
+
+    // Killed: no `ended`, and nothing answers on the socket when it tries
+    const other = join(home, ".clauntty/sessions", id.slice(0, -1) + "K");
+    startMaster(other);
+    const orphan = await attach(other);
+    process.kill(masterPid(other), "SIGKILL");
+    expect(await until(() => orphan.exitCode !== null)).toBe(true);
+  });
 });
+

@@ -147,7 +147,10 @@ pub const Protocol = @import("protocol.zig");
 ///          laptop's size instead of in its own columns
 /// 2.26.1 - Ctrl+\ detaches while the program uses kitty's keyboard protocol (Claude
 ///          Code does), where the terminal sends it as `ESC [ 92 ; 5 u`
-pub const version = "2.26.1";
+/// 2.27.0 - A terminal client stays in its session through a live upgrade: when the
+///          connection closes without `ended`, it reattaches, asking (ATTACH_FLAG_RESUME)
+///          for only what the new master wrote since it took over
+pub const version = "2.27.0";
 
 /// `-a`'s exit code when the session doesn't exist (it ended)
 pub const no_session_exit: u8 = 3;
