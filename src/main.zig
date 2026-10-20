@@ -160,7 +160,12 @@ pub const Protocol = @import("protocol.zig");
 ///          or for a program on the alternate screen, after the master's own repaint
 ///          nudge (one row short until it has drawn, then back), whose short redraw that
 ///          client doesn't get. Replaces the app's timing guesses.
-pub const version = "2.30.0";
+/// 2.31.0 - Every device hears about workspace changes and agents' state: a device's
+///          Clauntty gets its own pointer (~/.clauntty/devices/<id>) when it claims a
+///          session, and cli.notify goes to each, addressed (`@<id>;...`). Only the
+///          single active pointer was told before, so a reorder on the phone didn't
+///          reach the laptop. Showing a new pane stays with the device in use.
+pub const version = "2.31.0";
 
 /// `-a`'s exit code when the session doesn't exist (it ended)
 pub const no_session_exit: u8 = 3;

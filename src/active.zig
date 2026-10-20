@@ -6,6 +6,16 @@
 
 const std = @import("std");
 
+/// One pointer per device as well, ~/.clauntty/devices/<client id in hex>: the command
+/// FIFO of the session that device's Clauntty last claimed active. The single pointer
+/// reaches the device in use; these reach every device, so a change made on the phone
+/// (a reorder, an agent's state) shows on the laptop too.
+pub fn devicePath(pointer_path: []const u8, client_id: []const u8, buf: []u8) ?[]const u8 {
+    const base_dir = std.fs.path.dirname(pointer_path) orelse return null;
+    const hex = std.fmt.bytesToHex(client_id[0..16].*, .lower);
+    return std.fmt.bufPrint(buf, "{s}/devices/{s}", .{ base_dir, &hex }) catch null;
+}
+
 /// Pointer path for a session socket: sessions live in ~/.clauntty/sessions/<id>, the
 /// pointer next to that directory at ~/.clauntty/active. Null for bare socket names.
 pub fn pointerPath(socket_path: []const u8, buf: []u8) ?[]const u8 {

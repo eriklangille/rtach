@@ -297,14 +297,50 @@ pub fn activeSessionId(io: std.Io, buf: []u8) ?[]const u8 {
 }
 
 /// Tell the app something, quietly: nothing is printed when no app is listening.
-/// Goes to the session the app shows on this machine first (it may not be attached
-/// to this one), then to this session.
+/// Every device that has a session here hears it (each through the session it last
+/// claimed: active.devicePath); a `workspace;<ws>/<pane>` to show a new pane is only
+/// for the device in use, the others refresh. Without device pointers (older masters),
+/// the session the app shows on this machine first (it may not be attached to this
+/// one), then this session.
 pub fn notify(io: std.Io, kind: []const u8, value: []const u8) void {
+    const show_pane = std.mem.eql(u8, kind, "workspace") and value.len > 0;
+    const reached = notifyDevices(io, kind, if (show_pane) "" else value);
+    if (reached and !show_pane) return;
     var pointer_buf: [std.fs.max_path_bytes]u8 = undefined;
     const targets = [_]?Target{ activeTarget(io, &pointer_buf), envTarget() };
     for (targets) |maybe| {
         if (sendQuietly(io, maybe orelse continue, kind, value)) return;
     }
+}
+
+/// `@<device>;<kind>;<value>` to each device's session (~/.clauntty/devices), whose
+/// master gives it to that device's client. Pointers to sessions that are gone are
+/// removed. True if any device was reached.
+fn notifyDevices(io: std.Io, kind: []const u8, value: []const u8) bool {
+    const home = sys.getenv("HOME") orelse return false;
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path = std.fmt.bufPrint(&dir_buf, "{s}/.clauntty/devices", .{home}) catch return false;
+    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return false;
+    defer dir.close(io);
+    var reached = false;
+    var it = dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (entry.kind != .file or entry.name.len != 32) continue;
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir_path, entry.name }) catch continue;
+        var fifo_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const fifo = active.read(io, path, &fifo_buf) orelse continue;
+        var line_buf: [1024]u8 = undefined;
+        const addressed = std.fmt.bufPrint(&line_buf, "@{s};{s}", .{ entry.name, kind }) catch continue;
+        // Nobody reading: its session is gone
+        const fd = openFifo(fifo) catch {
+            active.clearIf(io, path, fifo);
+            continue;
+        };
+        sys.close(fd);
+        if (sendQuietly(io, .{ .fifo = fifo, .from_env = false }, addressed, value)) reached = true;
+    }
+    return reached;
 }
 
 /// Tell the session the app shows on this machine something. False if there's none, or

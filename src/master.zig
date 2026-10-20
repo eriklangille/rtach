@@ -1316,6 +1316,8 @@ pub const Master = struct {
                         if (self.pane.setTask(line["task;".len..])) self.pane_dirty = true;
                     } else if (std.mem.startsWith(u8, line, "push;")) {
                         self.handlePush(line["push;".len..]);
+                    } else if (line.len > 0 and line[0] == '@') {
+                        self.sendCommandToDevice(line[1..]);
                     } else if (std.mem.startsWith(u8, line, "upgrade;")) {
                         const path = line["upgrade;".len..];
                         if (path.len < self.upgrade_to.len) {
@@ -2032,6 +2034,7 @@ pub const Master = struct {
                 self.updateSizeClient();
                 log.info("client {} claimed active", .{client.fd});
                 self.writeActivePointer();
+                self.writeDevicePointer(client);
             },
             .detach => {
                 log.info("client {} detached", .{idx});
@@ -2039,6 +2042,7 @@ pub const Master = struct {
                 self.updateActiveClient();
                 self.updateSizeClient();
                 self.clearActivePointerIfUnreachable();
+                self.clearDevicePointer(self.clients.items[idx]);
             },
             .push => {
                 const payload = pkt.getPayload();
@@ -2556,6 +2560,8 @@ pub const Master = struct {
             self.active_client = null;
         }
         if (self.size_client == client) self.size_client = null;
+        client.attached = false;
+        self.clearDevicePointer(client);
         sys.close(client.fd);
         self.allocator.destroy(client);
         _ = self.clients.swapRemove(idx);
@@ -2572,6 +2578,50 @@ pub const Master = struct {
         active.write(self.io, pointer, self.cmd_fifo_path[0..self.cmd_fifo_path_len]) catch |err| {
             log.warn("failed to write active pointer {s}: {}", .{ pointer, err });
         };
+    }
+
+    /// This device's pointer at this session (active.devicePath)
+    fn writeDevicePointer(self: *Master, client: *ClientConn) void {
+        const id = client.client_id orelse return;
+        if (self.active_pointer_len == 0 or self.cmd_fifo_path_len == 0) return;
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = active.devicePath(self.active_pointer_path[0..self.active_pointer_len], &id, &buf) orelse return;
+        if (std.fs.path.dirname(path)) |dir| std.Io.Dir.cwd().createDirPath(self.io, dir) catch {};
+        active.write(self.io, path, self.cmd_fifo_path[0..self.cmd_fifo_path_len]) catch |err| {
+            log.warn("failed to write device pointer {s}: {}", .{ path, err });
+        };
+    }
+
+    /// The device left this session: its pointer stops pointing here, unless another of
+    /// its clients is still attached
+    fn clearDevicePointer(self: *Master, leaving: *ClientConn) void {
+        const id = leaving.client_id orelse return;
+        for (self.clients.items) |client| {
+            if (client == leaving or client.pending_remove or !client.attached) continue;
+            if (client.client_id) |other| if (std.mem.eql(u8, &other, &id)) return;
+        }
+        if (self.active_pointer_len == 0 or self.cmd_fifo_path_len == 0) return;
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = active.devicePath(self.active_pointer_path[0..self.active_pointer_len], &id, &buf) orelse return;
+        active.clearIf(self.io, path, self.cmd_fifo_path[0..self.cmd_fifo_path_len]);
+    }
+
+    /// `@<client id in hex>;<command>` (cli.notify): the command for that device's
+    /// client only
+    fn sendCommandToDevice(self: *Master, addressed: []const u8) void {
+        const sep = std.mem.indexOfScalar(u8, addressed, ';') orelse return;
+        const hex = addressed[0..sep];
+        const cmd = addressed[sep + 1 ..];
+        for (self.clients.items) |client| {
+            if (!self.isClientEligible(client, true)) continue;
+            const id = client.client_id orelse continue;
+            const id_hex = std.fmt.bytesToHex(id, .lower);
+            if (std.mem.eql(u8, &id_hex, hex)) {
+                writeFramed(client.fd, .command, cmd);
+                return;
+            }
+        }
+        log.debug("no client for device {s}, dropping: {s}", .{ hex, cmd });
     }
 
     fn clearActivePointer(self: *Master) void {
