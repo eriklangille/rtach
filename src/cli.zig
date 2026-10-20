@@ -38,9 +38,9 @@ const usage =
     \\  status            Show which session commands go to
     \\  ws <command>      Workspaces, tabs and split panes (clauntty ws for help)
     \\
-    \\Inside a Clauntty session, commands go to that session. Elsewhere (tmux,
-    \\other terminals, ssh) they go to the session Clauntty last had active on
-    \\this machine.
+    \\Commands go to the session Clauntty shows on this machine, so they arrive
+    \\from panes it isn't showing too; with none, inside a Clauntty session, to
+    \\that session.
     \\
 ;
 
@@ -77,18 +77,26 @@ fn run(allocator: std.mem.Allocator, io: std.Io, sub: []const u8, args: []const 
     }
     if (eql(sub, "status")) return status(io);
 
+    // These go where `show` goes: the session the app shows first, so they arrive when
+    // this pane isn't attached (the app lets idle panes go), else this session
+    var pointer_buf: [std.fs.max_path_bytes]u8 = undefined;
+
     if (eql(sub, "open") or eql(sub, "browser")) {
         if (args.len != 1) return fail("usage: clauntty open <url>", .{});
-        return sendLines(io, &.{.{ "browser", args[0] }}, null);
+        return sendLines(io, &.{.{ "browser", args[0] }}, appTarget(io, &pointer_buf));
     }
 
     if (eql(sub, "forward") or eql(sub, "tab")) {
         if (args.len != 1) return fail("usage: clauntty {s} <port>", .{sub});
         const port = parsePort(args[0]) orelse return fail("not a port: {s}", .{args[0]});
-        var port_buf: [8]u8 = undefined;
-        const port_str = std.fmt.bufPrint(&port_buf, "{d}", .{port}) catch unreachable;
         const is_forward = eql(sub, "forward");
-        const code = sendLines(io, &.{.{ if (is_forward) "forward" else "open", port_str }}, null);
+        // A tab goes under the workspace of the pane that opened it: `open;<port>;<pane>`
+        var value_buf: [96]u8 = undefined;
+        const value = if (is_forward)
+            std.fmt.bufPrint(&value_buf, "{d}", .{port}) catch unreachable
+        else
+            std.fmt.bufPrint(&value_buf, "{d};{s}", .{ port, paneId() }) catch unreachable;
+        const code = sendLines(io, &.{.{ if (is_forward) "forward" else "open", value }}, appTarget(io, &pointer_buf));
         if (code == 0) {
             if (is_forward) printOut("Port {d} forwarded\n", .{port}) else printOut("Opened port {d}\n", .{port});
         }
@@ -225,10 +233,7 @@ fn show(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
     // The session the app shows first: the app is attached there even when this pane
     // is off screen
     var pointer_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const target = blk: {
-        if (activeTarget(io, &pointer_buf)) |t| if (fifoOpen(t.fifo)) break :blk t;
-        break :blk envTarget();
-    };
+    const target = appTarget(io, &pointer_buf);
     const reachable = if (target) |t| fifoOpen(t.fifo) else false;
     if (!reachable and queued == lines.items.len) {
         printOut("Queued {d} image{s} (shown when Clauntty connects)\n", .{ lines.items.len, plural });
@@ -257,6 +262,13 @@ const Target = struct {
 
 fn resolveTarget(io: std.Io, pointer_buf: []u8) ?Target {
     return envTarget() orelse activeTarget(io, pointer_buf);
+}
+
+/// Where commands for the app go: the session it shows on this machine, if its master
+/// is there, else this session's pipe
+fn appTarget(io: std.Io, pointer_buf: []u8) ?Target {
+    if (activeTarget(io, pointer_buf)) |t| if (fifoOpen(t.fifo)) return t;
+    return envTarget();
 }
 
 /// This session's pipe
@@ -366,7 +378,7 @@ fn writeAllFd(io: std.Io, fd: posix.fd_t, data: []const u8) !void {
 
 fn status(io: std.Io) u8 {
     var pointer_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const target = resolveTarget(io, &pointer_buf) orelse {
+    const target = appTarget(io, &pointer_buf) orelse {
         printOut("No active Clauntty session on this machine.\n", .{});
         return 1;
     };
@@ -376,7 +388,7 @@ fn status(io: std.Io) u8 {
     }
     printOut("Commands go to session {s} ({s}).\n", .{
         sessionId(target.fifo),
-        if (target.from_env) "this session, $RTACH_CMD_PIPE" else "last active in Clauntty",
+        if (target.from_env) "this session, $RTACH_CMD_PIPE" else "the one Clauntty shows",
     });
     return 0;
 }

@@ -153,7 +153,10 @@ pub const Protocol = @import("protocol.zig");
 /// 2.28.0 - Workspaces keep an order on the host (`ws reorder`, workspaces/order), and
 ///          a new one goes after the one it was made from (`ws new --after`, or the
 ///          current pane's); `ws resize` sets a split's ratio
-pub const version = "2.28.0";
+/// 2.29.0 - `clauntty tab`, `forward` and `open` go to the session the app shows first,
+///          as `show` does, so they arrive from a pane the app isn't attached to; `tab`
+///          says which pane (`open;<port>;<pane>`)
+pub const version = "2.29.0";
 
 /// `-a`'s exit code when the session doesn't exist (it ended)
 pub const no_session_exit: u8 = 3;

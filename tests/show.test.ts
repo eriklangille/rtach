@@ -5,7 +5,7 @@ import { join } from "path";
 import { RTACH_BIN, cleanupAll, trackProcess, waitForOutput } from "./helpers";
 
 /**
- * `clauntty show` (src/cli.zig)
+ * `clauntty show` (src/cli.zig), and `tab`, `forward` and `open`, which go the same way
  *
  * Each image gets an inbox entry (~/.clauntty/inbox/<id>: its path, then the pane that
  * sent it) and an `image;<id>;<pane>;<path>` command. The command goes to the session
@@ -112,6 +112,22 @@ describe("clauntty show", () => {
     client.stdin.write(`${clauntty()} show ${image}\n`);
     await waitForOutput(client, "Sent 1 image to Clauntty", 3000);
     expect(inbox()).toEqual([`${image}\n${id}`]);
+  });
+
+  test("tab, forward and open go to the session the app shows too; tab says which pane", async () => {
+    const log = await app();
+    const client = await session();
+    client.stdin.write(`${clauntty()} tab 8000 && ${clauntty()} forward :8001 && ${clauntty()} open http://localhost:8002/x\n`);
+    await waitForOutput(client, "Port 8001 forwarded", 3000);
+
+    expect(await lines(log, 3)).toEqual([`open;8000;${id}`, "forward;8001", "browser;http://localhost:8002/x"]);
+  });
+
+  test("tab outside rtach: no pane", async () => {
+    const log = await app();
+    const r = spawnSync([clauntty(), "tab", "8000"], { env: env() });
+    expect(r.stdout.toString()).toContain("Opened port 8000");
+    expect(await lines(log, 1)).toEqual(["open;8000;"]);
   });
 
   test("nowhere to send it: queued in the inbox", () => {
