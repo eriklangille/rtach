@@ -57,6 +57,20 @@ A pane is an ordinary session. `~/.clauntty/workspaces/<id>.json` groups panes: 
 
 Besides the single active pointer (the device in use), each device has one: when a client with a client id claims active, its master writes `~/.clauntty/devices/<id in hex>` with its command FIFO, and clears it when that client leaves (unless another of its clients is still attached there). `cli.notify` (workspace changes from `ws`, agents' state from masters) writes `@<id>;<kind>;<value>` to each device's FIFO, and that master gives it to that device's client only (`sendCommandToDevice`); a FIFO nobody reads drops its pointer. A `workspace;<ws>/<pane>` (show the new pane) also goes the old way, to the device in use only; the others get `workspace;` (refresh). Without device pointers, the old way alone. Tests: `tests/devices.test.ts`.
 
+### Modes restored on attach (`src/term_modes.zig`)
+
+The replay is the last 16KB (none on the alternate screen), so state a program set at startup is
+before the cut. `TermModes` follows the raw PTY output and the master sends a new client
+`restoreSequence` after the replay: DEC flags (DECCKM, ?1004, ?2004, ?2031), mouse event and
+format, autowrap, cursor visibility, the keypad mode (`ESC =`), xterm's key modifier options
+(`ESC [ > 4 ; 2 m`, modifyOtherKeys), the cursor style (DECSCUSR) and the kitty keyboard flags.
+Claude Code pushes kitty flags (`ESC [ > 5 u`) and sets modifyOtherKeys at startup, on the normal
+screen; without them back, the terminal sent the older key encodings after a reattach. Kitty flags
+are a stack per screen, as in Ghostty: on the alternate screen the main screen's go out before the
+`?1049h`. RIS (`ESC c`) resets everything. They carry through a live upgrade (`upgrade.State`). Not
+tracked: the scroll region and origin mode (size-dependent), colors, charsets. Tests: unit tests in
+`term_modes.zig`, `tests/functional.test.ts` ("restores terminal modes"), `tests/upgrade.test.ts`.
+
 ### Ready after an attach
 
 A client that attaches with ATTACH_FLAG_READY (the app's proxy, `rtach --proxy --ready`; the handshake has HANDSHAKE_FLAG_READY) gets `ready` (response 8, empty) when the screen is ready to show. A shell's comes right after the replay. A program on the alternate screen gets no replay and only redraws on a real size change (Node ignores a SIGWINCH at the same size), so unless the attach changed the size, the master nudges (`startNudge`): the PTY one row short of `winsize` until the program's next output (outside a synchronized frame, `TermModes.sync_frame`), or NUDGE_TIMEOUT_NS on the idle tick, then back, then `ready`. That client doesn't get the program's output meanwhile (the short redraw); after `ready` comes the redraw at the real size. A real size change meanwhile ends the nudge. A program busy writing anyway (a spinner) can write before it reads the change, which ends the nudge early. Tests: `tests/ready.test.ts`.

@@ -592,6 +592,12 @@ pub const Master = struct {
             self.modes.flags.mask = @truncate(state.mode_flags);
             self.modes.mouse_event = state.mouse_event;
             self.modes.mouse_format = state.mouse_format;
+            self.modes.autowrap = state.autowrap;
+            self.modes.keypad_app = state.keypad_app;
+            self.modes.kitty_main = .{ .flags = state.kitty_main, .idx = @truncate(state.kitty_main_idx) };
+            self.modes.kitty_alt = .{ .flags = state.kitty_alt, .idx = @truncate(state.kitty_alt_idx) };
+            self.modes.modify_keys = state.modify_keys;
+            self.modes.cursor_style = state.cursor_style;
             const title_len = @min(state.title.len, self.terminal_title.len);
             @memcpy(self.terminal_title[0..title_len], state.title[0..title_len]);
             self.terminal_title_len = @intCast(title_len);
@@ -1394,6 +1400,14 @@ pub const Master = struct {
             .mode_flags = @intCast(self.modes.flags.mask),
             .mouse_event = self.modes.mouse_event,
             .mouse_format = self.modes.mouse_format,
+            .autowrap = self.modes.autowrap,
+            .keypad_app = self.modes.keypad_app,
+            .kitty_main = self.modes.kitty_main.flags,
+            .kitty_main_idx = self.modes.kitty_main.idx,
+            .kitty_alt = self.modes.kitty_alt.flags,
+            .kitty_alt_idx = self.modes.kitty_alt.idx,
+            .modify_keys = self.modes.modify_keys,
+            .cursor_style = self.modes.cursor_style,
             .title = self.terminal_title[0..self.terminal_title_len],
             .fg = pane.fgName(),
             .cwd = pane.cwdPath(),
@@ -1972,6 +1986,11 @@ pub const Master = struct {
                     // the following TUI content correctly. Without this, the client's
                     // terminal emulator thinks it's on the normal screen and scrolling
                     // behaves incorrectly (e.g., shows "@" artifacts in Claude Code).
+                    // The main screen's keyboard flags first: Ghostty keeps them per
+                    // screen, and they're back when the program leaves this one
+                    var main_buf: [TermModes.KittyStack.max_restore_len]u8 = undefined;
+                    const main = self.modes.mainScreenRestore(&main_buf);
+                    if (main.len > 0) writeFramed(self.clients.items[idx].fd, .terminal_data, main);
                     writeFramed(self.clients.items[idx].fd, .terminal_data, "\x1b[?1049h");
                     log.debug("sent alternate screen switch", .{});
                     self.restoreModes(idx);

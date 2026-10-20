@@ -1698,4 +1698,54 @@ describe("rtach restores terminal modes on attach", () => {
     expect(text).not.toContain("TUI"); // no replay in the alternate screen
     expect(text).toBe("\x1b[?1049h\x1b[?2004h\x1b[?1003h\x1b[?1006h\x1b[?25l");
   });
+
+  /** Start `script`, attach a framed client, and return the terminal data it gets */
+  async function attachedOutput(script: string): Promise<string> {
+    const socketPath = uniqueSocketPath();
+    const path = `${socketPath}.sh`;
+    await Bun.write(path, script);
+    chmodSync(path, 0o755);
+    await startDetachedMaster(socketPath, path);
+    await Bun.sleep(500);
+
+    const client = connectClient(socketPath, { noDetachChar: true, proxyMode: true });
+    const readerState = getBinaryReader(client);
+    expect(await readFrame(readerState, 5000)).not.toBeNull(); // handshake
+    client.stdin!.write(Buffer.from([MessageType.UPGRADE, 0]));
+    client.stdin!.flush();
+    let data = Buffer.alloc(0);
+    const deadline = Date.now() + 1000;
+    while (Date.now() < deadline) {
+      const frame = await readFrame(readerState, 200);
+      if (frame && (frame.type & ~COMPRESSION_FLAG) === ResponseType.TERMINAL_DATA) {
+        data = Buffer.concat([data, frame.payload]);
+      }
+    }
+    client.kill(9);
+    await client.exited;
+    unlinkSync(path);
+    return data.toString("latin1");
+  }
+
+  test("a program's keyboard modes from before the replay come back after it", async () => {
+    // Claude Code sets these once at startup, on the normal screen; after more than the
+    // replay's 16KB they were gone, and the terminal sent the older key encodings
+    const text = await attachedOutput(
+      "#!/bin/sh\nprintf '\\033[?2004h\\033[?1004h\\033[?2031h\\033[>5u\\033[>4;2m'\n" +
+        "i=0; while [ $i -lt 400 ]; do echo \"line $i of filler past the replay's sixteen kilobytes\"; i=$((i+1)); done\n" +
+        "exec sleep 30\n",
+    );
+    expect(text).toContain("line 399");
+    expect(text).not.toContain("line 0 "); // cut: the startup isn't in the replay
+    expect(text.endsWith("\x1b[?1004h\x1b[?2004h\x1b[?2031h\x1b[>4;2m\x1b[>5u")).toBe(true);
+  });
+
+  test("on the alternate screen, the main screen's keyboard flags go first", async () => {
+    // Ghostty keeps kitty flags per screen: the main screen's come back when the
+    // program leaves the alternate one
+    const text = await attachedOutput(
+      "#!/bin/sh\nprintf '\\033[>5u\\033[?1049h\\033[>1u\\033=TUI'\nexec sleep 30\n",
+    );
+    expect(text).toBe("\x1b[>5u\x1b[?1049h\x1b=\x1b[>1u");
+  });
 });

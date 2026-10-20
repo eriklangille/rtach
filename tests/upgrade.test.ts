@@ -113,6 +113,24 @@ describe("live upgrade", () => {
     expect(state().agent).toBe("claude");
   });
 
+  test("keyboard modes carry over", async () => {
+    startMaster();
+    const before = await attach();
+    // Set Claude Code's keyboard modes, then push them out of the replay
+    before.stdin!.write("printf '\\033[>5u\\033[>4;2m'; yes filler | head -c 20000\r");
+    before.stdin!.flush();
+    await Bun.sleep(800);
+    const pid = masterPid();
+    send(`upgrade;${next}`);
+    expect(await until(() => command(pid).includes("--resume"))).toBe(true);
+    await Bun.sleep(300);
+
+    // A new client gets them back from the new master
+    const after = trackProcess(spawn([RTACH_BIN, "-a", sock, "-E"], { env: env(), stdin: "pipe", stdout: "pipe", stderr: "pipe" }));
+    const out = await waitForOutput(after, "\x1b[>5u", 3000);
+    expect(out).toContain("\x1b[>4;2m\x1b[>5u");
+  });
+
   test("an upgrade that can't happen leaves the master as it was", async () => {
     startMaster();
     const client = await attach();

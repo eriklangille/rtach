@@ -14,6 +14,7 @@
 const std = @import("std");
 const posix = std.posix;
 const sys = @import("sys.zig");
+const TermModes = @import("term_modes.zig").TermModes;
 const version = @import("main.zig").version;
 
 const log = std.log.scoped(.upgrade);
@@ -37,6 +38,15 @@ pub const State = struct {
     mode_flags: u8 = 0,
     mouse_event: ?u16 = null,
     mouse_format: ?u16 = null,
+    autowrap: bool = true,
+    keypad_app: bool = false,
+    /// Each screen's kitty keyboard flags (`TermModes.KittyStack`)
+    kitty_main: [8]u8 = @splat(0),
+    kitty_main_idx: u8 = 0,
+    kitty_alt: [8]u8 = @splat(0),
+    kitty_alt_idx: u8 = 0,
+    modify_keys: ?TermModes.ModifyKeys = null,
+    cursor_style: u8 = 0,
     title: []const u8 = "",
     fg: []const u8 = "",
     cwd: []const u8 = "",

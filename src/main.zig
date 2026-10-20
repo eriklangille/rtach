@@ -165,7 +165,11 @@ pub const Protocol = @import("protocol.zig");
 ///          session, and cli.notify goes to each, addressed (`@<id>;...`). Only the
 ///          single active pointer was told before, so a reorder on the phone didn't
 ///          reach the laptop. Showing a new pane stays with the device in use.
-pub const version = "2.31.0";
+/// 2.31.1 - A reattach restores the keyboard modes a program set before the replay's cut:
+///          the kitty keyboard flags (per screen), modifyOtherKeys, the keypad mode, plus
+///          color scheme reports, autowrap and the cursor style. Claude Code sets them at
+///          startup, so after a reattach the terminal sent the older key encodings.
+pub const version = "2.31.1";
 
 /// `-a`'s exit code when the session doesn't exist (it ended)
 pub const no_session_exit: u8 = 3;

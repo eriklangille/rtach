@@ -25,9 +25,9 @@ const Row = struct {
 
 /// Puts the outer terminal back after a pane: programs leave their modes on when the
 /// client detaches (alternate screen, mouse reporting, bracketed paste, keyboard modes)
-const reset_modes = "\x1b[?1049l\x1b[?1l\x1b>\x1b[?1004l\x1b[?2004l" ++
+const reset_modes = "\x1b[?1049l\x1b[?1l\x1b>\x1b[?1004l\x1b[?2004l\x1b[?2031l\x1b[?7h" ++
     "\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l" ++
-    "\x1b[<99u\x1b[0m\x1b[?25h";
+    "\x1b[<99u\x1b[>4m\x1b[0 q\x1b[0m\x1b[?25h";
 
 pub const Picker = struct {
     allocator: std.mem.Allocator,
