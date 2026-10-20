@@ -8,6 +8,9 @@
 //!   {"id":"3f9a1c2e","name":"clauntty","cwd":"/src/clauntty","tabs":[
 //!     {"id":"9b2c41d0","name":"1","layout":{"split":"h","ratio":0.5,"a":"<pane>","b":"<pane>"}}]}
 //!
+//! workspaces/order lists the ids in the order the user put them (`reorder`); ones
+//! it doesn't have follow, oldest first.
+//!
 //! Every change happens under one flock on workspaces/.lock and replaces files by
 //! rename, so the app and the desktop can both edit. A session in no workspace is a
 //! plain tab. Removing a tab's last pane removes the tab, and a workspace's last tab
@@ -81,6 +84,21 @@ pub const Layout = union(enum) {
                 return self;
             },
         }
+    }
+
+    /// The split between `pane` and `other` (the smallest holding both) gives `pane`'s
+    /// side `ratio` of the space, kept between 0.1 and 0.9. False if there's no such split.
+    fn resize(self: Layout, pane: []const u8, other: []const u8, ratio: f64) bool {
+        const s = switch (self) {
+            .pane => return false,
+            .split => |s| s,
+        };
+        const pane_first = s.a.contains(pane);
+        const other_first = s.a.contains(other);
+        if (pane_first == other_first) return (if (pane_first) s.a else s.b).resize(pane, other, ratio);
+        if (!(if (pane_first) s.b.contains(other) else s.b.contains(pane))) return false;
+        s.ratio = std.math.clamp(if (pane_first) ratio else 1 - ratio, 0.1, 0.9);
+        return true;
     }
 
     /// The layout without `pane`, its sibling taking its place. Null if nothing's left.
@@ -215,6 +233,26 @@ fn stringField(o: std.json.ObjectMap, key: []const u8) ?[]const u8 {
 
 // MARK: Store
 
+/// In `order`'s order; ones it doesn't have after, oldest first (ids sort by
+/// creation, see newId)
+fn sortWorkspaces(workspaces: []Workspace, order: []const []const u8) void {
+    std.mem.sort(Workspace, workspaces, order, struct {
+        fn rank(ids: []const []const u8, id: []const u8) usize {
+            for (ids, 0..) |other, i| {
+                if (std.mem.eql(u8, other, id)) return i;
+            }
+            return ids.len;
+        }
+
+        fn lessThan(ids: []const []const u8, a: Workspace, b: Workspace) bool {
+            const ra = rank(ids, a.id);
+            const rb = rank(ids, b.id);
+            if (ra != rb) return ra < rb;
+            return std.mem.order(u8, a.id, b.id) == .lt;
+        }
+    }.lessThan);
+}
+
 /// All workspaces, loaded and saved under the lock
 const Store = struct {
     arena: Allocator,
@@ -251,27 +289,28 @@ const Store = struct {
             try self.workspaces.append(self.arena, ws);
             try self.loaded_ids.append(self.arena, ws.id);
         }
-        // Oldest first: ids sort by creation (see newId)
-        std.mem.sort(Workspace, self.workspaces.items, {}, struct {
-            fn lessThan(_: void, a: Workspace, b: Workspace) bool {
-                return std.mem.order(u8, a.id, b.id) == .lt;
-            }
-        }.lessThan);
+        sortWorkspaces(self.workspaces.items, self.readOrder());
     }
 
-    /// Write every workspace, and delete the files of removed ones
+    /// The order file's ids; none if it's missing or unreadable
+    fn readOrder(self: *Store) []const []const u8 {
+        const path = std.fmt.allocPrint(self.arena, "{s}/order", .{self.dir}) catch return &.{};
+        const data = std.Io.Dir.cwd().readFileAlloc(self.io, path, self.arena, .limited(1024 * 1024)) catch return &.{};
+        return std.json.parseFromSliceLeaky([]const []const u8, self.arena, data, .{}) catch &.{};
+    }
+
+    /// Write every workspace and the order, and delete the files of removed ones
     fn save(self: *Store) !void {
-        const cwd = std.Io.Dir.cwd();
         for (self.workspaces.items) |ws| {
             const path = try std.fmt.allocPrint(self.arena, "{s}/{s}.json", .{ self.dir, ws.id });
-            const tmp = try std.fmt.allocPrint(self.arena, "{s}.{d}.tmp", .{ path, std.c.getpid() });
-            const data = try std.json.Stringify.valueAlloc(self.arena, ws, .{ .whitespace = .indent_2 });
-            try cwd.writeFile(self.io, .{ .sub_path = tmp, .data = data, .flags = .{ .permissions = .fromMode(0o600) } });
-            cwd.rename(tmp, cwd, path, self.io) catch |err| {
-                cwd.deleteFile(self.io, tmp) catch {};
-                return err;
-            };
+            try self.replace(path, try std.json.Stringify.valueAlloc(self.arena, ws, .{ .whitespace = .indent_2 }));
         }
+        var ids: std.ArrayList([]const u8) = .empty;
+        for (self.workspaces.items) |ws| try ids.append(self.arena, ws.id);
+        const order = try std.fmt.allocPrint(self.arena, "{s}/order", .{self.dir});
+        try self.replace(order, try std.json.Stringify.valueAlloc(self.arena, ids.items, .{}));
+
+        const cwd = std.Io.Dir.cwd();
         for (self.loaded_ids.items) |id| {
             if (self.find(id) != null) continue;
             const path = try std.fmt.allocPrint(self.arena, "{s}/{s}.json", .{ self.dir, id });
@@ -279,9 +318,25 @@ const Store = struct {
         }
     }
 
+    /// Write `path` through a temp file and a rename
+    fn replace(self: *Store, path: []const u8, data: []const u8) !void {
+        const cwd = std.Io.Dir.cwd();
+        const tmp = try std.fmt.allocPrint(self.arena, "{s}.{d}.tmp", .{ path, std.c.getpid() });
+        try cwd.writeFile(self.io, .{ .sub_path = tmp, .data = data, .flags = .{ .permissions = .fromMode(0o600) } });
+        cwd.rename(tmp, cwd, path, self.io) catch |err| {
+            cwd.deleteFile(self.io, tmp) catch {};
+            return err;
+        };
+    }
+
     fn find(self: *Store, id: []const u8) ?*Workspace {
-        for (self.workspaces.items) |*ws| {
-            if (std.mem.eql(u8, ws.id, id)) return ws;
+        const i = self.indexOf(id) orelse return null;
+        return &self.workspaces.items[i];
+    }
+
+    fn indexOf(self: *Store, id: []const u8) ?usize {
+        for (self.workspaces.items, 0..) |ws, i| {
+            if (std.mem.eql(u8, ws.id, id)) return i;
         }
         return null;
     }
@@ -495,8 +550,11 @@ const usage =
     \\Clauntty app shows on this machine.
     \\
     \\Commands:
-    \\  new [NAME] [--cwd DIR]      New workspace with one tab and pane. DIR defaults
-    \\                              to the git root above the current directory.
+    \\  new [NAME] [--cwd DIR] [--after WS]
+    \\                              New workspace with one tab and pane. DIR defaults
+    \\                              to the git root above the current directory. It
+    \\                              goes after WS, else after the current pane's
+    \\                              workspace, else last.
     \\  tab [WS] [--name NAME]      New tab with one pane (WS: the current one)
     \\  split [PANE] [-h|-v]        New pane next to PANE (-h side by side, default;
     \\                              -v stacked)
@@ -507,6 +565,9 @@ const usage =
     \\  add SESSION...              Make each existing session a one-pane workspace
     \\  move PANE TAB               Move PANE into TAB, next to its last pane
     \\  rename ID NAME              Rename a workspace or tab
+    \\  reorder WS [--before OTHER] Move a workspace before OTHER, or last
+    \\  resize PANE OTHER RATIO     The split between two panes of a tab gives PANE's
+    \\                              side RATIO of the space (0.1 to 0.9)
     \\  list [--json]               Workspaces, tabs and panes
     \\
     \\Changes print the new or affected ids as JSON, and tell the Clauntty app,
@@ -626,6 +687,10 @@ fn dispatch(ctx: *Context, command: []const u8, rest: []const []const u8) !void 
         cmdMove(ctx, rest)
     else if (eql(u8, command, "rename"))
         cmdRename(ctx, rest)
+    else if (eql(u8, command, "reorder"))
+        cmdReorder(ctx, rest)
+    else if (eql(u8, command, "resize"))
+        cmdResize(ctx, rest)
     else if (eql(u8, command, "list") or eql(u8, command, "ls"))
         cmdList(ctx, rest)
     else
@@ -641,6 +706,7 @@ pub fn errorText(err: anyerror) []const u8 {
         error.NoSuchId => "no workspace or tab with that id",
         error.NotASession => "no session answers with that id",
         error.AlreadyInWorkspace => "that session is already in a workspace",
+        error.NotSplit => "no split between those panes",
         error.PaneDidntStart => "the new pane's session didn't start",
         error.NoShellIntegration => "-- CMD needs bash, zsh or fish as $SHELL",
         error.Usage => "wrong arguments (see rtach ws)",
@@ -667,6 +733,8 @@ const Parsed = struct {
     positional: std.ArrayList([]const u8) = .empty,
     name: ?[]const u8 = null,
     cwd: ?[]const u8 = null,
+    after: ?[]const u8 = null,
+    before: ?[]const u8 = null,
     dir: Dir = .h,
     json: bool = false,
     /// After `--`: a command to type in the new pane
@@ -678,10 +746,20 @@ fn parse(arena: Allocator, args: []const []const u8) !Parsed {
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
-        if (std.mem.eql(u8, arg, "--name") or std.mem.eql(u8, arg, "--cwd")) {
+        const option: ?*?[]const u8 = if (std.mem.eql(u8, arg, "--name"))
+            &p.name
+        else if (std.mem.eql(u8, arg, "--cwd"))
+            &p.cwd
+        else if (std.mem.eql(u8, arg, "--after"))
+            &p.after
+        else if (std.mem.eql(u8, arg, "--before"))
+            &p.before
+        else
+            null;
+        if (option) |field| {
             i += 1;
             if (i >= args.len) return error.Usage;
-            if (arg[2] == 'n') p.name = args[i] else p.cwd = args[i];
+            field.* = args[i];
         } else if (std.mem.eql(u8, arg, "-h")) {
             p.dir = .h;
         } else if (std.mem.eql(u8, arg, "-v")) {
@@ -722,7 +800,13 @@ fn cmdNew(ctx: *Context, args: []const []const u8) !void {
     var ws: Workspace = .{ .id = try newId(ctx.io, ctx.arena), .name = name, .cwd = dir, .tabs = .empty };
     const tab: Tab = .{ .id = try newId(ctx.io, ctx.arena), .name = "1", .layout = .{ .pane = pane } };
     try ws.tabs.append(ctx.arena, tab);
-    try store.workspaces.append(ctx.arena, ws);
+    // Right after the workspace it's made from: --after's, else the current pane's
+    const from = p.after orelse if (sys.getenv("RTACH_SESSION_ID")) |current|
+        if (store.workspaceOf(current)) |w| w.id else null
+    else
+        null;
+    const index = if (from) |id| if (store.indexOf(id)) |i| i + 1 else null else null;
+    try store.workspaces.insert(ctx.arena, index orelse store.workspaces.items.len, ws);
     try store.save();
     ctx.json(.{ .workspace = ws.id, .tab = tab.id, .pane = pane });
     ctx.notify(ws.id, pane);
@@ -912,6 +996,37 @@ fn cmdRename(ctx: *Context, args: []const []const u8) !void {
     return error.NoSuchId;
 }
 
+fn cmdReorder(ctx: *Context, args: []const []const u8) !void {
+    const p = try parse(ctx.arena, args);
+    if (p.positional.items.len != 1) return error.Usage;
+    const id = p.positional.items[0];
+    var store = try Store.open(ctx.arena, ctx.io, ctx.home);
+    defer store.close();
+    const ws = store.workspaces.orderedRemove(store.indexOf(id) orelse return error.NoSuchWorkspace);
+    const index = if (p.before) |other| store.indexOf(other) orelse return error.NoSuchWorkspace else store.workspaces.items.len;
+    try store.workspaces.insert(ctx.arena, index, ws);
+    try store.save();
+    ctx.json(.{ .reordered = id });
+    ctx.notify(null, null);
+}
+
+fn cmdResize(ctx: *Context, args: []const []const u8) !void {
+    const p = try parse(ctx.arena, args);
+    if (p.positional.items.len != 3) return error.Usage;
+    const pane = p.positional.items[0];
+    const other = p.positional.items[1];
+    const ratio = std.fmt.parseFloat(f64, p.positional.items[2]) catch return error.Usage;
+    if (!(ratio > 0 and ratio < 1)) return error.Usage;
+    var store = try Store.open(ctx.arena, ctx.io, ctx.home);
+    defer store.close();
+    const ws = store.workspaceOf(pane) orelse return error.NotInWorkspace;
+    const tab = ws.tabOf(pane).?;
+    if (!tab.layout.resize(pane, other, ratio)) return error.NotSplit;
+    try store.save();
+    ctx.json(.{ .workspace = ws.id, .tab = tab.id });
+    ctx.notify(null, null);
+}
+
 pub const PaneInfo = struct {
     id: []const u8,
     title: ?[]const u8,
@@ -1051,4 +1166,40 @@ test "removing a tab's last pane removes the tab" {
     ws.removePane("A");
     try testing.expectEqual(@as(usize, 1), ws.tabs.items.len);
     try testing.expectEqualStrings("t2", ws.tabs.items[0].id);
+}
+
+test "resize sets the split between two panes, from the first one's side" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const layout = try testLayout(arena,
+        \\{"split":"h","ratio":0.5,"a":{"split":"h","ratio":0.5,"a":"A","b":"B"},"b":{"split":"v","ratio":0.5,"a":"C","b":"D"}}
+    );
+    try testing.expect(layout.resize("B", "C", 0.25));
+    try testing.expect(layout.resize("D", "C", 0.75));
+    try testing.expect(layout.resize("A", "B", 0.6));
+    try testing.expectEqualStrings(
+        \\{"split":"h","ratio":0.25,"a":{"split":"h","ratio":0.6,"a":"A","b":"B"},"b":{"split":"v","ratio":0.25,"a":"C","b":"D"}}
+    , try layoutJson(arena, layout));
+    try testing.expect(!layout.resize("A", "A", 0.5));
+    try testing.expect(!layout.resize("A", "X", 0.5));
+}
+
+test "workspaces sort by the order file, the rest after it oldest first" {
+    var workspaces = [_]Workspace{
+        .{ .id = "3", .name = "", .cwd = "", .tabs = .empty },
+        .{ .id = "1", .name = "", .cwd = "", .tabs = .empty },
+        .{ .id = "4", .name = "", .cwd = "", .tabs = .empty },
+        .{ .id = "2", .name = "", .cwd = "", .tabs = .empty },
+    };
+    // "9" is gone
+    sortWorkspaces(&workspaces, &.{ "4", "9", "2" });
+    var ids: [4][]const u8 = undefined;
+    for (workspaces, 0..) |ws, i| ids[i] = ws.id;
+    try testing.expectEqualDeep([_][]const u8{ "4", "2", "1", "3" }, ids);
+
+    sortWorkspaces(&workspaces, &.{});
+    for (workspaces, 0..) |ws, i| ids[i] = ws.id;
+    try testing.expectEqualDeep([_][]const u8{ "1", "2", "3", "4" }, ids);
 }

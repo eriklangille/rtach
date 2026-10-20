@@ -257,6 +257,51 @@ describe("rtach ws", () => {
     expect(after.tabs.map((t) => t.name)).toEqual(["1", "logs"]);
   });
 
+  test("reorder keeps an order on the host; new goes after the workspace it came from", () => {
+    const { workspace: w1, pane: a } = wsJson(["new", "one", "--cwd", project]);
+    const { workspace: w2 } = wsJson(["new", "two", "--cwd", project]);
+    const { workspace: w3 } = wsJson(["new", "three", "--cwd", project]);
+    const order = () => list().map((w) => w.id);
+    expect(order()).toEqual([w1, w2, w3]);
+
+    expect(wsJson(["reorder", w3, "--before", w1])).toEqual({ reordered: w3 });
+    expect(order()).toEqual([w3, w1, w2]);
+    wsJson(["reorder", w3]);
+    expect(order()).toEqual([w1, w2, w3]);
+
+    // From a pane: after its workspace; --after: after that one
+    const { workspace: w4 } = wsJson(["new", "four", "--cwd", project], { env: { RTACH_SESSION_ID: a } });
+    expect(order()).toEqual([w1, w4, w2, w3]);
+    const { workspace: w5 } = wsJson(["new", "five", "--cwd", project, "--after", w2]);
+    expect(order()).toEqual([w1, w4, w2, w5, w3]);
+    // A workspace that's gone: last
+    const { workspace: w6 } = wsJson(["new", "six", "--cwd", project, "--after", "gone"]);
+    expect(order()).toEqual([w1, w4, w2, w5, w3, w6]);
+
+    // Ended workspaces leave the order; ones it doesn't have (an older rtach made
+    // them) go after it
+    wsJson(["end", w4]);
+    writeFileSync(join(home, ".clauntty/workspaces/order"), JSON.stringify([w3, w1, w5, w2]));
+    expect(order()).toEqual([w3, w1, w5, w2, w6]);
+    expect(() => ws(["reorder", "gone"])).toThrow("no such workspace");
+  });
+
+  test("resize sets the ratio of the split between two panes", () => {
+    const { pane: a } = wsJson(["new", "proj", "--cwd", project]);
+    const { pane: b } = wsJson(["split", a]);
+    const { pane: c } = wsJson(["split", b, "-v"]);
+
+    wsJson(["resize", a, b, "0.3"]);
+    wsJson(["resize", c, b, "0.75"]);
+    expect(list()[0].tabs[0].layout).toEqual({ split: "h", ratio: 0.3, a, b: { split: "v", ratio: 0.25, a: b, b: c } });
+    // Kept between 0.1 and 0.9
+    wsJson(["resize", b, a, "0.99"]);
+    expect((list()[0].tabs[0].layout as any).ratio).toBe(0.1);
+
+    expect(() => ws(["resize", a, a, "0.5"])).toThrow("no split between those panes");
+    expect(() => ws(["resize", a, b, "2"])).toThrow("wrong arguments");
+  });
+
   test("changes tell the app; --quiet doesn't", async () => {
     // Stand in for the app: the active pointer names a pipe we read
     const fifo = join(home, "app.cmd");

@@ -150,7 +150,10 @@ pub const Protocol = @import("protocol.zig");
 /// 2.27.0 - A terminal client stays in its session through a live upgrade: when the
 ///          connection closes without `ended`, it reattaches, asking (ATTACH_FLAG_RESUME)
 ///          for only what the new master wrote since it took over
-pub const version = "2.27.0";
+/// 2.28.0 - Workspaces keep an order on the host (`ws reorder`, workspaces/order), and
+///          a new one goes after the one it was made from (`ws new --after`, or the
+///          current pane's); `ws resize` sets a split's ratio
+pub const version = "2.28.0";
 
 /// `-a`'s exit code when the session doesn't exist (it ended)
 pub const no_session_exit: u8 = 3;
