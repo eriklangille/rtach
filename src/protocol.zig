@@ -62,6 +62,10 @@ pub const ResponseType = enum(u8) {
     /// The PTY's size and whether it's this client's (PtySize). Only to clients that
     /// sent want_size: older clients don't skip unknown types.
     pty_size = 7,
+    /// After an attach, the screen is ready to show: after the replay, or for a program
+    /// on the alternate screen, from here on comes its redraw at the real size (see
+    /// Master.startNudge). Empty. Only to clients that attached with ATTACH_FLAG_READY.
+    ready = 8,
 };
 
 /// Response header size (type: 1 byte + len: 4 bytes)
@@ -142,11 +146,17 @@ pub const HistoryPageMeta = struct {
 /// everything up to it. Instead of the usual replay, it gets only what the new master
 /// wrote since it took over (nothing from a master that wasn't upgraded), and no modes.
 pub const ATTACH_FLAG_RESUME: u8 = 1 << 0;
+/// Attach flag: send `ready` when the screen is ready to show. A program on the
+/// alternate screen gets no replay, so the master makes it redraw (a nudge) and holds
+/// its output from this client until then.
+pub const ATTACH_FLAG_READY: u8 = 1 << 1;
 
 /// Handshake flag: the master supports request_history
 pub const HANDSHAKE_FLAG_HISTORY: u16 = 1 << 0;
 /// Handshake flag: the master answers want_size
 pub const HANDSHAKE_FLAG_PTY_SIZE: u16 = 1 << 1;
+/// Handshake flag: the master sends `ready` to clients that attach with ATTACH_FLAG_READY
+pub const HANDSHAKE_FLAG_READY: u16 = 1 << 2;
 
 /// pty_size payload: the PTY's size, and whether it's this client's (the client in
 /// use, see Master.pickSizeClient). When it isn't, the output is drawn for another

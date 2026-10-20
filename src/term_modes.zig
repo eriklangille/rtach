@@ -40,6 +40,9 @@ pub const TermModes = struct {
 
     alt_screen: bool = false,
     cursor_visible: bool = true,
+    /// Inside a synchronized update (?2026h, until ?2026l): a frame being drawn. Not
+    /// restored on attach: only says whether a redraw is finished.
+    sync_frame: bool = false,
     /// Bit i set means flag_modes[i] is on
     flags: std.bit_set.IntegerBitSet(flag_modes.len) = .initEmpty(),
     mouse_event: ?u16 = null,
@@ -103,6 +106,7 @@ pub const TermModes = struct {
         switch (mode) {
             1049, 1047, 47 => self.alt_screen = on,
             25 => self.cursor_visible = on,
+            2026 => self.sync_frame = on,
             else => {
                 if (std.mem.indexOfScalar(u16, &mouse_event_modes, mode) != null) {
                     self.mouse_event = if (on) mode else null;

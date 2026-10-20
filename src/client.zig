@@ -18,6 +18,8 @@ pub const ClientOptions = struct {
     redraw_method: RedrawMethod = .none,
     client_id: ?[Protocol.CLIENT_ID_SIZE]u8 = null, // Unique client identifier
     proxy_mode: bool = false,
+    /// Attach with ATTACH_FLAG_READY (the app asks with --ready)
+    want_ready: bool = false,
 };
 
 pub const Client = struct {
@@ -151,7 +153,10 @@ pub const Client = struct {
             _ = try sys.write(self.socket_fd, attach_pkt.serialize());
             return self.sendWindowSize();
         }
-        const attach_pkt = Protocol.Packet.initAttach(client_id_ptr);
+        const attach_pkt = if (self.options.want_ready)
+            Protocol.Packet.initAttachFlags(client_id_ptr, Protocol.ATTACH_FLAG_READY)
+        else
+            Protocol.Packet.initAttach(client_id_ptr);
         _ = try sys.write(self.socket_fd, attach_pkt.serialize());
 
         try self.sendWindowSize();

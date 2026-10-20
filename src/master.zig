@@ -362,6 +362,9 @@ const ClientConn = struct {
     wants_size: bool = false,
     /// The last pty_size sent, so an unchanged one isn't sent again
     sent_size: ?Protocol.PtySize = null,
+    /// Attached with ATTACH_FLAG_READY and hasn't had `ready` yet: the program's output
+    /// meanwhile (its redraw for the nudge's short size) isn't sent to it
+    awaiting_ready: bool = false,
 };
 
 pub const Master = struct {
@@ -447,6 +450,11 @@ pub const Master = struct {
     // attach since the TUI will redraw itself; the other modes are restored on attach
     modes: TermModes = .{},
 
+    /// The repaint nudge (startNudge): the PTY is one row short of `winsize` until the
+    /// program redraws for it, or NUDGE_TIMEOUT_NS passes
+    nudging: bool = false,
+    nudge_started_ns: i128 = 0,
+
     // Idle detection for battery optimization
     // When PTY has no output for IDLE_THRESHOLD_NS, send idle notification to paused clients
     last_pty_write_ns: i128 = 0,
@@ -478,6 +486,8 @@ pub const Master = struct {
 
     const IDLE_THRESHOLD_NS: i128 = 2 * std.time.ns_per_s; // 2 seconds
     const IDLE_CHECK_INTERVAL_MS: u64 = 500; // Check every 500ms
+    /// A program that hasn't redrawn for the nudge by then won't (checked on the idle tick)
+    const NUDGE_TIMEOUT_NS: i128 = 500 * std.time.ns_per_ms;
     const TITLE_WRITE_DEBOUNCE_NS: i128 = 500 * std.time.ns_per_ms; // 500ms
     const PANE_PROBE_INTERVAL_NS: i128 = std.time.ns_per_s;
     const PUSH_REPEAT_NS: i128 = 10 * std.time.ns_per_s;
@@ -1061,7 +1071,8 @@ pub const Master = struct {
         // Paused clients will receive buffered data when they resume
         for (self.clients.items) |client| {
             if (client.pending_remove) continue;
-            if (client.attached and !client.paused) {
+            // Waiting for `ready`: this is the redraw for the nudge's short size
+            if (client.attached and !client.paused and !client.awaiting_ready) {
                 if (client.framed_mode) {
                     // Use compression for PTY output streaming (if client requested it)
                     writeFramedMaybeCompressed(client.fd, .terminal_data, data, client.compression_enabled);
@@ -1071,6 +1082,10 @@ pub const Master = struct {
                 }
             }
         }
+
+        // The program drew for the nudge's short size (a whole synchronized frame, if it
+        // draws in them): it read the change, so the size can go back
+        if (self.nudging and !self.modes.sync_frame) self.finishNudge();
 
         // Re-arm PTY read
         self.pty_stream.read(
@@ -1082,6 +1097,53 @@ pub const Master = struct {
             ptyReadCallback,
         );
         return .disarm;
+    }
+
+    // MARK: Repaint nudge
+
+    /// Make a program on the alternate screen redraw for clients that just attached
+    /// (awaiting_ready): they get no replay, and programs only redraw on a real size
+    /// change (Node ignores a SIGWINCH at the same size). The PTY goes one row short;
+    /// once the program has drawn for that, or NUDGE_TIMEOUT_NS passes (a program that
+    /// doesn't redraw), the size goes back and they get `ready`: what follows is the
+    /// redraw at the real size. Their output meanwhile (the short redraw) isn't sent.
+    /// A program busy writing anyway (a spinner) can write once before it reads the
+    /// change; going back on that output can leave it without a redraw.
+    fn startNudge(self: *Master) void {
+        // The one under way covers this client too
+        if (self.nudging) return;
+        if (self.winsize.rows <= 2) return self.finishNudge();
+        self.signalSize(self.winsize.rows - 1, self.winsize.cols);
+        self.nudging = true;
+        self.nudge_started_ns = self.nowNs();
+        log.info("nudge: {}x{} for a redraw", .{ self.winsize.cols, self.winsize.rows - 1 });
+    }
+
+    /// Put the PTY back at its size, and tell the clients waiting the screen is ready
+    fn finishNudge(self: *Master) void {
+        if (self.nudging) {
+            self.nudging = false;
+            self.signalSize(self.winsize.rows, self.winsize.cols);
+            log.info("nudge: back to {}x{}", .{ self.winsize.cols, self.winsize.rows });
+        }
+        for (self.clients.items) |client| {
+            if (client.awaiting_ready and !client.pending_remove) self.sendReady(client);
+        }
+    }
+
+    fn sendReady(self: *Master, client: *ClientConn) void {
+        _ = self;
+        client.awaiting_ready = false;
+        // Empty: just the header (writeFramed skips empty payloads)
+        const header = Protocol.ResponseHeader{ .type = .ready, .len = 0 };
+        writeAll(client.fd, header.toBytes());
+    }
+
+    /// Set the PTY's size and signal the program, without changing `winsize`
+    fn signalSize(self: *Master, rows: u16, cols: u16) void {
+        const c_ws = posix.winsize{ .row = rows, .col = cols, .xpixel = self.winsize.xpixel, .ypixel = self.winsize.ypixel };
+        _ = std.c.ioctl(self.pty_master, getTIOCSWINSZ(), &c_ws);
+        if (self.child_pid > 0) _ = std.c.kill(-self.child_pid, posix.SIG.WINCH);
     }
 
     fn idleTimerCallback(
@@ -1175,6 +1237,12 @@ pub const Master = struct {
                 log.info("idle detected but no attached clients to notify", .{});
             }
             self.idle_notified = true;
+        }
+
+        // A program that doesn't redraw for the nudge
+        if (self.nudging and now - self.nudge_started_ns >= NUDGE_TIMEOUT_NS) {
+            log.info("nudge: no redraw, going back", .{});
+            self.finishNudge();
         }
 
         // Write title to file if dirty (debounced)
@@ -1291,6 +1359,8 @@ pub const Master = struct {
     /// socket, command pipe and shell (upgrade.zig). Returns only if that didn't happen,
     /// and then this master carries on as it was.
     fn upgradeTo(self: *Master, path: []const u8) void {
+        // Not with the PTY one row short
+        if (self.nudging) self.finishNudge();
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
         const path_z = std.fmt.bufPrintZ(&path_buf, "{s}", .{path}) catch return;
         if (std.c.access(path_z, std.c.X_OK) != 0) {
@@ -1512,6 +1582,14 @@ pub const Master = struct {
         const size_changed = ws.cols != self.winsize.cols or ws.rows != self.winsize.rows;
         const pixels_changed = ws.xpixel != self.winsize.xpixel or ws.ypixel != self.winsize.ypixel;
         if (!size_changed and !pixels_changed) return;
+        // A real size change is a redraw of its own: the nudge is done, at the new size
+        const ends_nudge = self.nudging and size_changed;
+        if (ends_nudge) self.nudging = false;
+        defer if (ends_nudge) {
+            for (self.clients.items) |client| {
+                if (client.awaiting_ready and !client.pending_remove) self.sendReady(client);
+            }
+        };
         self.winsize = ws;
         const c_ws = posix.winsize{
             .row = ws.rows,
@@ -1553,7 +1631,7 @@ pub const Master = struct {
 
     /// Send handshake to client after attach
     fn sendHandshake(client_fd: posix.fd_t) void {
-        const handshake = Protocol.Handshake{ .flags = Protocol.HANDSHAKE_FLAG_HISTORY | Protocol.HANDSHAKE_FLAG_PTY_SIZE };
+        const handshake = Protocol.Handshake{ .flags = Protocol.HANDSHAKE_FLAG_HISTORY | Protocol.HANDSHAKE_FLAG_PTY_SIZE | Protocol.HANDSHAKE_FLAG_READY };
         const header = Protocol.ResponseHeader{
             .type = .handshake,
             .len = Protocol.Handshake.WIRE_SIZE,
@@ -1836,6 +1914,7 @@ pub const Master = struct {
                 // Get client ID from attach packet (if provided)
                 const client_id = pkt.getClientId();
                 const resuming = pkt.getAttachFlags() & Protocol.ATTACH_FLAG_RESUME != 0;
+                const wants_ready = pkt.getAttachFlags() & Protocol.ATTACH_FLAG_READY != 0;
 
                 // If client ID provided, kick any existing connection with same ID
                 if (client_id) |id| {
@@ -1862,8 +1941,11 @@ pub const Master = struct {
                 log.info("client {} attached (client_id: {}, alt_screen: {})", .{ idx, if (client_id != null) @as(u64, @bitCast(client_id.?[0..8].*)) else 0, self.modes.alt_screen });
                 self.clients.items[idx].attached = true;
                 self.clients.items[idx].last_attach_ns = self.nowNs();
+                const size_before = self.winsize;
                 self.updateActiveClient();
                 self.updateSizeClient();
+                // The attach resized the PTY: the program has a real size change to redraw for
+                const resized = size_before.rows != self.winsize.rows or size_before.cols != self.winsize.cols;
 
                 // Handshake already sent on connect, now send scrollback
 
@@ -1915,6 +1997,17 @@ pub const Master = struct {
 
                     // The replay may start after the modes were set
                     self.restoreModes(idx);
+                }
+
+                if (wants_ready) {
+                    const client = self.clients.items[idx];
+                    if (!resuming and self.modes.alt_screen and !resized) {
+                        // No replay, and no size change for the program to redraw for
+                        client.awaiting_ready = true;
+                        self.startNudge();
+                    } else {
+                        self.sendReady(client);
+                    }
                 }
 
                 // Send idle notification if session is already idle

@@ -156,7 +156,11 @@ pub const Protocol = @import("protocol.zig");
 /// 2.29.0 - `clauntty tab`, `forward` and `open` go to the session the app shows first,
 ///          as `show` does, so they arrive from a pane the app isn't attached to; `tab`
 ///          says which pane (`open;<port>;<pane>`)
-pub const version = "2.29.0";
+/// 2.30.0 - `ready` after an attach (`--ready`, ATTACH_FLAG_READY): after the replay,
+///          or for a program on the alternate screen, after the master's own repaint
+///          nudge (one row short until it has drawn, then back), whose short redraw that
+///          client doesn't get. Replaces the app's timing guesses.
+pub const version = "2.30.0";
 
 /// `-a`'s exit code when the session doesn't exist (it ended)
 pub const no_session_exit: u8 = 3;
@@ -205,6 +209,8 @@ const Args = struct {
     scrollback_size: usize = 1024 * 1024, // 1MB default
     client_id: ?[Protocol.CLIENT_ID_SIZE]u8 = null, // Unique client identifier (UUID)
     proxy_mode: bool = false,
+    /// --ready: attach asking for `ready` (ATTACH_FLAG_READY)
+    want_ready: bool = false,
     /// Start the master here even if spawnd could (spawnd's own request)
     no_spawnd: bool = false,
 
@@ -422,6 +428,7 @@ fn attach(allocator: std.mem.Allocator, args: Args) !void {
         .redraw_method = args.redraw_method,
         .client_id = args.client_id,
         .proxy_mode = args.proxy_mode,
+        .want_ready = args.want_ready,
     });
     defer client.deinit();
 
@@ -520,6 +527,8 @@ fn parseArgs(process_args: std.process.Args) !Args {
             result.no_detach_char = true;
         } else if (std.mem.eql(u8, arg, "--proxy")) {
             result.proxy_mode = true;
+        } else if (std.mem.eql(u8, arg, "--ready")) {
+            result.want_ready = true;
         } else if (std.mem.eql(u8, arg, "--no-spawnd")) {
             result.no_spawnd = true;
         } else if (std.mem.eql(u8, arg, "-s")) {
@@ -567,6 +576,7 @@ fn printUsage() void {
         \\  -e CHAR     Set detach character (default: ^\)
         \\  -E          Disable detach character
         \\  --proxy     Proxy mode (forward handshake, wait for client upgrade)
+        \\  --ready     Ask the master for `ready` when the screen is ready to show
         \\  -r METHOD   Redraw method: none, ctrl_l, winch
         \\  -s SIZE     Scrollback buffer size in bytes (default: 1MB)
         \\  -C UUID     Client ID for deduplication
