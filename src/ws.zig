@@ -504,7 +504,8 @@ fn paneAlive(arena: Allocator, home: []const u8, pane: []const u8) bool {
 fn paneTitle(arena: Allocator, io: std.Io, home: []const u8, pane: []const u8) ?[]const u8 {
     const path = std.fmt.allocPrint(arena, "{s}/.clauntty/sessions/{s}.title", .{ home, pane }) catch return null;
     const title = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(4096)) catch return null;
-    return std.mem.trim(u8, title, " \n");
+    // An older master wrote it as it came; JSON needs text
+    return std.mem.trim(u8, @import("pane_state.zig").fixUtf8(title), " \n");
 }
 
 /// A pane's `<socket>.state` (see pane_state.zig), as JSON

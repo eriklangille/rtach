@@ -600,6 +600,7 @@ pub const Master = struct {
             self.modes.cursor_style = state.cursor_style;
             const title_len = @min(state.title.len, self.terminal_title.len);
             @memcpy(self.terminal_title[0..title_len], state.title[0..title_len]);
+            _ = pane_state.fixUtf8(self.terminal_title[0..title_len]);
             self.terminal_title_len = @intCast(title_len);
             self.pane.restore(state.fg, state.cwd, state.agent, state.status, state.note, state.task, state.from_hook);
             self.flushed_status = std.meta.stringToEnum(pane_state.Status, state.flushed_status) orelse .none;
@@ -2478,6 +2479,8 @@ pub const Master = struct {
     fn finishTitle(self: *Master) void {
         if (self.osc_buf_len > 0) {
             @memcpy(self.terminal_title[0..self.osc_buf_len], self.osc_buf[0..self.osc_buf_len]);
+            // Cut at the buffer's end, or sent broken: the .title file and JSON need text
+            _ = pane_state.fixUtf8(self.terminal_title[0..self.osc_buf_len]);
             self.terminal_title_len = self.osc_buf_len;
             self.title_dirty = true;
             log.debug("title set: \"{s}\"", .{self.terminal_title[0..self.terminal_title_len]});

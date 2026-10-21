@@ -193,7 +193,11 @@ pub const Protocol = @import("protocol.zig");
 ///          before its first winch is the client in use: told the size wasn't its own,
 ///          the app never sent one, and the pane stayed "in use on another device".
 ///          The client in use stays the size's owner while it's paused (switched away).
-pub const version = "2.32.3";
+/// 2.32.4 - Titles and pane state are valid UTF-8 (`pane_state.fixUtf8`): a title cut
+///          mid-character or with a stray byte went into `ws list --json` as an array of
+///          numbers, and the app rejected the whole list, so none of the host's
+///          workspaces refreshed.
+pub const version = "2.32.4";
 
 /// `-a`'s exit code when the session doesn't exist (it ended)
 pub const no_session_exit: u8 = 3;

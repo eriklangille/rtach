@@ -111,6 +111,18 @@ describe("pane state", () => {
     expect((await waitForState((s) => s.state === "idle")).task).toBeUndefined();
   });
 
+  test("a title that isn't valid UTF-8 is still a string in the state and ws list", async () => {
+    const client = await start();
+    // A spinner character cut in half, then a stray byte
+    client.stdin.write(`printf '\\033]0;\\342\\240 working \\377\\007'; sleep 5\n`);
+    const s = await waitForState((s) => String(s.title ?? "").includes("working"));
+    expect(s.title).toBe("?? working ?");
+    spawnSync([RTACH_BIN, "ws", "add", id], { env: env() });
+    const list = spawnSync([RTACH_BIN, "ws", "list", "--json"], { env: env() });
+    const pane = JSON.parse(list.stdout.toString()).workspaces[0].tabs[0].panes[0];
+    expect(pane.title).toBe("?? working ?");
+  });
+
   test("outside an rtach session, agent-state does nothing", () => {
     const r = spawnSync([join(home, ".clauntty/bin/clauntty"), "agent-state", "working"], {
       env: { ...env(), RTACH_CMD_PIPE: "" },

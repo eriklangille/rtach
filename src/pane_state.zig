@@ -160,22 +160,22 @@ pub const PaneState = struct {
         try jw.objectField("rtach");
         try jw.write(rtach);
         try jw.objectField("fg");
-        try jw.write(self.fgName());
+        try writeText(&jw, self.fgName());
         try jw.objectField("cwd");
-        try jw.write(self.cwdPath());
+        try writeText(&jw, self.cwdPath());
         try jw.objectField("title");
-        try jw.write(title);
+        try writeText(&jw, title);
         try jw.objectField("agent");
         try jw.write(@tagName(self.agent));
         try jw.objectField("state");
         try jw.write(@tagName(self.status));
         if (self.note_len > 0) {
             try jw.objectField("note");
-            try jw.write(self.noteText());
+            try writeText(&jw, self.noteText());
         }
         if (self.task_len > 0) {
             try jw.objectField("task");
-            try jw.write(self.taskText());
+            try writeText(&jw, self.taskText());
         }
         // This master sends push notifications (2.18.0), so the app doesn't post its own
         try jw.objectField("pushes");
@@ -183,6 +183,35 @@ pub const PaneState = struct {
         try jw.endObject();
     }
 };
+
+/// Make `text` valid UTF-8 in place: a byte that doesn't start a whole, valid
+/// character becomes '?'. Titles and paths are whatever bytes a program sent (a
+/// title cut mid-character, a stray byte); written as they are, JSON writers emit
+/// invalid UTF-8 as an array of numbers, and the app's decoder then rejected the
+/// whole `ws list`, so none of the host's workspaces refreshed.
+pub fn fixUtf8(text: []u8) []u8 {
+    var i: usize = 0;
+    while (i < text.len) {
+        const n = std.unicode.utf8ByteSequenceLength(text[i]) catch 0;
+        const valid = n > 0 and i + n <= text.len and
+            if (std.unicode.utf8Decode(text[i .. i + n])) |_| true else |_| false;
+        if (valid) {
+            i += n;
+        } else {
+            text[i] = '?';
+            i += 1;
+        }
+    }
+    return text;
+}
+
+/// Write `text` as a JSON string, made valid UTF-8 first (see fixUtf8)
+fn writeText(jw: *std.json.Stringify, text: []const u8) !void {
+    var buf: [4096]u8 = undefined;
+    const n = @min(text.len, buf.len);
+    @memcpy(buf[0..n], text[0..n]);
+    try jw.write(fixUtf8(buf[0..n]));
+}
 
 /// The longest task kept (bytes)
 pub const task_max = 120;
@@ -383,4 +412,23 @@ test "probe finds this test's foreground process" {
     var cwd: [1024]u8 = undefined;
     const got = probe(0, &name, &cwd) orelse return error.SkipZigTest;
     try testing.expect(got.name.len > 0);
+}
+
+test "invalid UTF-8 becomes '?', valid text stays" {
+    var cut = "\xe2\xa0 working".*;
+    try testing.expectEqualStrings("?? working", fixUtf8(&cut));
+    var ok = "\xe2\x9c\xb3 Fix it caf\xc3\xa9".*;
+    try testing.expectEqualStrings("\xe2\x9c\xb3 Fix it caf\xc3\xa9", fixUtf8(&ok));
+    var end = "tail \xf0\x9f".*;
+    try testing.expectEqualStrings("tail ??", fixUtf8(&end));
+    var stray = "a\xffb\xc0\xafc".*;
+    try testing.expectEqualStrings("a?b??c", fixUtf8(&stray));
+}
+
+test "state JSON has strings for invalid titles" {
+    var s: PaneState = .{};
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try s.writeJson(&w, "\xe2\xa0 working", "2.32.4");
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "\"title\":\"?? working\"") != null);
 }
