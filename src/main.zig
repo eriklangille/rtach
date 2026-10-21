@@ -181,7 +181,12 @@ pub const Protocol = @import("protocol.zig");
 ///          went to the phone's size, and the laptop's background fetches (resume, then
 ///          pause) flipped it back and forth. A yielded client now takes the size only
 ///          when it's the only client attached.
-pub const version = "2.32.1";
+/// 2.32.2 - A client's input that's only its terminal answering (cursor position, device
+///          attributes, modes, colors, focus in/out) doesn't count as using the pane:
+///          with the phone and the laptop both showing Claude Code, which asks after
+///          each redraw, every answer took the size, and the pane flipped between the
+///          two sizes many times a second.
+pub const version = "2.32.2";
 
 /// `-a`'s exit code when the session doesn't exist (it ended)
 pub const no_session_exit: u8 = 3;

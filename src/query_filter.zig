@@ -219,6 +219,80 @@ pub const QueryFilter = struct {
     }
 };
 
+/// Whether `input` (a client's input) is only its terminal answering: replies to the
+/// queries above (cursor position, device attributes, modes, kitty flags, window
+/// reports, OSC colors, DCS), and focus in/out. The master doesn't count these as the
+/// client using the pane: two terminals showing a program that asks something after
+/// each redraw handed its size back and forth, every answer taking it. Anything else,
+/// including keys, mouse reports or a sequence cut short, counts.
+pub fn onlyReplies(input: []const u8) bool {
+    const ESC = 0x1b;
+    if (input.len == 0) return false;
+    var i: usize = 0;
+    while (i < input.len) {
+        if (input[i] != ESC or i + 1 >= input.len) return false;
+        switch (input[i + 1]) {
+            '[' => {
+                var j = i + 2;
+                while (j < input.len and input[j] >= 0x20 and input[j] <= 0x3f) j += 1;
+                if (j >= input.len or input[j] < 0x40 or input[j] > 0x7e) return false;
+                const params = input[i + 2 .. j];
+                const prefix: u8 = if (params.len > 0 and std.mem.indexOfScalar(u8, "?<=>", params[0]) != null) params[0] else 0;
+                const reply = switch (input[j]) {
+                    'R' => prefix == 0 or prefix == '?', // cursor position
+                    'c' => prefix == '?' or prefix == '>' or prefix == '=', // device attributes
+                    'n' => prefix == 0 or prefix == '?', // status
+                    'y' => std.mem.indexOfScalar(u8, params, '$') != null, // DECRPM
+                    'u' => prefix == '?', // kitty keyboard flags
+                    't' => prefix == 0 and params.len > 0, // window reports
+                    'I', 'O' => params.len == 0, // focus in/out
+                    else => false,
+                };
+                if (!reply) return false;
+                i = j + 1;
+            },
+            // OSC (colors), DCS (DECRQSS, XTGETTCAP, XTVERSION), APC: to BEL or ST
+            ']', 'P', '_' => {
+                var j = i + 2;
+                while (true) : (j += 1) {
+                    if (j >= input.len) return false;
+                    if (input[j] == 0x07 and input[i + 1] == ']') break;
+                    if (input[j] == ESC) {
+                        if (j + 1 >= input.len or input[j + 1] != '\\') return false;
+                        j += 1;
+                        break;
+                    }
+                }
+                i = j + 1;
+            },
+            else => return false,
+        }
+    }
+    return true;
+}
+
+test "terminal replies don't count as using the pane" {
+    try testing.expect(onlyReplies("\x1b[12;5R"));
+    try testing.expect(onlyReplies("\x1b[?62;22c\x1b[>1;10;0c"));
+    try testing.expect(onlyReplies("\x1b[0n\x1b[?2026;2$y\x1b[?5u\x1b[8;48;145t"));
+    try testing.expect(onlyReplies("\x1b[I"));
+    try testing.expect(onlyReplies("\x1b[O\x1b]11;rgb:2828/2c2c/3434\x07"));
+    try testing.expect(onlyReplies("\x1b]10;rgb:ffff/ffff/ffff\x1b\\\x1bP>|ghostty 1.2\x1b\\"));
+}
+
+test "keys, mouse and text count as using the pane" {
+    try testing.expect(!onlyReplies(""));
+    try testing.expect(!onlyReplies("x"));
+    try testing.expect(!onlyReplies("\x1b[12;5Rx"));
+    try testing.expect(!onlyReplies("\x1b[A"));
+    try testing.expect(!onlyReplies("\x1b[13;2u"));
+    try testing.expect(!onlyReplies("\x1b[27;2;13~"));
+    try testing.expect(!onlyReplies("\x1b[<0;10;5M"));
+    try testing.expect(!onlyReplies("\x1b"));
+    try testing.expect(!onlyReplies("\x1b[12;5"));
+    try testing.expect(!onlyReplies("\x1b]11;rgb:0/0/0"));
+}
+
 fn filterAll(input: []const u8, buf: []u8) []u8 {
     var f: QueryFilter = .{};
     return f.process(input, buf);

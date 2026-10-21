@@ -2085,10 +2085,14 @@ pub const Master = struct {
                 const payload = pkt.getPayload();
                 if (payload.len > 0) {
                     const client = self.clients.items[idx];
-                    client.last_input_ns = self.nowNs();
-                    client.yielded = false;
-                    self.updateActiveClient();
-                    if (self.size_client != client) self.updateSizeClient();
+                    // Its terminal answering the program isn't the client being used:
+                    // two terminals answering each redraw's query took the size in turn
+                    if (!@import("query_filter.zig").onlyReplies(payload)) {
+                        client.last_input_ns = self.nowNs();
+                        client.yielded = false;
+                        self.updateActiveClient();
+                        if (self.size_client != client) self.updateSizeClient();
+                    }
                     _ = try sys.write(self.pty_master, payload);
                 }
             },

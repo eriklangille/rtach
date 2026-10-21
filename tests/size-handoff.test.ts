@@ -333,4 +333,20 @@ describe("size handoff", () => {
     await proxy.exited;
     laptop.close();
   });
+
+  test("a terminal answering the program doesn't take the size", async () => {
+    const laptop = await client("aaaaaaaa-size-test", A);
+    watcher = laptop;
+    await winches(() => send(laptop, MessageType.CLAIM_ACTIVE));
+    const phone = await backgroundClient("bbbbbbbb-size-test", B);
+
+    // The phone's terminal answers a cursor position query and reports focus
+    expect(await winches(() => send(phone, MessageType.PUSH, Buffer.from("\x1b[12;5R\x1b[I")))).toEqual([]);
+    // A key does take it
+    expect(await winches(() => send(phone, MessageType.PUSH, Buffer.from("\x1b[A")))).toEqual([size(B)]);
+    // And the laptop's answers don't take it back
+    expect(await winches(() => send(laptop, MessageType.PUSH, Buffer.from("\x1b]11;rgb:2828/2c2c/3434\x07")))).toEqual([]);
+    laptop.close();
+    phone.close();
+  });
 });
