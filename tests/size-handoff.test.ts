@@ -260,23 +260,26 @@ describe("size handoff", () => {
     phone.close();
   });
 
-  test("a background attach takes the size when no other client shows the pane", async () => {
+  test("a device only viewing the pane doesn't take it when the one using it switches away", async () => {
     const laptop = await client("aaaaaaaa-size-test", A);
-    watcher = laptop;
     await winches(() => send(laptop, MessageType.CLAIM_ACTIVE));
-    // The laptop switched away from the pane
-    send(laptop, MessageType.PAUSE);
-    await Bun.sleep(100);
-
+    // The phone is open, showing the pane in its overview
     const phone = await backgroundClient("bbbbbbbb-size-test", B);
+    watcher = phone;
     send(phone, MessageType.WANT_SIZE);
-    expect(await sizesTold(phone)).toEqual([`${size(B)} yours`]);
-    // The laptop shows it again: it takes the size back, though it didn't claim yet
-    send(laptop, MessageType.RESUME);
     expect(await sizesTold(phone)).toEqual([size(A)]);
-    // And when the laptop leaves, it goes back to the phone
+
+    // The laptop shows another pane: it pauses this one, and the size stays
+    expect(await winches(() => send(laptop, MessageType.PAUSE))).toEqual([]);
+    // Its background fetches (resume, then pause) don't move it either
+    expect(await winches(() => {
+      send(laptop, MessageType.RESUME);
+      send(laptop, MessageType.PAUSE);
+    })).toEqual([size(A)]);
+    expect(await sizesTold(phone)).toEqual([]);
+    // Once the laptop has let go of the pane, the phone is the only one showing it
     laptop.close();
-    expect(await sizesTold(phone)).toEqual([`${size(B)} yours`]);
+    expect(await sizesTold(phone, 400)).toEqual([`${size(B)} yours`]);
     phone.close();
   });
 

@@ -1540,29 +1540,34 @@ pub const Master = struct {
     }
 
     /// The client in use: latest claim or input, else latest attach, among clients
-    /// that are showing the session. Yielded ones (paused since, or attached in the
-    /// background) only when no other client is: they don't take the size from one in
-    /// use, but a pane nobody else shows gets the size of the one showing it.
+    /// that are showing the session and haven't yielded. A yielded one (paused since, or
+    /// attached in the background) only when it's the only client attached: a device
+    /// that's attached but not using the pane (paused, only viewing it) keeps the size
+    /// where it is, so a phone that's just open doesn't take a pane a laptop switched
+    /// away from, and a laptop's background fetch (resume, then pause) doesn't move it.
     fn pickSizeClient(self: *Master) ?*ClientConn {
         var best: ?*ClientConn = null;
         var best_activity: i128 = 0;
         var best_attach: i128 = 0;
+        var attached: usize = 0;
+        var lone: ?*ClientConn = null;
         for (self.clients.items) |client| {
+            if (client.attached and !client.pending_remove) attached += 1;
             if (!self.isSizeEligible(client)) continue;
+            if (client.yielded) {
+                lone = client;
+                continue;
+            }
             const activity = @max(client.last_claim_ns, client.last_input_ns);
-            const better = if (best) |current|
-                if (current.yielded != client.yielded)
-                    current.yielded
-                else
-                    activity > best_activity or (activity == best_activity and client.last_attach_ns > best_attach)
-            else
-                true;
-            if (better) {
+            if (best == null or activity > best_activity or
+                (activity == best_activity and client.last_attach_ns > best_attach))
+            {
                 best = client;
                 best_activity = activity;
                 best_attach = client.last_attach_ns;
             }
         }
+        if (best == null and attached == 1) return lone;
         return best;
     }
 

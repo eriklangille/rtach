@@ -176,7 +176,12 @@ pub const Protocol = @import("protocol.zig");
 ///          when no other client shows the pane. A claim can be for commands only
 ///          (CLAIM_FLAG_COMMANDS_ONLY): the app showing a pane at launch or in the
 ///          foreground, without taking it from a device typing there.
-pub const version = "2.32.0";
+/// 2.32.1 - Fix for 2.32.0: a background client took the size whenever no other client
+///          was unpaused, so with the phone open, a pane the laptop switched away from
+///          went to the phone's size, and the laptop's background fetches (resume, then
+///          pause) flipped it back and forth. A yielded client now takes the size only
+///          when it's the only client attached.
+pub const version = "2.32.1";
 
 /// `-a`'s exit code when the session doesn't exist (it ended)
 pub const no_session_exit: u8 = 3;
