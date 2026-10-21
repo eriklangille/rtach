@@ -302,7 +302,7 @@ describe("rtach ws", () => {
     expect(() => ws(["resize", a, b, "2"])).toThrow("wrong arguments");
   });
 
-  test("changes tell the app; --quiet doesn't", async () => {
+  test("changes tell the app; --quiet only refreshes it", async () => {
     // Stand in for the app: the active pointer names a pipe we read
     const fifo = join(home, "app.cmd");
     spawnSync(["mkfifo", fifo]);
@@ -319,11 +319,10 @@ describe("rtach ws", () => {
     wsJson(["close", b]);
     expect((await new Response(app.stdout).text()).trim()).toBe("workspace;");
 
+    // An agent that shouldn't move the user's screen: the new pane appears, not shown
     app = listen();
     wsJson(["split", a, "--quiet"]);
-    await Bun.sleep(200);
-    expect(app.exitCode).toBeNull();
-    app.kill();
+    expect((await new Response(app.stdout).text()).trim()).toBe("workspace;");
   });
 
   test("outside rtach, PANE defaults to the pane the app shows", async () => {

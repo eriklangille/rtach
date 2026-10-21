@@ -572,7 +572,7 @@ const usage =
     \\  list [--json]               Workspaces, tabs and panes
     \\
     \\Changes print the new or affected ids as JSON, and tell the Clauntty app,
-    \\which shows a new pane right away (--quiet: don't).
+    \\which shows a new pane right away (--quiet: it only refreshes).
     \\
 ;
 
@@ -581,7 +581,10 @@ const Context = struct {
     io: std.Io,
     home: []const u8,
     out: std.ArrayList(u8) = .empty,
-    /// Don't tell the app (it ran the command itself)
+    /// --quiet: the app refreshes, but doesn't show the new pane (the app's own commands,
+    /// an agent that shouldn't move the user's screen). It used to tell the app nothing:
+    /// a workspace an agent made with --quiet didn't appear until something else
+    /// refreshed, and one the phone made didn't reach the laptop.
     quiet: bool = false,
     /// Tell the app to refresh, not to show the new pane (the picker: each device
     /// keeps its own place)
@@ -599,8 +602,7 @@ const Context = struct {
     /// Tell the app the workspaces changed: `workspace;<ws>/<pane>` to show a new pane,
     /// `workspace;` to refresh
     fn notify(self: *Context, workspace: ?[]const u8, pane: ?[]const u8) void {
-        if (self.quiet) return;
-        const value = if (workspace != null and pane != null and !self.refresh_only)
+        const value = if (workspace != null and pane != null and !self.refresh_only and !self.quiet)
             std.fmt.allocPrint(self.arena, "{s}/{s}", .{ workspace.?, pane.? }) catch return
         else
             "";

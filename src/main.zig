@@ -197,7 +197,10 @@ pub const Protocol = @import("protocol.zig");
 ///          mid-character or with a stray byte went into `ws list --json` as an array of
 ///          numbers, and the app rejected the whole list, so none of the host's
 ///          workspaces refreshed.
-pub const version = "2.32.4";
+/// 2.32.5 - `ws ... --quiet` tells the app to refresh, only not to show the new pane: it
+///          told the app nothing, so a workspace an agent made with --quiet didn't
+///          appear on the laptop, and one the phone made didn't reach the laptop.
+pub const version = "2.32.5";
 
 /// `-a`'s exit code when the session doesn't exist (it ended)
 pub const no_session_exit: u8 = 3;
