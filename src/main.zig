@@ -186,7 +186,14 @@ pub const Protocol = @import("protocol.zig");
 ///          with the phone and the laptop both showing Claude Code, which asks after
 ///          each redraw, every answer took the size, and the pane flipped between the
 ///          two sizes many times a second.
-pub const version = "2.32.2";
+/// 2.32.3 - Using a pane (a claim, typing, a plain attach) yields every other client, so
+///          the size stays with it until another device is used: a phone that typed in
+///          a pane earlier took it whenever the laptop switched away, and "In use on
+///          another device" flashed on the laptop at every switch. A client that claims
+///          before its first winch is the client in use: told the size wasn't its own,
+///          the app never sent one, and the pane stayed "in use on another device".
+///          The client in use stays the size's owner while it's paused (switched away).
+pub const version = "2.32.3";
 
 /// `-a`'s exit code when the session doesn't exist (it ended)
 pub const no_session_exit: u8 = 3;

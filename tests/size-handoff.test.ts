@@ -137,14 +137,17 @@ describe("size handoff", () => {
 
   const size = (s: { rows: number; cols: number }) => `${s.rows}x${s.cols}`;
 
-  test("the client in use gets its size, and gives it back when it pauses", async () => {
+  test("the client in use gets its size, and keeps it when it pauses", async () => {
     const a = await client("aaaaaaaa-size-test", A);
     watcher = a;
     const b = await client("bbbbbbbb-size-test", B);
 
     expect(await winches(() => send(a, MessageType.CLAIM_ACTIVE))).toEqual([size(A)]);
     expect(await winches(() => send(b, MessageType.PUSH, Buffer.from(" ")))).toEqual([size(B)]);
-    expect(await winches(() => send(b, MessageType.PAUSE))).toEqual([size(A)]);
+    // b went to the background: a only shows the pane, so the size stays
+    expect(await winches(() => send(b, MessageType.PAUSE))).toEqual([]);
+    // until a is used
+    expect(await winches(() => send(a, MessageType.CLAIM_ACTIVE))).toEqual([size(A)]);
     a.close();
     b.close();
   });
@@ -155,10 +158,16 @@ describe("size handoff", () => {
     watcher = b;
 
     expect(await winches(() => send(a, MessageType.CLAIM_ACTIVE))).toEqual([size(A)]);
-    expect(await winches(() => send(a, MessageType.PAUSE))).toEqual([size(B)]);
-    // Every resume signals the program to repaint, here at B's size, which stays
-    expect(await winches(() => send(a, MessageType.RESUME))).toEqual([size(B)]);
     expect(await winches(() => send(a, MessageType.PAUSE))).toEqual([]);
+    // Every resume signals the program to repaint, at the size the PTY kept
+    expect(await winches(() => send(a, MessageType.RESUME))).toEqual([size(A)]);
+    expect(await winches(() => send(a, MessageType.PAUSE))).toEqual([]);
+    // b is used: it takes the size, and a's pre-fetches don't take it back
+    expect(await winches(() => send(b, MessageType.CLAIM_ACTIVE))).toEqual([size(B)]);
+    expect(await winches(() => {
+      send(a, MessageType.RESUME);
+      send(a, MessageType.PAUSE);
+    })).toEqual([size(B)]);
     // Showing the tab again: the app resumes, then claims
     const shown = await winches(() => {
       send(a, MessageType.RESUME);
@@ -169,7 +178,7 @@ describe("size handoff", () => {
     b.close();
   });
 
-  test("detaching or disconnecting hands the size to the other client", async () => {
+  test("detaching or disconnecting leaves the size to the client left", async () => {
     const a = await client("aaaaaaaa-size-test", A);
     const b = await client("bbbbbbbb-size-test", B);
     watcher = a;
@@ -178,8 +187,9 @@ describe("size handoff", () => {
     expect(await winches(() => send(b, MessageType.CLAIM_ACTIVE))).toEqual([size(B)]);
     expect(await winches(() => send(b, MessageType.DETACH))).toEqual([size(A)]);
 
-    const c = await client("cccccccc-size-test", B);
-    expect(await winches(() => send(c, MessageType.CLAIM_ACTIVE))).toEqual([size(B)]);
+    // A plain attach (a terminal) is use: it takes the size right away
+    let c!: RawRtachConnection;
+    expect(await winches(async () => { c = await client("cccccccc-size-test", B); })).toEqual([size(B)]);
     expect(await winches(() => c.close())).toEqual([size(A)]);
     a.close();
     b.close();
@@ -231,8 +241,10 @@ describe("size handoff", () => {
     // Nothing changed: nothing sent
     send(phone, MessageType.CLAIM_ACTIVE);
     expect(await sizesTold(phone)).toEqual([]);
-    // The phone pauses (the app in the background): the laptop's size, not the phone's
+    // The phone pauses (the app in the background): still its own until the laptop is used
     send(phone, MessageType.PAUSE);
+    expect(await sizesTold(phone)).toEqual([]);
+    send(laptop, MessageType.CLAIM_ACTIVE);
     expect(await sizesTold(phone)).toEqual([size(B)]);
 
     // A client that didn't ask (older apps, the CLI) gets none
@@ -346,6 +358,56 @@ describe("size handoff", () => {
     expect(await winches(() => send(phone, MessageType.PUSH, Buffer.from("\x1b[A")))).toEqual([size(B)]);
     // And the laptop's answers don't take it back
     expect(await winches(() => send(laptop, MessageType.PUSH, Buffer.from("\x1b]11;rgb:2828/2c2c/3434\x07")))).toEqual([]);
+    laptop.close();
+    phone.close();
+  });
+
+  test("a device that used the pane earlier doesn't take it when the laptop switches away", async () => {
+    const laptop = await client("aaaaaaaa-size-test", A);
+    const phone = await backgroundClient("bbbbbbbb-size-test", B);
+    watcher = laptop;
+    // The phone typed there, then the laptop took it back
+    expect(await winches(() => send(phone, MessageType.PUSH, Buffer.from("x")))).toEqual([size(B)]);
+    expect(await winches(() => send(laptop, MessageType.CLAIM_ACTIVE))).toEqual([size(A)]);
+    // The laptop shows another pane; the phone still streams this one (and sees the program)
+    watcher = phone;
+    expect(await winches(() => send(laptop, MessageType.PAUSE))).toEqual([]);
+    laptop.close();
+    phone.close();
+  });
+
+  test("a claim before the client's size makes it the client in use", async () => {
+    const laptop = await client("aaaaaaaa-size-test", A);
+    watcher = laptop;
+    await winches(() => send(laptop, MessageType.CLAIM_ACTIVE));
+    // The laptop's connection is replaced; the new one claims before its first winch
+    const again = await connectRawSocketWithUpgrade(socketPath);
+    const payload = Buffer.alloc(17);
+    Buffer.from("aaaaaaaa-size-test").copy(payload, 0, 0, 16);
+    payload[16] = ATTACH_FLAG_BACKGROUND;
+    send(again, MessageType.ATTACH, payload);
+    send(again, MessageType.WANT_SIZE);
+    send(again, MessageType.CLAIM_ACTIVE);
+    // Its own (after "not yours" for the want_size before the claim), so the app sends its size
+    expect((await sizesTold(again)).at(-1)).toBe(`${size(A)} yours`);
+    const later = { rows: 40, cols: 160 };
+    winch(again, later);
+    expect(await sizesTold(again)).toEqual([`${size(later)} yours`]);
+    again.close();
+  });
+
+  test("the client in use stays the size's owner while it's switched away", async () => {
+    const laptop = await client("aaaaaaaa-size-test", A);
+    send(laptop, MessageType.CLAIM_ACTIVE);
+    send(laptop, MessageType.WANT_SIZE);
+    expect(await sizesTold(laptop)).toEqual([`${size(A)} yours`]);
+    const phone = await backgroundClient("bbbbbbbb-size-test", B);
+    // Switching away and back: still its own the whole time, so no pill
+    send(laptop, MessageType.PAUSE);
+    expect(await sizesTold(laptop)).toEqual([]);
+    send(laptop, MessageType.RESUME);
+    send(laptop, MessageType.CLAIM_ACTIVE);
+    expect(await sizesTold(laptop)).toEqual([]);
     laptop.close();
     phone.close();
   });

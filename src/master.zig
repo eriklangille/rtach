@@ -1536,15 +1536,30 @@ pub const Master = struct {
 
     fn isSizeEligible(self: *Master, client: *ClientConn) bool {
         if (!self.isClientEligible(client, false)) return false;
-        return client.size != null and !client.paused;
+        // Without a size yet (it claimed before its first winch) it can still be the
+        // client in use: the PTY keeps its size until that winch, and the client is
+        // told the size is its own, so it sends one. Told otherwise, an app that sends
+        // no size for a pane another device has never would.
+        return !client.paused;
     }
 
-    /// The client in use: latest claim or input, else latest attach, among clients
-    /// that are showing the session and haven't yielded. A yielded one (paused since, or
-    /// attached in the background) only when it's the only client attached: a device
-    /// that's attached but not using the pane (paused, only viewing it) keeps the size
-    /// where it is, so a phone that's just open doesn't take a pane a laptop switched
-    /// away from, and a laptop's background fetch (resume, then pause) doesn't move it.
+    /// The client is being used (it claimed, typed, or attached without
+    /// ATTACH_FLAG_BACKGROUND): every other client yields. The size then stays with it
+    /// when it pauses or leaves, instead of going to a device that only shows the pane
+    /// (a phone streaming it in its overview); a device takes it back by being used.
+    fn takeUse(self: *Master, client: *ClientConn) void {
+        client.yielded = false;
+        for (self.clients.items) |other| {
+            if (other != client) other.yielded = true;
+        }
+    }
+
+    /// The client in use: the unpaused one that hasn't yielded (see takeUse), by latest
+    /// claim or input, then latest attach. A yielded one (another was used since, it
+    /// paused, or it attached in the background) only when it's the only client
+    /// attached: a device that's attached but not using the pane keeps the size where
+    /// it is, so a phone that's just open doesn't take a pane a laptop switched away
+    /// from, and a laptop's background fetch (resume, then pause) doesn't move it.
     fn pickSizeClient(self: *Master) ?*ClientConn {
         var best: ?*ClientConn = null;
         var best_activity: i128 = 0;
@@ -1574,7 +1589,14 @@ pub const Master = struct {
     /// Give the PTY the size of the client in use. With none (e.g. the only client
     /// paused in the background), the size stays as it is.
     fn updateSizeClient(self: *Master) void {
-        const chosen = self.pickSizeClient();
+        // With none in use (the one that was paused: the laptop switched away), it stays
+        // the one whose size the PTY has while it's attached. Telling it the size wasn't
+        // its own anymore showed "In use on another device" until its claim came back.
+        const kept = if (self.size_client) |current|
+            if (current.attached and !current.pending_remove) current else null
+        else
+            null;
+        const chosen = self.pickSizeClient() orelse kept;
         if (chosen != self.size_client) {
             log.debug("size client update: {} -> {}", .{
                 if (self.size_client) |client| client.fd else -1,
@@ -1582,7 +1604,7 @@ pub const Master = struct {
             });
             self.size_client = chosen;
         }
-        if (chosen) |client| self.applyWinsize(client.size.?);
+        if (chosen) |client| if (client.size) |size| self.applyWinsize(size);
         self.tellSizes();
     }
 
@@ -1971,7 +1993,11 @@ pub const Master = struct {
                 self.clients.items[idx].attached = true;
                 self.clients.items[idx].last_attach_ns = self.nowNs();
                 // Loading the pane, not using it: leave the size with a client that is
-                self.clients.items[idx].yielded = background;
+                if (background) {
+                    self.clients.items[idx].yielded = true;
+                } else {
+                    self.takeUse(self.clients.items[idx]);
+                }
                 const size_before = self.winsize;
                 self.updateActiveClient();
                 self.updateSizeClient();
@@ -2065,7 +2091,7 @@ pub const Master = struct {
                 client.supports_commands = true;
                 if (!commands_only) {
                     client.last_claim_ns = self.nowNs();
-                    client.yielded = false;
+                    self.takeUse(client);
                 }
                 self.updateActiveClient();
                 self.updateSizeClient();
@@ -2089,7 +2115,7 @@ pub const Master = struct {
                     // two terminals answering each redraw's query took the size in turn
                     if (!@import("query_filter.zig").onlyReplies(payload)) {
                         client.last_input_ns = self.nowNs();
-                        client.yielded = false;
+                        self.takeUse(client);
                         self.updateActiveClient();
                         if (self.size_client != client) self.updateSizeClient();
                     }
