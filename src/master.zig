@@ -354,9 +354,9 @@ const ClientConn = struct {
     supports_commands: bool = false,
     /// This client's terminal size, from its last winch
     size: ?Protocol.Winsize = null,
-    /// Set by pause, cleared by a claim or input: a client that paused gives up the
-    /// PTY size until it's used again, so a background pre-fetch (resume, then pause)
-    /// doesn't take the size back
+    /// Set by pause or a background attach, cleared by a claim or input: the client
+    /// doesn't take the PTY size from one in use until it's used itself, so a
+    /// background pre-fetch (resume, then pause) doesn't take the size back
     yielded: bool = false,
     /// Sent want_size: told the PTY's size when it or the client in use changes
     wants_size: bool = false,
@@ -1536,11 +1536,13 @@ pub const Master = struct {
 
     fn isSizeEligible(self: *Master, client: *ClientConn) bool {
         if (!self.isClientEligible(client, false)) return false;
-        return client.size != null and !client.paused and !client.yielded;
+        return client.size != null and !client.paused;
     }
 
     /// The client in use: latest claim or input, else latest attach, among clients
-    /// that are showing the session
+    /// that are showing the session. Yielded ones (paused since, or attached in the
+    /// background) only when no other client is: they don't take the size from one in
+    /// use, but a pane nobody else shows gets the size of the one showing it.
     fn pickSizeClient(self: *Master) ?*ClientConn {
         var best: ?*ClientConn = null;
         var best_activity: i128 = 0;
@@ -1548,9 +1550,14 @@ pub const Master = struct {
         for (self.clients.items) |client| {
             if (!self.isSizeEligible(client)) continue;
             const activity = @max(client.last_claim_ns, client.last_input_ns);
-            if (best == null or activity > best_activity or
-                (activity == best_activity and client.last_attach_ns > best_attach))
-            {
+            const better = if (best) |current|
+                if (current.yielded != client.yielded)
+                    current.yielded
+                else
+                    activity > best_activity or (activity == best_activity and client.last_attach_ns > best_attach)
+            else
+                true;
+            if (better) {
                 best = client;
                 best_activity = activity;
                 best_attach = client.last_attach_ns;
@@ -1931,6 +1938,7 @@ pub const Master = struct {
                 const client_id = pkt.getClientId();
                 const resuming = pkt.getAttachFlags() & Protocol.ATTACH_FLAG_RESUME != 0;
                 const wants_ready = pkt.getAttachFlags() & Protocol.ATTACH_FLAG_READY != 0;
+                const background = pkt.getAttachFlags() & Protocol.ATTACH_FLAG_BACKGROUND != 0;
 
                 // If client ID provided, kick any existing connection with same ID
                 if (client_id) |id| {
@@ -1954,9 +1962,11 @@ pub const Master = struct {
                     self.clients.items[idx].client_id = id;
                 }
 
-                log.info("client {} attached (client_id: {}, alt_screen: {})", .{ idx, if (client_id != null) @as(u64, @bitCast(client_id.?[0..8].*)) else 0, self.modes.alt_screen });
+                log.info("client {} attached (client_id: {}, alt_screen: {}, background: {})", .{ idx, if (client_id != null) @as(u64, @bitCast(client_id.?[0..8].*)) else 0, self.modes.alt_screen, background });
                 self.clients.items[idx].attached = true;
                 self.clients.items[idx].last_attach_ns = self.nowNs();
+                // Loading the pane, not using it: leave the size with a client that is
+                self.clients.items[idx].yielded = background;
                 const size_before = self.winsize;
                 self.updateActiveClient();
                 self.updateSizeClient();
@@ -2044,14 +2054,17 @@ pub const Master = struct {
             },
             _ => log.debug("client {} sent unknown packet type {}", .{ idx, @intFromEnum(pkt.header.type) }),
             .claim_active => {
-                const now_ns = self.nowNs();
                 const client = self.clients.items[idx];
-                client.last_claim_ns = now_ns;
+                const payload = pkt.getPayload();
+                const commands_only = payload.len >= 1 and payload[0] & Protocol.CLAIM_FLAG_COMMANDS_ONLY != 0;
                 client.supports_commands = true;
-                client.yielded = false;
+                if (!commands_only) {
+                    client.last_claim_ns = self.nowNs();
+                    client.yielded = false;
+                }
                 self.updateActiveClient();
                 self.updateSizeClient();
-                log.info("client {} claimed active", .{client.fd});
+                log.info("client {} claimed active{s}", .{ client.fd, if (commands_only) " (commands only)" else "" });
                 self.writeActivePointer();
                 self.writeDevicePointer(client);
             },
@@ -2313,6 +2326,8 @@ pub const Master = struct {
 
                     client.paused = false;
                     client.paused_total_written = 0;
+                    // Showing the pane again: it may be the only client that does
+                    self.updateSizeClient();
 
                     // Always send SIGWINCH on resume to trigger TUI repaint
                     // This is needed because paused clients miss intermediate repaints

@@ -169,7 +169,14 @@ pub const Protocol = @import("protocol.zig");
 ///          the kitty keyboard flags (per screen), modifyOtherKeys, the keypad mode, plus
 ///          color scheme reports, autowrap and the cursor style. Claude Code sets them at
 ///          startup, so after a reattach the terminal sent the older key encodings.
-pub const version = "2.31.1";
+/// 2.32.0 - A background attach (`--background`, ATTACH_FLAG_BACKGROUND) doesn't take the
+///          PTY's size from a client in use: the app attaching its panes (at launch, or
+///          a window coming on screen) resized every pane a laptop was using. Yielded
+///          clients (paused since, or attached in the background) take the size only
+///          when no other client shows the pane. A claim can be for commands only
+///          (CLAIM_FLAG_COMMANDS_ONLY): the app showing a pane at launch or in the
+///          foreground, without taking it from a device typing there.
+pub const version = "2.32.0";
 
 /// `-a`'s exit code when the session doesn't exist (it ended)
 pub const no_session_exit: u8 = 3;
@@ -220,6 +227,8 @@ const Args = struct {
     proxy_mode: bool = false,
     /// --ready: attach asking for `ready` (ATTACH_FLAG_READY)
     want_ready: bool = false,
+    /// --background: attach without taking the size from a client in use (ATTACH_FLAG_BACKGROUND)
+    background: bool = false,
     /// Start the master here even if spawnd could (spawnd's own request)
     no_spawnd: bool = false,
 
@@ -438,6 +447,7 @@ fn attach(allocator: std.mem.Allocator, args: Args) !void {
         .client_id = args.client_id,
         .proxy_mode = args.proxy_mode,
         .want_ready = args.want_ready,
+        .background = args.background,
     });
     defer client.deinit();
 
@@ -538,6 +548,8 @@ fn parseArgs(process_args: std.process.Args) !Args {
             result.proxy_mode = true;
         } else if (std.mem.eql(u8, arg, "--ready")) {
             result.want_ready = true;
+        } else if (std.mem.eql(u8, arg, "--background")) {
+            result.background = true;
         } else if (std.mem.eql(u8, arg, "--no-spawnd")) {
             result.no_spawnd = true;
         } else if (std.mem.eql(u8, arg, "-s")) {
@@ -586,6 +598,7 @@ fn printUsage() void {
         \\  -E          Disable detach character
         \\  --proxy     Proxy mode (forward handshake, wait for client upgrade)
         \\  --ready     Ask the master for `ready` when the screen is ready to show
+        \\  --background  Attach without taking the size from a client in use
         \\  -r METHOD   Redraw method: none, ctrl_l, winch
         \\  -s SIZE     Scrollback buffer size in bytes (default: 1MB)
         \\  -C UUID     Client ID for deduplication

@@ -1,4 +1,5 @@
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
+import { spawn } from "bun";
 import { chmodSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
@@ -10,6 +11,8 @@ import {
   sendAttachPacket,
   MessageType,
   ResponseType,
+  RTACH_BIN,
+  trackProcess,
   HANDSHAKE_FLAG_PTY_SIZE,
   type RawRtachConnection,
 } from "./helpers";
@@ -30,6 +33,10 @@ while :; do sleep 0.05; done
 `;
 
 const A = { rows: 30, cols: 100 };
+// Attach flag: loading the pane, not using it (protocol.zig)
+const ATTACH_FLAG_BACKGROUND = 1 << 2;
+// claim_active payload: for commands only, not the size
+const CLAIM_FLAG_COMMANDS_ONLY = 1 << 0;
 const B = { rows: 50, cols: 200 };
 
 describe("size handoff", () => {
@@ -68,6 +75,18 @@ describe("size handoff", () => {
   async function client(id: string, size: { rows: number; cols: number }): Promise<RawRtachConnection> {
     const conn = await connectRawSocketWithUpgrade(socketPath);
     sendAttachPacket(conn, id);
+    winch(conn, size);
+    await Bun.sleep(50);
+    return conn;
+  }
+
+  /** A client attaching with ATTACH_FLAG_BACKGROUND: loading the pane, not using it */
+  async function backgroundClient(id: string, size: { rows: number; cols: number }): Promise<RawRtachConnection> {
+    const conn = await connectRawSocketWithUpgrade(socketPath);
+    const payload = Buffer.alloc(17);
+    Buffer.from(id).copy(payload, 0, 0, 16);
+    payload[16] = ATTACH_FLAG_BACKGROUND;
+    send(conn, MessageType.ATTACH, payload);
     winch(conn, size);
     await Bun.sleep(50);
     return conn;
@@ -219,6 +238,96 @@ describe("size handoff", () => {
     // A client that didn't ask (older apps, the CLI) gets none
     expect(await sizesTold(laptop)).toEqual([]);
     phone.close();
+    laptop.close();
+  });
+  test("a background attach leaves the size with the client in use", async () => {
+    const laptop = await client("aaaaaaaa-size-test", A);
+    watcher = laptop;
+    await winches(() => send(laptop, MessageType.CLAIM_ACTIVE));
+
+    // The phone loads the pane (launch, or its window coming on screen): no resize
+    let phone!: RawRtachConnection;
+    expect(await winches(async () => { phone = await backgroundClient("bbbbbbbb-size-test", B); })).toEqual([]);
+    send(phone, MessageType.WANT_SIZE);
+    expect(await sizesTold(phone)).toEqual([size(A)]);
+    // It types: in use now
+    expect(await winches(() => send(phone, MessageType.PUSH, Buffer.from(" ")))).toEqual([size(B)]);
+    expect(await sizesTold(phone)).toEqual([`${size(B)} yours`]);
+    // The laptop claims it back; the phone's pause doesn't change it
+    expect(await winches(() => send(laptop, MessageType.CLAIM_ACTIVE))).toEqual([size(A)]);
+    expect(await winches(() => send(phone, MessageType.PAUSE))).toEqual([]);
+    laptop.close();
+    phone.close();
+  });
+
+  test("a background attach takes the size when no other client shows the pane", async () => {
+    const laptop = await client("aaaaaaaa-size-test", A);
+    watcher = laptop;
+    await winches(() => send(laptop, MessageType.CLAIM_ACTIVE));
+    // The laptop switched away from the pane
+    send(laptop, MessageType.PAUSE);
+    await Bun.sleep(100);
+
+    const phone = await backgroundClient("bbbbbbbb-size-test", B);
+    send(phone, MessageType.WANT_SIZE);
+    expect(await sizesTold(phone)).toEqual([`${size(B)} yours`]);
+    // The laptop shows it again: it takes the size back, though it didn't claim yet
+    send(laptop, MessageType.RESUME);
+    expect(await sizesTold(phone)).toEqual([size(A)]);
+    // And when the laptop leaves, it goes back to the phone
+    laptop.close();
+    expect(await sizesTold(phone)).toEqual([`${size(B)} yours`]);
+    phone.close();
+  });
+
+  test("a background attach that's the only client gets its size", async () => {
+    const phone = await backgroundClient("bbbbbbbb-size-test", B);
+    send(phone, MessageType.WANT_SIZE);
+    expect(await sizesTold(phone)).toEqual([`${size(B)} yours`]);
+    phone.close();
+  });
+  test("a claim for commands only leaves the size with the client in use", async () => {
+    const laptop = await client("aaaaaaaa-size-test", A);
+    watcher = laptop;
+    await winches(() => send(laptop, MessageType.CLAIM_ACTIVE));
+    const phone = await backgroundClient("bbbbbbbb-size-test", B);
+
+    // The phone came to the foreground on this pane, but nobody typed there
+    expect(await winches(() => send(phone, MessageType.CLAIM_ACTIVE, Buffer.from([CLAIM_FLAG_COMMANDS_ONLY])))).toEqual([]);
+    // A plain claim (Tap to use here) takes it
+    expect(await winches(() => send(phone, MessageType.CLAIM_ACTIVE))).toEqual([size(B)]);
+    laptop.close();
+    phone.close();
+  });
+
+  test("the app's proxy attaches in the background and passes a claim's flags on", async () => {
+    const laptop = await client("aaaaaaaa-size-test", A);
+    watcher = laptop;
+    await winches(() => send(laptop, MessageType.CLAIM_ACTIVE));
+
+    // What the app runs over SSH; it writes framed packets to the proxy's stdin
+    const proxy = trackProcess(spawn([RTACH_BIN, "--proxy", "--ready", "--background", "-a", socketPath], {
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "pipe",
+    }));
+    const write = (bytes: number[] | Buffer) => {
+      proxy.stdin!.write(Buffer.from(bytes));
+      proxy.stdin!.flush();
+    };
+    const sizePayload = Buffer.alloc(8);
+    sizePayload.writeUInt16LE(B.rows, 0);
+    sizePayload.writeUInt16LE(B.cols, 2);
+    expect(await winches(async () => {
+      await Bun.sleep(200);
+      write([MessageType.UPGRADE, 0]);
+      await Bun.sleep(50);
+      write(Buffer.concat([Buffer.from([MessageType.WINCH, 8]), sizePayload]));
+      write([MessageType.CLAIM_ACTIVE, 1, CLAIM_FLAG_COMMANDS_ONLY]);
+    }, 600)).toEqual([]);
+    expect(await winches(() => write([MessageType.CLAIM_ACTIVE, 0]))).toEqual([size(B)]);
+    proxy.kill(9);
+    await proxy.exited;
     laptop.close();
   });
 });

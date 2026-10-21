@@ -150,6 +150,17 @@ pub const ATTACH_FLAG_RESUME: u8 = 1 << 0;
 /// alternate screen gets no replay, so the master makes it redraw (a nudge) and holds
 /// its output from this client until then.
 pub const ATTACH_FLAG_READY: u8 = 1 << 1;
+/// Attach flag: loading the pane, not using it (the app attaching panes it isn't typing
+/// in). The client starts yielded, as after a pause: it doesn't take the PTY's size from
+/// a client that's using it, only when no other client is (see Master.pickSizeClient).
+/// A claim or input makes it a client in use.
+pub const ATTACH_FLAG_BACKGROUND: u8 = 1 << 2;
+
+/// claim_active payload byte: the claim is for commands and workspace news only (the
+/// app showing a pane it isn't typing in: at launch, coming back to the foreground). It
+/// doesn't take the PTY's size or count as use. Without it (or from older apps), a claim
+/// is both. Older masters ignore the payload.
+pub const CLAIM_FLAG_COMMANDS_ONLY: u8 = 1 << 0;
 
 /// Handshake flag: the master supports request_history
 pub const HANDSHAKE_FLAG_HISTORY: u16 = 1 << 0;

@@ -20,6 +20,8 @@ pub const ClientOptions = struct {
     proxy_mode: bool = false,
     /// Attach with ATTACH_FLAG_READY (the app asks with --ready)
     want_ready: bool = false,
+    /// Attach with ATTACH_FLAG_BACKGROUND (the app asks with --background)
+    background: bool = false,
 };
 
 pub const Client = struct {
@@ -147,14 +149,16 @@ pub const Client = struct {
 
     fn sendPostUpgradeSetup(self: *Client) !void {
         const client_id_ptr: ?*const [Protocol.CLIENT_ID_SIZE]u8 = if (self.options.client_id) |*id| id else null;
+        const background: u8 = if (self.options.background) Protocol.ATTACH_FLAG_BACKGROUND else 0;
         if (self.reattaching) {
             self.reattaching = false;
-            const attach_pkt = Protocol.Packet.initAttachFlags(client_id_ptr, Protocol.ATTACH_FLAG_RESUME);
+            const attach_pkt = Protocol.Packet.initAttachFlags(client_id_ptr, Protocol.ATTACH_FLAG_RESUME | background);
             _ = try sys.write(self.socket_fd, attach_pkt.serialize());
             return self.sendWindowSize();
         }
-        const attach_pkt = if (self.options.want_ready)
-            Protocol.Packet.initAttachFlags(client_id_ptr, Protocol.ATTACH_FLAG_READY)
+        const ready: u8 = if (self.options.want_ready) Protocol.ATTACH_FLAG_READY else 0;
+        const attach_pkt = if (ready | background != 0)
+            Protocol.Packet.initAttachFlags(client_id_ptr, ready | background)
         else
             Protocol.Packet.initAttach(client_id_ptr);
         _ = try sys.write(self.socket_fd, attach_pkt.serialize());
@@ -358,7 +362,9 @@ pub const Client = struct {
                     pkt_type == @intFromEnum(Protocol.MessageType.request_scrollback) or
                     pkt_type == @intFromEnum(Protocol.MessageType.request_scrollback_page) or
                     pkt_type == @intFromEnum(Protocol.MessageType.request_history) or
-                    pkt_type == @intFromEnum(Protocol.MessageType.want_size))
+                    pkt_type == @intFromEnum(Protocol.MessageType.want_size) or
+                    // With its flags (CLAIM_FLAG_COMMANDS_ONLY)
+                    pkt_type == @intFromEnum(Protocol.MessageType.claim_active))
                 {
                     // Forward the raw packet (header + payload) to master
                     const packet_size: usize = 2 + pkt_len_usize;
@@ -386,10 +392,6 @@ pub const Client = struct {
                 } else if (pkt_type == @intFromEnum(Protocol.MessageType.@"resume")) {
                     // Forward resume to master
                     const pkt = Protocol.Packet.initResume();
-                    _ = try sys.write(self.socket_fd, pkt.serialize());
-                } else if (pkt_type == @intFromEnum(Protocol.MessageType.claim_active)) {
-                    // Forward active claim to master
-                    const pkt = Protocol.Packet.initClaimActive();
                     _ = try sys.write(self.socket_fd, pkt.serialize());
                 }
                 // Other packet types: ignore
