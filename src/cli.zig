@@ -33,8 +33,8 @@ const usage =
     \\  open <url>        Open a URL in the phone's browser (forwards localhost ports)
     \\  forward <port>    Forward a port to the phone (8000 or http://localhost:8000)
     \\  tab <port>        Open a port in a Clauntty web tab
-    \\  show <image>...   Show images in Clauntty (png, jpg, gif, heic, webp); they
-    \\                    wait on this machine until Clauntty connects
+    \\  show <file>...    Show images (png, jpg, gif, heic, webp) or videos (mp4, mov,
+    \\                    m4v) in Clauntty; they wait on this machine until it connects
     \\  status            Show which session commands go to
     \\  ws <command>      Workspaces, tabs and split panes (clauntty ws for help)
     \\
@@ -187,7 +187,7 @@ fn show(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
         paths.deinit(allocator);
     }
     for (args) |arg| {
-        if (!isImagePath(arg)) return fail("not an image (png, jpg, gif, heic, webp): {s}", .{arg});
+        if (!isMediaPath(arg)) return fail("not an image (png, jpg, gif, heic, webp) or video (mp4, mov, m4v): {s}", .{arg});
         var real_buf: [std.fs.max_path_bytes]u8 = undefined;
         const real_len = std.Io.Dir.cwd().realPathFile(io, arg, &real_buf) catch |err|
             return fail("{s}: {s}", .{ arg, errorText(err) });
@@ -447,9 +447,10 @@ pub fn parsePort(arg: []const u8) ?u16 {
     return if (port == 0) null else port;
 }
 
-pub fn isImagePath(path: []const u8) bool {
+/// What the app can show: images, and videos Apple's players play (not webm or mkv)
+pub fn isMediaPath(path: []const u8) bool {
     const ext = std.fs.path.extension(path);
-    for ([_][]const u8{ ".png", ".jpg", ".jpeg", ".gif", ".heic", ".webp" }) |known| {
+    for ([_][]const u8{ ".png", ".jpg", ".jpeg", ".gif", ".heic", ".webp", ".mp4", ".mov", ".m4v" }) |known| {
         if (std.ascii.eqlIgnoreCase(ext, known)) return true;
     }
     return false;
@@ -506,11 +507,14 @@ test "parsePort" {
     try testing.expectEqual(@as(?u16, null), parsePort("70000"));
 }
 
-test "isImagePath" {
-    try testing.expect(isImagePath("shot.png"));
-    try testing.expect(isImagePath("/tmp/Photo.JPEG"));
-    try testing.expect(!isImagePath("notes.txt"));
-    try testing.expect(!isImagePath("png"));
+test "isMediaPath" {
+    try testing.expect(isMediaPath("shot.png"));
+    try testing.expect(isMediaPath("/tmp/Photo.JPEG"));
+    try testing.expect(isMediaPath("demo.mp4"));
+    try testing.expect(isMediaPath("Screen Recording.MOV"));
+    try testing.expect(!isMediaPath("clip.webm"));
+    try testing.expect(!isMediaPath("notes.txt"));
+    try testing.expect(!isMediaPath("png"));
 }
 
 test "sendLines writes kind;value lines to the FIFO" {

@@ -130,6 +130,22 @@ describe("clauntty show", () => {
     expect(await lines(log, 1)).toEqual(["open;8000;"]);
   });
 
+  test("videos too, but not ones Apple's players can't play", async () => {
+    const log = await app();
+    const video = join(home, "demo.mov");
+    writeFileSync(video, "not really a video");
+    const r = spawnSync([clauntty(), "show", video], { env: env() });
+    expect(r.exitCode).toBe(0);
+    const [line] = await lines(log, 1);
+    expect(line).toMatch(new RegExp(`^image;\\d+-\\d+-0;;${video}$`));
+
+    const webm = join(home, "clip.webm");
+    writeFileSync(webm, "");
+    const refused = spawnSync([clauntty(), "show", webm], { env: env() });
+    expect(refused.exitCode).not.toBe(0);
+    expect(refused.stderr.toString()).toContain("not an image");
+  });
+
   test("nowhere to send it: queued in the inbox", () => {
     const r = spawnSync([clauntty(), "show", image], { env: env() });
     expect(r.stdout.toString()).toContain("Queued 1 image");

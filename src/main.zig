@@ -204,7 +204,9 @@ pub const Protocol = @import("protocol.zig");
 ///          kept while it stays done and across a live upgrade. The app compares it with
 ///          the finish it last showed, so a done dot the user hasn't seen survives the
 ///          app's restart, and an agent that finished while the app was closed gets one.
-pub const version = "2.33.0";
+/// 2.34.0 - `clauntty show` takes videos too (mp4, mov, m4v: what Apple's players play),
+///          for the app to play in its viewer. Sent and queued as images are.
+pub const version = "2.34.0";
 
 /// `-a`'s exit code when the session doesn't exist (it ended)
 pub const no_session_exit: u8 = 3;

@@ -89,7 +89,7 @@ A phone that's away (suspended, so not attached) hears about an agent through AP
 
 ### Images (`clauntty show`, `src/inbox.zig`)
 
-`clauntty show IMG...` writes an inbox entry per image (`~/.clauntty/inbox/<id>`: the path, then on a second line the pane that sent it) and sends `image;<id>;<pane>;<path>` (the pane is `$RTACH_SESSION_ID`, empty outside rtach) to the session the app shows, else to this session's pipe. Going through the shown session means an image from a pane that's off screen still arrives right away. In agent mode the app puts it in the corner of that pane's window. The app deletes an entry once it has shown it, and shows entries left behind when it connects. Tests: `tests/show.test.ts`.
+`clauntty show FILE...` (images, or videos the app can play: mp4, mov, m4v; `cli.isMediaPath`) writes an inbox entry per file (`~/.clauntty/inbox/<id>`: the path, then on a second line the pane that sent it) and sends `image;<id>;<pane>;<path>` (the pane is `$RTACH_SESSION_ID`, empty outside rtach) to the session the app shows, else to this session's pipe. Going through the shown session means an image from a pane that's off screen still arrives right away. In agent mode the app puts it in the corner of that pane's window. The app deletes an entry once it has shown it, and shows entries left behind when it connects. Tests: `tests/show.test.ts`.
 
 ### Live upgrade (`src/upgrade.zig`)
 
