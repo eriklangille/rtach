@@ -842,6 +842,12 @@ pub const Master = struct {
                 _ = setenv("RTACH_SESSION_ID", @ptrCast(socket[socket.len - id.len ..].ptr), 1);
             }
 
+            // The devices using a session are elsewhere, as over SSH. Programs that copy to
+            // the terminal's clipboard (OSC 52) only under SSH (Codex, Neovim) otherwise
+            // copy to this machine's alone. A pane `rtach ws` started had no SSH variables;
+            // one started over SSH had that connection's, gone once it closed.
+            _ = setenv("SSH_TTY", @ptrCast(&self.pty_slave_path), 1);
+
             // Set BROWSER to open-browser so CLI tools use iOS browser
             if (sys.getenv("HOME")) |home| {
                 var browser_path_buf: [std.fs.max_path_bytes]u8 = undefined;

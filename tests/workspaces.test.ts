@@ -116,6 +116,18 @@ describe("rtach ws", () => {
     expect(output).not.toContain("/tmp/caller-bin");
   });
 
+  test("a pane's SSH_TTY is its own terminal", async () => {
+    // Codex sends a copy to the terminal (OSC 52) only under SSH; without it, the copy
+    // went to the host's clipboard and never reached the device
+    const { pane } = wsJson(["new", "--cwd", project], { env: { SSH_TTY: "/dev/ttys999" } });
+
+    const client = attach(pane);
+    await waitForOutput(client, "$ ", 3000);
+    client.stdin.write('[ "$SSH_TTY" = "$(tty)" ] && echo "ssh-tty=own" || echo "ssh-tty=${SSH_TTY:-unset}-other"\n');
+    const output = await waitForOutput(client, /ssh-tty=[a-z\/]/, 3000);
+    expect(output).toContain("ssh-tty=own");
+  });
+
   // zsh reads every startup file from ZDOTDIR, which points at the integration's
   // wrappers; a .zshenv can move the rest of them with its own ZDOTDIR
   for (const dotdir of ["", "zsh"]) {

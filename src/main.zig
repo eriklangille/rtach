@@ -206,7 +206,10 @@ pub const Protocol = @import("protocol.zig");
 ///          app's restart, and an agent that finished while the app was closed gets one.
 /// 2.34.0 - `clauntty show` takes videos too (mp4, mov, m4v: what Apple's players play),
 ///          for the app to play in its viewer. Sent and queued as images are.
-pub const version = "2.34.0";
+/// 2.35.0 - A session's shell has `SSH_TTY` (its own terminal): Codex sends a copy to the
+///          terminal (OSC 52) only under SSH, tmux or Herdr, so in a pane `ws` started it
+///          went to the host's clipboard only.
+pub const version = "2.35.0";
 
 /// `-a`'s exit code when the session doesn't exist (it ended)
 pub const no_session_exit: u8 = 3;
