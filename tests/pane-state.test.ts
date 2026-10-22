@@ -84,8 +84,14 @@ describe("pane state", () => {
     expect(s.agent).toBe("claude");
     expect(s.note).toBe("Claude needs your permission to use Bash");
 
+    expect(s.done_at).toBeUndefined();
+    const before = Date.now();
     client.stdin.write("~/.clauntty/bin/clauntty agent-state done < /dev/null\n");
-    expect((await waitForState((s) => s.state === "done")).note).toBeUndefined();
+    const done = await waitForState((s) => s.state === "done");
+    expect(done.note).toBeUndefined();
+    // When it finished, for the app to tell a finish the user has seen
+    expect(done.done_at).toBeGreaterThanOrEqual(before - 1000);
+    expect(done.done_at).toBeLessThanOrEqual(Date.now() + 1000);
 
     await Bun.sleep(300);
     const lines = readFileSync(appLog, "utf8").split("\n").filter((l) => l.startsWith("pane;"));

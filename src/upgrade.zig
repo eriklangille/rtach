@@ -55,6 +55,7 @@ pub const State = struct {
     note: []const u8 = "",
     task: []const u8 = "",
     from_hook: bool = false,
+    done_at: i64 = 0,
     flushed_status: []const u8 = "none",
     pushed_status: []const u8 = "none",
     /// A command pipe line not finished yet

@@ -602,7 +602,7 @@ pub const Master = struct {
             @memcpy(self.terminal_title[0..title_len], state.title[0..title_len]);
             _ = pane_state.fixUtf8(self.terminal_title[0..title_len]);
             self.terminal_title_len = @intCast(title_len);
-            self.pane.restore(state.fg, state.cwd, state.agent, state.status, state.note, state.task, state.from_hook);
+            self.pane.restore(state.fg, state.cwd, state.agent, state.status, state.note, state.task, state.from_hook, state.done_at);
             self.flushed_status = std.meta.stringToEnum(pane_state.Status, state.flushed_status) orelse .none;
             self.pushed_status = std.meta.stringToEnum(pane_state.Status, state.pushed_status) orelse .none;
             const partial = @min(state.cmd_partial.len, self.cmd_line_buf.len);
@@ -1417,6 +1417,7 @@ pub const Master = struct {
             .note = pane.noteText(),
             .task = pane.taskText(),
             .from_hook = pane.from_hook,
+            .done_at = pane.done_at,
             .flushed_status = @tagName(self.flushed_status),
             .pushed_status = @tagName(self.pushed_status),
             .cmd_partial = self.cmd_line_buf[0..self.cmd_line_len],
@@ -2494,7 +2495,8 @@ pub const Master = struct {
         const status = parts.next() orelse return;
         const note = parts.rest();
         log.info("agent state: {s}", .{status});
-        if (self.pane.applyHook(status, note)) {
+        const now_ms: i64 = @intCast(@divFloor(sys.realtimeNs(), std.time.ns_per_ms));
+        if (self.pane.applyHook(status, note, now_ms)) {
             // Right away: the app may notify the user
             self.pane_dirty = true;
             self.flushPaneState();

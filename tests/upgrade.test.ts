@@ -113,6 +113,23 @@ describe("live upgrade", () => {
     expect(state().agent).toBe("claude");
   });
 
+  test("when an agent finished carries over", async () => {
+    startMaster();
+    await attach();
+    send("state;done;");
+    expect(await until(() => state()?.state === "done")).toBe(true);
+    const doneAt = state().done_at;
+    expect(doneAt).toBeGreaterThan(0);
+    const pid = masterPid();
+    // The new master writes the state file again: read its, not the old one's
+    rmSync(`${sock}.state`);
+    send(`upgrade;${next}`);
+    expect(await until(() => command(pid).includes("--resume"))).toBe(true);
+    expect(await until(() => state() !== null)).toBe(true);
+    expect(state().state).toBe("done");
+    expect(state().done_at).toBe(doneAt);
+  });
+
   test("keyboard modes carry over", async () => {
     startMaster();
     const before = await attach();

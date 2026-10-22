@@ -200,7 +200,11 @@ pub const Protocol = @import("protocol.zig");
 /// 2.32.5 - `ws ... --quiet` tells the app to refresh, only not to show the new pane: it
 ///          told the app nothing, so a workspace an agent made with --quiet didn't
 ///          appear on the laptop, and one the phone made didn't reach the laptop.
-pub const version = "2.32.5";
+/// 2.33.0 - Pane state has `done_at` (unix ms) while an agent is done: when it finished,
+///          kept while it stays done and across a live upgrade. The app compares it with
+///          the finish it last showed, so a done dot the user hasn't seen survives the
+///          app's restart, and an agent that finished while the app was closed gets one.
+pub const version = "2.33.0";
 
 /// `-a`'s exit code when the session doesn't exist (it ended)
 pub const no_session_exit: u8 = 3;

@@ -40,6 +40,9 @@ pub const PaneState = struct {
     task_len: usize = 0,
     /// Set by a hook: then the title doesn't override the status
     from_hook: bool = false,
+    /// Unix ms when the agent last went to done, 0 while it isn't: the app tells a finish
+    /// the user hasn't seen from one they have, across its restarts
+    done_at: i64 = 0,
 
     pub fn fgName(self: *const PaneState) []const u8 {
         return self.fg[0..self.fg_len];
@@ -72,7 +75,7 @@ pub const PaneState = struct {
 
     /// Back as it was before a live upgrade (upgrade.zig): fields by name, unknown names
     /// leave the default
-    pub fn restore(self: *PaneState, fg: []const u8, cwd: []const u8, agent: []const u8, status: []const u8, note: []const u8, task: []const u8, from_hook: bool) void {
+    pub fn restore(self: *PaneState, fg: []const u8, cwd: []const u8, agent: []const u8, status: []const u8, note: []const u8, task: []const u8, from_hook: bool, done_at: i64) void {
         _ = self.setForeground(fg, cwd);
         self.agent = std.meta.stringToEnum(Agent, agent) orelse .none;
         self.status = std.meta.stringToEnum(Status, status) orelse .none;
@@ -81,6 +84,7 @@ pub const PaneState = struct {
         self.note_len = n;
         _ = self.setTask(task);
         self.from_hook = from_hook;
+        self.done_at = if (self.status == .done) done_at else 0;
     }
 
     /// Record the agent's task. True if it changed.
@@ -104,9 +108,9 @@ pub const PaneState = struct {
         return true;
     }
 
-    /// A hook's `state;<status>;<note>` (status "end": the agent exited). True if
-    /// anything changed.
-    pub fn applyHook(self: *PaneState, status_name: []const u8, note: []const u8) bool {
+    /// A hook's `state;<status>;<note>` (status "end": the agent exited), at `now_ms`
+    /// (unix ms). True if anything changed.
+    pub fn applyHook(self: *PaneState, status_name: []const u8, note: []const u8, now_ms: i64) bool {
         const before = self.*;
         if (std.mem.eql(u8, status_name, "end")) {
             self.agent = .none;
@@ -124,6 +128,12 @@ pub const PaneState = struct {
         const n = @min(note.len, self.note.len);
         @memcpy(self.note[0..n], note[0..n]);
         self.note_len = if (self.status == .blocked) n else 0;
+        // A repeated done is the same finish
+        if (self.status != .done) {
+            self.done_at = 0;
+        } else if (before.status != .done) {
+            self.done_at = now_ms;
+        }
         return !std.meta.eql(before.agent, self.agent) or before.status != self.status or
             !std.mem.eql(u8, before.note[0..before.note_len], self.noteText()) or before.task_len != self.task_len;
     }
@@ -142,11 +152,13 @@ pub const PaneState = struct {
             if (self.agent == .none) return false;
             self.agent = .none;
             self.status = .none;
+            self.done_at = 0;
             return true;
         };
         if (self.agent == .claude and self.status == s) return false;
         self.agent = .claude;
         self.status = s;
+        self.done_at = 0;
         return true;
     }
 
@@ -176,6 +188,10 @@ pub const PaneState = struct {
         if (self.task_len > 0) {
             try jw.objectField("task");
             try writeText(&jw, self.taskText());
+        }
+        if (self.done_at != 0) {
+            try jw.objectField("done_at");
+            try jw.write(self.done_at);
         }
         // This master sends push notifications (2.18.0), so the app doesn't post its own
         try jw.objectField("pushes");
@@ -339,28 +355,57 @@ test "hooks set the status; the title only counts without them" {
     try testing.expect(s.applyTitle("✳ Fixing the login redirect"));
     try testing.expectEqual(Status.idle, s.status);
 
-    try testing.expect(s.applyHook("blocked", "Claude needs your permission to use Bash"));
+    try testing.expect(s.applyHook("blocked", "Claude needs your permission to use Bash", 0));
     try testing.expectEqual(Status.blocked, s.status);
     try testing.expectEqualStrings("Claude needs your permission to use Bash", s.noteText());
     try testing.expect(!s.applyTitle("⠋ Fixing"));
     try testing.expectEqual(Status.blocked, s.status);
 
-    try testing.expect(s.applyHook("done", ""));
+    try testing.expect(s.applyHook("done", "", 0));
     try testing.expectEqual(@as(usize, 0), s.note_len);
-    try testing.expect(!s.applyHook("done", ""));
-    try testing.expect(s.applyHook("end", ""));
+    try testing.expect(!s.applyHook("done", "", 0));
+    try testing.expect(s.applyHook("end", "", 0));
     try testing.expectEqual(Agent.none, s.agent);
 }
 
 test "the task is the last prompt; a new session clears it" {
     var s: PaneState = .{};
-    _ = s.applyHook("working", "");
+    _ = s.applyHook("working", "", 0);
     try testing.expect(s.setTask("Fix the login redirect"));
     try testing.expect(!s.setTask("Fix the login redirect"));
-    _ = s.applyHook("done", "");
+    _ = s.applyHook("done", "", 0);
     try testing.expectEqualStrings("Fix the login redirect", s.taskText());
-    try testing.expect(s.applyHook("idle", ""));
+    try testing.expect(s.applyHook("idle", "", 0));
     try testing.expectEqual(@as(usize, 0), s.task_len);
+}
+
+test "done_at is when the agent finished, kept while it stays done" {
+    var s: PaneState = .{};
+    _ = s.applyHook("working", "", 100);
+    try testing.expectEqual(@as(i64, 0), s.done_at);
+    _ = s.applyHook("done", "", 200);
+    try testing.expectEqual(@as(i64, 200), s.done_at);
+    try testing.expect(!s.applyHook("done", "", 300));
+    try testing.expectEqual(@as(i64, 200), s.done_at);
+    _ = s.applyHook("working", "", 400);
+    try testing.expectEqual(@as(i64, 0), s.done_at);
+    _ = s.applyHook("done", "", 500);
+    try testing.expectEqual(@as(i64, 500), s.done_at);
+
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try s.writeJson(&w, "✳ Fix it", "2.33.0");
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "\"done_at\":500") != null);
+
+    // Back after an upgrade
+    var r: PaneState = .{};
+    r.restore("zsh", "/src", "claude", "done", "", "", true, 500);
+    try testing.expectEqual(@as(i64, 500), r.done_at);
+    r.restore("zsh", "/src", "claude", "working", "", "", true, 500);
+    try testing.expectEqual(@as(i64, 0), r.done_at);
+
+    _ = s.applyHook("end", "", 600);
+    try testing.expectEqual(@as(i64, 0), s.done_at);
 }
 
 test "prompts as tasks" {
@@ -396,7 +441,7 @@ test "agent label" {
 test "json line" {
     var s: PaneState = .{};
     _ = s.setForeground("zsh", "/src/app");
-    _ = s.applyHook("blocked", "needs \"you\"");
+    _ = s.applyHook("blocked", "needs \"you\"", 0);
     var buf: [512]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     try s.writeJson(&w, "✳ Fix it", "2.19.0");
