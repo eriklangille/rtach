@@ -298,14 +298,51 @@ pub const Foreground = struct { name: []const u8, cwd: []const u8 };
 pub fn probe(pty_master: posix.fd_t, name_buf: []u8, cwd_buf: []u8) ?Foreground {
     const pgid = tcgetpgrp(pty_master);
     if (pgid <= 0) return null;
+    var fg = switch (builtin.os.tag) {
+        .macos => probeDarwin(pgid, name_buf, cwd_buf),
+        .linux => probeLinux(pgid, name_buf, cwd_buf),
+        else => null,
+    } orelse return null;
+    fg.name = programName(pgid, fg.name);
+    return fg;
+}
+
+/// Claude Code's binary is named after its version (`~/.local/share/claude/versions/
+/// 2.1.309`, what `claude` links to), so its process is "2.1.309": call it claude
+fn programName(pid: posix.pid_t, name: []const u8) []const u8 {
+    if (!looksLikeVersion(name)) return name;
+    var buf: [4096]u8 = undefined;
+    const path = exePath(pid, &buf) orelse return name;
+    return if (std.mem.indexOf(u8, path, "/claude/versions/") != null) "claude" else name;
+}
+
+fn looksLikeVersion(name: []const u8) bool {
+    if (name.len == 0 or !std.ascii.isDigit(name[0])) return false;
+    for (name) |c| {
+        if (!std.ascii.isDigit(c) and c != '.') return false;
+    }
+    return std.mem.indexOfScalar(u8, name, '.') != null;
+}
+
+/// The path of a process's executable
+fn exePath(pid: posix.pid_t, buf: []u8) ?[]const u8 {
     switch (builtin.os.tag) {
-        .macos => return probeDarwin(pgid, name_buf, cwd_buf),
-        .linux => return probeLinux(pgid, name_buf, cwd_buf),
+        .macos => {
+            const n = proc_pidpath(pid, buf.ptr, @intCast(buf.len));
+            return if (n > 0) buf[0..@intCast(n)] else null;
+        },
+        .linux => {
+            var path_buf: [64]u8 = undefined;
+            const exe = std.fmt.bufPrintZ(&path_buf, "/proc/{d}/exe", .{pid}) catch return null;
+            const n = std.c.readlink(exe, buf.ptr, buf.len);
+            return if (n > 0) buf[0..@intCast(n)] else null;
+        },
         else => return null,
     }
 }
 
 extern "c" fn proc_name(pid: c_int, buffer: [*]u8, size: u32) c_int;
+extern "c" fn proc_pidpath(pid: c_int, buffer: [*]u8, size: u32) c_int;
 extern "c" fn proc_pidinfo(pid: c_int, flavor: c_int, arg: u64, buffer: *anyopaque, size: c_int) c_int;
 
 /// sys/proc_info.h: PROC_PIDVNODEPATHINFO gives a proc_vnodepathinfo, whose first
@@ -347,6 +384,14 @@ fn probeLinux(pid: posix.pid_t, name_buf: []u8, cwd_buf: []u8) ?Foreground {
 // MARK: Tests
 
 const testing = std.testing;
+
+test "a version for a name is Claude Code's binary, maybe" {
+    try testing.expect(looksLikeVersion("2.1.309"));
+    try testing.expect(!looksLikeVersion("claude"));
+    try testing.expect(!looksLikeVersion("node"));
+    try testing.expect(!looksLikeVersion("2to3"));
+    try testing.expect(!looksLikeVersion(""));
+}
 
 test "hooks set the status; the title only counts without them" {
     var s: PaneState = .{};

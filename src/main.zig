@@ -209,7 +209,10 @@ pub const Protocol = @import("protocol.zig");
 /// 2.35.0 - A session's shell has `SSH_TTY` (its own terminal): Codex sends a copy to the
 ///          terminal (OSC 52) only under SSH, tmux or Herdr, so in a pane `ws` started it
 ///          went to the host's clipboard only.
-pub const version = "2.35.0";
+/// 2.35.1 - Claude Code's process is "claude" in pane state, not its version: its binary
+///          is named after the version (`~/.local/share/claude/versions/2.1.309`), so
+///          the app's cards said "2.1.309 · ~/Projects/app".
+pub const version = "2.35.1";
 
 /// `-a`'s exit code when the session doesn't exist (it ended)
 pub const no_session_exit: u8 = 3;
