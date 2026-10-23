@@ -97,7 +97,10 @@ pub const PaneState = struct {
     }
 
     /// Record the foreground process. True if anything changed.
-    pub fn setForeground(self: *PaneState, fg: []const u8, cwd: []const u8) bool {
+    pub fn setForeground(self: *PaneState, fg_name: []const u8, cwd: []const u8) bool {
+        // Claude Code under its version's name whose binary an update has since removed:
+        // `programName` can't find where it ran from, but the hooks said it's Claude
+        const fg = if (self.agent == .claude and looksLikeVersion(fg_name)) "claude" else fg_name;
         const fg_n = @min(fg.len, self.fg.len);
         const cwd_n = @min(cwd.len, self.cwd.len);
         if (std.mem.eql(u8, self.fgName(), fg[0..fg_n]) and std.mem.eql(u8, self.cwdPath(), cwd[0..cwd_n])) return false;
@@ -384,6 +387,17 @@ fn probeLinux(pid: posix.pid_t, name_buf: []u8, cwd_buf: []u8) ?Foreground {
 // MARK: Tests
 
 const testing = std.testing;
+
+test "a version for a name is claude once the pane is known to run Claude" {
+    var s: PaneState = .{};
+    _ = s.setForeground("2.1.305", "/tmp");
+    try testing.expectEqualStrings("2.1.305", s.fgName());
+    s.agent = .claude;
+    try testing.expect(s.setForeground("2.1.305", "/tmp"));
+    try testing.expectEqualStrings("claude", s.fgName());
+    _ = s.setForeground("node", "/tmp");
+    try testing.expectEqualStrings("node", s.fgName());
+}
 
 test "a version for a name is Claude Code's binary, maybe" {
     try testing.expect(looksLikeVersion("2.1.309"));

@@ -212,7 +212,9 @@ pub const Protocol = @import("protocol.zig");
 /// 2.35.1 - Claude Code's process is "claude" in pane state, not its version: its binary
 ///          is named after the version (`~/.local/share/claude/versions/2.1.309`), so
 ///          the app's cards said "2.1.309 · ~/Projects/app".
-pub const version = "2.35.1";
+/// 2.35.2 - The same when that version's binary is gone (Claude's updater removes old
+///          ones while sessions still run them) and the pane is known to run Claude.
+pub const version = "2.35.2";
 
 /// `-a`'s exit code when the session doesn't exist (it ended)
 pub const no_session_exit: u8 = 3;
