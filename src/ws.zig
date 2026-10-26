@@ -29,6 +29,26 @@ const Allocator = std.mem.Allocator;
 
 pub const Dir = enum { h, v };
 
+/// Where `move` puts a pane next to another
+pub const Side = enum {
+    left,
+    right,
+    up,
+    down,
+
+    fn dir(self: Side) Dir {
+        return switch (self) {
+            .left, .right => .h,
+            .up, .down => .v,
+        };
+    }
+
+    /// The moved pane takes the first half
+    fn before(self: Side) bool {
+        return self == .left or self == .up;
+    }
+};
+
 pub const Layout = union(enum) {
     pane: []const u8,
     split: *Split,
@@ -71,16 +91,23 @@ pub const Layout = union(enum) {
 
     /// The layout with `pane` split: `pane` keeps the first half, `new_pane` gets the second
     fn splitPane(self: Layout, arena: Allocator, pane: []const u8, dir: Dir, new_pane: []const u8) !Layout {
+        return self.insert(arena, pane, dir, new_pane, false);
+    }
+
+    /// The layout with `pane` split, `new_pane` taking the first half (left or top) if
+    /// `before`, else the second
+    fn insert(self: Layout, arena: Allocator, pane: []const u8, dir: Dir, new_pane: []const u8, before: bool) !Layout {
         switch (self) {
             .pane => |id| {
                 if (!std.mem.eql(u8, id, pane)) return self;
                 const s = try arena.create(Split);
-                s.* = .{ .dir = dir, .ratio = 0.5, .a = self, .b = .{ .pane = new_pane } };
+                const added: Layout = .{ .pane = new_pane };
+                s.* = .{ .dir = dir, .ratio = 0.5, .a = if (before) added else self, .b = if (before) self else added };
                 return .{ .split = s };
             },
             .split => |s| {
-                s.a = try s.a.splitPane(arena, pane, dir, new_pane);
-                s.b = try s.b.splitPane(arena, pane, dir, new_pane);
+                s.a = try s.a.insert(arena, pane, dir, new_pane, before);
+                s.b = try s.b.insert(arena, pane, dir, new_pane, before);
                 return self;
             },
         }
@@ -565,6 +592,8 @@ const usage =
     \\  end WS                      End a workspace and all its panes
     \\  add SESSION...              Make each existing session a one-pane workspace
     \\  move PANE TAB               Move PANE into TAB, next to its last pane
+    \\  move PANE OTHER --left|--right|--up|--down
+    \\                              Move PANE to that side of OTHER, splitting it
     \\  rename ID NAME              Rename a workspace or tab
     \\  reorder WS [--before OTHER] Move a workspace before OTHER, or last
     \\  resize PANE OTHER RATIO     The split between two panes of a tab gives PANE's
@@ -739,6 +768,8 @@ const Parsed = struct {
     after: ?[]const u8 = null,
     before: ?[]const u8 = null,
     dir: Dir = .h,
+    /// `move`'s --left, --right, --up or --down
+    side: ?Side = null,
     json: bool = false,
     /// After `--`: a command to type in the new pane
     run: ?[]const u8 = null,
@@ -767,6 +798,8 @@ fn parse(arena: Allocator, args: []const []const u8) !Parsed {
             p.dir = .h;
         } else if (std.mem.eql(u8, arg, "-v")) {
             p.dir = .v;
+        } else if (arg.len > 2 and std.mem.startsWith(u8, arg, "--") and std.meta.stringToEnum(Side, arg[2..]) != null) {
+            p.side = std.meta.stringToEnum(Side, arg[2..]);
         } else if (std.mem.eql(u8, arg, "--json")) {
             p.json = true;
         } else if (std.mem.eql(u8, arg, "--")) {
@@ -932,6 +965,7 @@ fn cmdMove(ctx: *Context, args: []const []const u8) !void {
     const p = try parse(ctx.arena, args);
     if (p.positional.items.len != 2) return error.Usage;
     const pane = p.positional.items[0];
+    if (p.side) |side| return movePane(ctx, pane, p.positional.items[1], side);
     const tab_id = p.positional.items[1];
     var store = try Store.open(ctx.arena, ctx.io, ctx.home);
     defer store.close();
@@ -969,6 +1003,23 @@ fn cmdMove(ctx: *Context, args: []const []const u8) !void {
     try store.save();
     ctx.json(.{ .workspace = ws_id, .tab = tab_copy, .pane = pane });
     ctx.notify(ws_id, pane);
+}
+
+/// `move PANE OTHER --side`: PANE leaves its place, its sibling taking it, and splits
+/// OTHER's in half on that side. OTHER can be in another tab or workspace.
+fn movePane(ctx: *Context, pane: []const u8, other: []const u8, side: Side) !void {
+    if (std.mem.eql(u8, pane, other)) return error.Usage;
+    var store = try Store.open(ctx.arena, ctx.io, ctx.home);
+    defer store.close();
+    if (store.workspaceOf(pane) == null or store.workspaceOf(other) == null) return error.NotInWorkspace;
+    // OTHER stays, so its tab and workspace do; removePane can move them in the list
+    store.removePane(pane);
+    const ws = store.workspaceOf(other).?;
+    const tab = ws.tabOf(other).?;
+    tab.layout = try tab.layout.insert(ctx.arena, other, side.dir(), pane, side.before());
+    try store.save();
+    ctx.json(.{ .workspace = ws.id, .tab = tab.id, .pane = pane });
+    ctx.notify(ws.id, pane);
 }
 
 fn cmdRename(ctx: *Context, args: []const []const u8) !void {
@@ -1146,6 +1197,29 @@ test "split, then remove, gives the sibling its place" {
     layout = layout.without("A").?;
     try testing.expectEqualStrings("\"C\"", try layoutJson(arena, layout));
     try testing.expect(layout.without("C") == null);
+}
+
+test "a bottom pane moved beside the top one: out, then in on that side" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var layout = try testLayout(arena,
+        \\{"split":"v","ratio":0.7,"a":"A","b":"B"}
+    );
+    layout = layout.without("B").?;
+    layout = try layout.insert(arena, "A", Side.left.dir(), "B", Side.left.before());
+    try testing.expectEqualStrings(
+        \\{"split":"h","ratio":0.5,"a":"B","b":"A"}
+    , try layoutJson(arena, layout));
+
+    // Deeper: C goes under B, the split around A and B stays
+    layout = try layout.splitPane(arena, "A", .v, "C");
+    layout = layout.without("C").?;
+    layout = try layout.insert(arena, "B", Side.down.dir(), "C", Side.down.before());
+    try testing.expectEqualStrings(
+        \\{"split":"h","ratio":0.5,"a":{"split":"v","ratio":0.5,"a":"B","b":"C"},"b":"A"}
+    , try layoutJson(arena, layout));
 }
 
 test "a workspace round-trips through JSON" {

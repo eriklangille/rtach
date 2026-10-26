@@ -269,6 +269,29 @@ describe("rtach ws", () => {
     expect(after.tabs.map((t) => t.name)).toEqual(["1", "logs"]);
   });
 
+  test("move beside another pane: a bottom pane becomes a side one, or goes to another tab", () => {
+    const { workspace, tab: t1, pane: a } = wsJson(["new", "proj", "--cwd", project]);
+    const { pane: b } = wsJson(["split", a, "-v"]);
+
+    expect(wsJson(["move", b, a, "--right"])).toEqual({ workspace, tab: t1, pane: b });
+    let [w] = list();
+    expect(w.tabs[0].layout).toEqual({ split: "h", ratio: 0.5, a, b });
+
+    wsJson(["move", b, a, "--up"]);
+    [w] = list();
+    expect(w.tabs[0].layout).toEqual({ split: "v", ratio: 0.5, a: b, b: a });
+
+    // Into another tab: the one it leaves, now empty, goes
+    const { tab: t2, pane: c } = wsJson(["tab", workspace]);
+    wsJson(["move", c, b, "--left"]);
+    [w] = list();
+    expect(w.tabs.map((t) => t.id)).toEqual([t1]);
+    expect(w.tabs[0].layout).toEqual({ split: "v", ratio: 0.5, a: { split: "h", ratio: 0.5, a: c, b }, b: a });
+    expect(t2).not.toBe(t1);
+
+    expect(() => ws(["move", a, a, "--left"])).toThrow();
+  });
+
   test("reorder keeps an order on the host; new goes after the workspace it came from", () => {
     const { workspace: w1, pane: a } = wsJson(["new", "one", "--cwd", project]);
     const { workspace: w2 } = wsJson(["new", "two", "--cwd", project]);

@@ -219,7 +219,9 @@ pub const Protocol = @import("protocol.zig");
 ///          and a write that would block dropped the client. A terminal client (laptop,
 ///          picker) sent a 254- or 255-byte read of input as one byte: the packet's
 ///          length overflowed a u8 (`Packet.serialize`), and the master lost sync.
-pub const version = "2.35.3";
+/// 2.36.0 - `ws move PANE OTHER --left|--right|--up|--down` puts a pane on that side of
+///          another, in its tab or another: the Mac app's panes are dragged by their title.
+pub const version = "2.36.0";
 
 /// `-a`'s exit code when the session doesn't exist (it ended)
 pub const no_session_exit: u8 = 3;
