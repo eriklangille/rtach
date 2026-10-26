@@ -40,6 +40,7 @@ The iOS app uses the version to determine when to redeploy the binary to remote 
 - Client→Server: `[type:1B][len:1B][payload]` (max 255B)
 - Server→Client: `[type:1B][len:4B][payload]`
 - Active claim: `[type=10][len=0]` (foreground client for commands)
+- Input to the PTY (`push`, raw clients) goes through `Master.writePty`: a non-blocking write takes what the PTY has room for (about 1KB on macOS until the program reads), the rest queues (up to 1MB) and a libxev write on a `dup` of the PTY fd sends it as the PTY takes it (epoll allows one watcher per fd, and the PTY's read is always armed). Queued input doesn't survive a live upgrade. Tests: `tests/paste.test.ts` ("paste to a program that isn't reading yet").
 
 ### Terminal size
 

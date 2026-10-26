@@ -401,7 +401,9 @@ pub const Packet = struct {
 
     /// Serialize packet for transmission
     pub fn serialize(self: *const Packet) []const u8 {
-        const total_len = @sizeOf(PacketHeader) + self.header.len;
+        // In usize: as u8, a payload of 254 or 255 overflowed (a panic in Debug, and in
+        // release a packet of just its type byte, which desynced the master)
+        const total_len = @sizeOf(PacketHeader) + @as(usize, self.header.len);
         const self_bytes: [*]const u8 = @ptrCast(self);
         return self_bytes[0..total_len];
     }
@@ -520,6 +522,9 @@ test "packet with max payload size" {
     const pkt = Packet.init(.push, &data);
     try testing.expectEqual(@as(u8, MAX_PAYLOAD_SIZE), pkt.header.len);
     try testing.expectEqual(@as(usize, MAX_PAYLOAD_SIZE), pkt.getPayload().len);
+    const bytes = pkt.serialize();
+    try testing.expectEqual(@as(usize, 2 + MAX_PAYLOAD_SIZE), bytes.len);
+    try testing.expectEqualSlices(u8, &data, bytes[2..]);
 }
 
 test "packet with data larger than max truncates" {

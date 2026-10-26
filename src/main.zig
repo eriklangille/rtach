@@ -214,7 +214,12 @@ pub const Protocol = @import("protocol.zig");
 ///          the app's cards said "2.1.309 · ~/Projects/app".
 /// 2.35.2 - The same when that version's binary is gone (Claude's updater removes old
 ///          ones while sessions still run them) and the pane is known to run Claude.
-pub const version = "2.35.2";
+/// 2.35.3 - Input the PTY can't take yet waits in the master and goes in as the program
+///          reads. A PTY takes about 1KB (macOS): the rest of a bigger paste was lost,
+///          and a write that would block dropped the client. A terminal client (laptop,
+///          picker) sent a 254- or 255-byte read of input as one byte: the packet's
+///          length overflowed a u8 (`Packet.serialize`), and the master lost sync.
+pub const version = "2.35.3";
 
 /// `-a`'s exit code when the session doesn't exist (it ended)
 pub const no_session_exit: u8 = 3;

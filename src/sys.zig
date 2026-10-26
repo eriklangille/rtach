@@ -83,6 +83,13 @@ pub fn dup2(old_fd: fd_t, new_fd: fd_t) void {
     while (posix.errno(system.dup2(old_fd, new_fd)) == .INTR) {}
 }
 
+/// A second fd for the same open file, closed on exec
+pub fn dupCloexec(fd: fd_t) error{Unexpected}!fd_t {
+    const rc = system.fcntl(fd, posix.F.DUPFD_CLOEXEC, @as(c_int, 0));
+    if (rc < 0) return error.Unexpected;
+    return rc;
+}
+
 pub fn unlink(path: []const u8) void {
     const path_z = posix.toPosixPath(path) catch return;
     _ = system.unlink(&path_z);

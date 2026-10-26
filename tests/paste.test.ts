@@ -14,6 +14,9 @@ import {
   type RawRtachConnection,
 } from "./helpers";
 import type { Subprocess } from "bun";
+import { writeFileSync, chmodSync, unlinkSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 
 /**
  * Paste reliability tests
@@ -225,6 +228,76 @@ describe("paste reliability", () => {
 
     const result = await waitForFramedData(rawConn, marker, 5000);
     expect(result).toContain(marker);
+  });
+});
+
+/**
+ * Input the PTY can't take yet (master.zig writePty)
+ *
+ * A PTY takes about 1KB of input until the program reads it (macOS). The master
+ * used to write each packet once: the rest of a paste was lost, and a write that
+ * would block dropped the client. Here the program waits a second before reading,
+ * so all but the first KB has to wait in the master's queue.
+ */
+describe("paste to a program that isn't reading yet", () => {
+  let socketPath: string;
+  let script: string;
+  let rawConn: RawRtachConnection | null = null;
+
+  beforeEach(async () => {
+    socketPath = uniqueSocketPath();
+    // rtach runs one executable with no arguments; raw so no line is too long
+    script = join(tmpdir(), `rtach-test-slowcat-${Math.random().toString(36).substring(2, 10)}.sh`);
+    writeFileSync(script, "#!/bin/sh\nstty raw -echo\nsleep 1\nexec cat\n");
+    chmodSync(script, 0o755);
+    await startDetachedMaster(socketPath, script, 256 * 1024);
+  });
+
+  afterEach(async () => {
+    if (rawConn) {
+      rawConn.close();
+      rawConn = null;
+    }
+    await cleanupAll();
+    try { unlinkSync(script); } catch {}
+  });
+
+  test("32KB paste arrives whole and the client stays", async () => {
+    rawConn = await connectRawSocketWithUpgrade(socketPath);
+    sendAttachPacket(rawConn, "paste-queue-test");
+    await Bun.sleep(100);
+    rawConn.dataBuffer = Buffer.alloc(0);
+
+    const lines: string[] = [];
+    for (let i = 0; i < 800; i++) lines.push(`line ${i.toString().padStart(3, "0")}: ${"Z".repeat(30)}`);
+    const marker = `QUEUE_END_${Date.now()}`;
+    const content = lines.join("\n") + "\n" + marker;
+    expect(content.length).toBeGreaterThan(32000);
+
+    // All at once, before the program reads
+    const bytes = Buffer.from(content, "utf8");
+    const packets: Buffer[] = [];
+    for (let i = 0; i < bytes.length; i += 255) {
+      const chunk = bytes.subarray(i, Math.min(i + 255, bytes.length));
+      packets.push(Buffer.concat([Buffer.from([MessageType.PUSH, chunk.length]), chunk]));
+    }
+    rawConn.socket.write(Buffer.concat(packets));
+
+    let output = "";
+    const start = Date.now();
+    while (!output.includes(marker) && Date.now() - start < 10000) {
+      while (rawConn.dataBuffer.length >= 5) {
+        const len = rawConn.dataBuffer.readUInt32LE(1);
+        if (rawConn.dataBuffer.length < 5 + len) break;
+        if (rawConn.dataBuffer[0] === ResponseType.TERMINAL_DATA) {
+          output += rawConn.dataBuffer.subarray(5, 5 + len).toString();
+        }
+        rawConn.dataBuffer = rawConn.dataBuffer.subarray(5 + len);
+      }
+      await Bun.sleep(10);
+    }
+
+    expect(output).toContain(content);
   });
 });
 
@@ -554,10 +627,11 @@ describe("client.zig framed stdin handling", () => {
     expect(output).toContain("const value49");
   });
 
-  // Note: This test is slightly flaky (~20% failure rate) due to timing sensitivity
-  // in process spawning and pipe I/O. The underlying functionality works correctly -
-  // the sliding window handles large pastes fine. When it fails, it's due to the
-  // client process exiting before all data is received, likely a race in test cleanup.
+  // Skipped: fails every time (2.35.2 and 2.35.3): the --proxy client's stdout ends
+  // with no terminal data and nothing on its stderr. Not the master's PTY queue
+  // ("paste to a program that isn't reading yet" passes with 32KB) or Packet.serialize
+  // (fixed in 2.35.3); the client's framed stdin path with more than its 4KB buffer is
+  // the suspect.
   test.skip("16KB paste (larger than 4KB buffer, tests sliding window)", async () => {
     const { sendFramedPacket, waitForFramedOutput } = await connectFramedClient();
 

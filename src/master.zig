@@ -423,6 +423,17 @@ pub const Master = struct {
     pty_completion: xev.Completion = .{},
     socket_completion: xev.Completion = .{},
     pty_read_buf: [4096]u8 = undefined,
+    /// Input the PTY hasn't taken yet. A PTY takes about 1KB until the program reads
+    /// (macOS), so a paste waits here and goes in as it does (see writePty).
+    pty_input: std.ArrayList(u8) = .empty,
+    /// The write in flight: pty_write_buf[0..pty_write_len], or none at 0
+    pty_write_buf: [4096]u8 = undefined,
+    pty_write_len: usize = 0,
+    /// A second fd for the PTY, for those writes: epoll takes one watcher per fd, and
+    /// the PTY's read is always armed. Made on the first input that has to wait.
+    pty_write_fd: posix.fd_t = -1,
+    pty_write_stream: xev.Stream = undefined,
+    pty_write_completion: xev.Completion = .{},
     /// Strips terminal queries from output stored for replay (see query_filter.zig)
     replay_filter: QueryFilter = .{},
     replay_buf: [4096 + QueryFilter.max_pending]u8 = undefined,
@@ -943,6 +954,12 @@ pub const Master = struct {
             sys.close(self.pty_master);
             self.pty_master = -1;
         }
+        if (self.pty_write_fd >= 0) {
+            sys.close(self.pty_write_fd);
+            self.pty_write_fd = -1;
+        }
+        self.pty_input.deinit(self.allocator);
+        self.pty_input = .empty;
         if (self.cmd_fifo_fd >= 0) {
             sys.close(self.cmd_fifo_fd);
             self.cmd_fifo_fd = -1;
@@ -1026,6 +1043,94 @@ pub const Master = struct {
             if (client.pending_remove or !client.framed_mode) continue;
             writeFramed(client.fd, .command, "ended");
         }
+    }
+
+    /// Input waiting for the PTY past this is dropped: a program that stopped reading
+    /// shouldn't grow the master without bound
+    const max_pty_input = 1024 * 1024;
+
+    /// Input for the program, in order. A non-blocking write takes what the PTY has room
+    /// for (about 1KB on macOS until the program reads); the rest waits in `pty_input`
+    /// and pty_write_stream writes it as the PTY takes it. One write to the PTY dropped
+    /// the rest of a paste, and its WouldBlock dropped the client.
+    fn writePty(self: *Master, data: []const u8) void {
+        var rest = data;
+        if (self.pty_write_len == 0 and self.pty_input.items.len == 0) {
+            const n = sys.write(self.pty_master, rest) catch |err| switch (err) {
+                error.WouldBlock => 0,
+                else => {
+                    log.warn("failed to write to PTY: {}", .{err});
+                    return;
+                },
+            };
+            rest = rest[n..];
+            if (rest.len == 0) return;
+        }
+        if (self.pty_input.items.len + rest.len > max_pty_input) {
+            log.warn("PTY input queue full, dropping {} bytes", .{rest.len});
+            return;
+        }
+        self.pty_input.appendSlice(self.allocator, rest) catch {
+            log.warn("PTY input queue: out of memory, dropping {} bytes", .{rest.len});
+            return;
+        };
+        if (self.pty_write_len == 0) self.startPtyWrite();
+    }
+
+    /// Move the next of `pty_input` into pty_write_buf and write it when the PTY has room
+    fn startPtyWrite(self: *Master) void {
+        if (self.pty_write_fd < 0) {
+            self.pty_write_fd = sys.dupCloexec(self.pty_master) catch {
+                log.warn("PTY input: no fd to write with, dropping {} bytes", .{self.pty_input.items.len});
+                self.pty_input.clearRetainingCapacity();
+                return;
+            };
+            self.pty_write_stream = xev.Stream.initFd(self.pty_write_fd);
+        }
+        const n = @min(self.pty_input.items.len, self.pty_write_buf.len);
+        @memcpy(self.pty_write_buf[0..n], self.pty_input.items[0..n]);
+        self.pty_input.replaceRangeAssumeCapacity(0, n, &.{});
+        self.pty_write_len = n;
+        self.armPtyWrite();
+    }
+
+    fn armPtyWrite(self: *Master) void {
+        self.pty_write_stream.write(
+            &self.loop,
+            &self.pty_write_completion,
+            .{ .slice = self.pty_write_buf[0..self.pty_write_len] },
+            Master,
+            self,
+            ptyWriteCallback,
+        );
+    }
+
+    fn ptyWriteCallback(
+        self_opt: ?*Master,
+        _: *xev.Loop,
+        _: *xev.Completion,
+        _: xev.Stream,
+        _: xev.WriteBuffer,
+        result: xev.WriteError!usize,
+    ) xev.CallbackAction {
+        const self = self_opt orelse return .disarm;
+        // The loop writes once the PTY has room, so an error here is the PTY gone
+        const n = result catch |err| {
+            log.warn("failed to write to PTY: {}, dropping {} bytes of input", .{ err, self.pty_write_len + self.pty_input.items.len });
+            self.pty_write_len = 0;
+            self.pty_input.clearRetainingCapacity();
+            return .disarm;
+        };
+        if (n < self.pty_write_len) {
+            std.mem.copyForwards(u8, self.pty_write_buf[0 .. self.pty_write_len - n], self.pty_write_buf[n..self.pty_write_len]);
+            self.pty_write_len -= n;
+            self.armPtyWrite();
+        } else if (self.pty_input.items.len > 0) {
+            self.startPtyWrite();
+        } else {
+            self.pty_write_len = 0;
+        }
+        return .disarm;
     }
 
     fn ptyReadCallback(
@@ -1939,18 +2044,14 @@ pub const Master = struct {
                     if (data.len > packet_len) {
                         client.last_input_ns = self.nowNs();
                         self.updateActiveClient();
-                        _ = sys.write(self.pty_master, data[packet_len..]) catch |err| {
-                            log.warn("failed to write to PTY: {}", .{err});
-                        };
+                        self.writePty(data[packet_len..]);
                     }
                 }
             } else {
                 // Forward to PTY as raw input
                 client.last_input_ns = self.nowNs();
                 self.updateActiveClient();
-                _ = sys.write(self.pty_master, data) catch |err| {
-                    log.warn("failed to write to PTY: {}", .{err});
-                };
+                self.writePty(data);
             }
         }
 
@@ -2127,7 +2228,7 @@ pub const Master = struct {
                         self.updateActiveClient();
                         if (self.size_client != client) self.updateSizeClient();
                     }
-                    _ = try sys.write(self.pty_master, payload);
+                    self.writePty(payload);
                 }
             },
             .winch => {
