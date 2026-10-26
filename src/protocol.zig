@@ -64,7 +64,9 @@ pub const ResponseType = enum(u8) {
     pty_size = 7,
     /// After an attach, the screen is ready to show: after the replay, or for a program
     /// on the alternate screen, from here on comes its redraw at the real size (see
-    /// Master.startNudge). Empty. Only to clients that attached with ATTACH_FLAG_READY.
+    /// Master.startNudge). Only to clients that attached with ATTACH_FLAG_READY. Empty,
+    /// or (2.37.0+) READY_FLAG_* flags u8, then the foreground program's name: older
+    /// clients read it by its length and skip it.
     ready = 8,
 };
 
@@ -161,6 +163,11 @@ pub const ATTACH_FLAG_BACKGROUND: u8 = 1 << 2;
 /// doesn't take the PTY's size or count as use. Without it (or from older apps), a claim
 /// is both. Older masters ignore the payload.
 pub const CLAIM_FLAG_COMMANDS_ONLY: u8 = 1 << 0;
+
+/// `ready` payload flag: the program on the alternate screen didn't draw for the nudge,
+/// so the screen is blank until it does. It isn't responding: stuck, or waiting on
+/// something on the host (a permission dialog), so the app can say so.
+pub const READY_FLAG_NO_REDRAW: u8 = 1 << 0;
 
 /// Handshake flag: the master supports request_history
 pub const HANDSHAKE_FLAG_HISTORY: u16 = 1 << 0;

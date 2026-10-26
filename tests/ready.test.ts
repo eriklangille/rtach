@@ -24,6 +24,7 @@ import {
 const READY = 8;
 const ATTACH_FLAG_READY = 1 << 1;
 const HANDSHAKE_FLAG_READY = 1 << 2;
+const READY_FLAG_NO_REDRAW = 1 << 0;
 
 // On the alternate screen, prints its size on every SIGWINCH
 const TUI = `#!/bin/sh
@@ -89,7 +90,8 @@ describe("ready", () => {
     return conn;
   }
 
-  /** What a client got, in order: terminal text and "<ready>" where it came */
+  /** What a client got, in order: terminal text and "<ready>" where it came ("<ready
+   * no-redraw NAME>" when the program didn't draw for the nudge) */
   function events(conn: RawRtachConnection): string[] {
     const out: string[] = [];
     while (conn.dataBuffer.length >= 5) {
@@ -98,6 +100,8 @@ describe("ready", () => {
       if (conn.dataBuffer.length < 5 + len) break;
       const payload = conn.dataBuffer.subarray(5, 5 + len);
       if (type === ResponseType.TERMINAL_DATA) out.push(payload.toString());
+      else if (type === READY && len > 0 && (payload[0] & READY_FLAG_NO_REDRAW) !== 0)
+        out.push(`<ready no-redraw ${payload.subarray(1).toString()}>`);
       else if (type === READY) out.push("<ready>");
       conn.dataBuffer = conn.dataBuffer.subarray(5 + len);
     }
@@ -164,7 +168,9 @@ describe("ready", () => {
 
     const c = await client("ready-client", S, true);
     await Bun.sleep(1300);
-    expect(events(c)).toContain("<ready>");
+    // It says the program didn't draw, and which program
+    // (the shell running the script: bash or sh)
+    expect(events(c)).toContainEqual(expect.stringMatching(/^<ready no-redraw (ba)?sh>$/));
     // The nudge gave up and put the size back
     send(watcher, MessageType.PUSH, Buffer.from("\n"));
     await Bun.sleep(300);

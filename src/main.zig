@@ -221,7 +221,10 @@ pub const Protocol = @import("protocol.zig");
 ///          length overflowed a u8 (`Packet.serialize`), and the master lost sync.
 /// 2.36.0 - `ws move PANE OTHER --left|--right|--up|--down` puts a pane on that side of
 ///          another, in its tab or another: the Mac app's panes are dragged by their title.
-pub const version = "2.36.0";
+/// 2.37.0 - `ready` says when the program on the alternate screen didn't draw for the
+///          nudge (READY_FLAG_NO_REDRAW, then its name): the app's pane was blank with no
+///          sign why (Claude stuck behind a permission dialog on the host).
+pub const version = "2.37.0";
 
 /// `-a`'s exit code when the session doesn't exist (it ended)
 pub const no_session_exit: u8 = 3;

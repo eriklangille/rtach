@@ -1203,7 +1203,7 @@ pub const Master = struct {
 
         // The program drew for the nudge's short size (a whole synchronized frame, if it
         // draws in them): it read the change, so the size can go back
-        if (self.nudging and !self.modes.sync_frame) self.finishNudge();
+        if (self.nudging and !self.modes.sync_frame) self.finishNudge(true);
 
         // Re-arm PTY read
         self.pty_stream.read(
@@ -1230,31 +1230,42 @@ pub const Master = struct {
     fn startNudge(self: *Master) void {
         // The one under way covers this client too
         if (self.nudging) return;
-        if (self.winsize.rows <= 2) return self.finishNudge();
+        if (self.winsize.rows <= 2) return self.finishNudge(true);
         self.signalSize(self.winsize.rows - 1, self.winsize.cols);
         self.nudging = true;
         self.nudge_started_ns = self.nowNs();
         log.info("nudge: {}x{} for a redraw", .{ self.winsize.cols, self.winsize.rows - 1 });
     }
 
-    /// Put the PTY back at its size, and tell the clients waiting the screen is ready
-    fn finishNudge(self: *Master) void {
+    /// Put the PTY back at its size, and tell the clients waiting the screen is ready.
+    /// `drew`: the program drew for the nudge; if not, their screen stays blank until it
+    /// does, and `ready` says so.
+    fn finishNudge(self: *Master, drew: bool) void {
         if (self.nudging) {
             self.nudging = false;
             self.signalSize(self.winsize.rows, self.winsize.cols);
             log.info("nudge: back to {}x{}", .{ self.winsize.cols, self.winsize.rows });
         }
         for (self.clients.items) |client| {
-            if (client.awaiting_ready and !client.pending_remove) self.sendReady(client);
+            if (client.awaiting_ready and !client.pending_remove) self.sendReady(client, drew);
         }
     }
 
-    fn sendReady(self: *Master, client: *ClientConn) void {
-        _ = self;
+    fn sendReady(self: *Master, client: *ClientConn, drew: bool) void {
         client.awaiting_ready = false;
-        // Empty: just the header (writeFramed skips empty payloads)
-        const header = Protocol.ResponseHeader{ .type = .ready, .len = 0 };
-        writeAll(client.fd, header.toBytes());
+        if (drew) {
+            // Empty: just the header (writeFramed skips empty payloads)
+            const header = Protocol.ResponseHeader{ .type = .ready, .len = 0 };
+            writeAll(client.fd, header.toBytes());
+            return;
+        }
+        // The flag, then the program's name for the app to show
+        var payload: [1 + 64]u8 = undefined;
+        payload[0] = Protocol.READY_FLAG_NO_REDRAW;
+        const name = self.pane.fgName();
+        const n = @min(name.len, payload.len - 1);
+        @memcpy(payload[1..][0..n], name[0..n]);
+        writeFramed(client.fd, .ready, payload[0 .. 1 + n]);
     }
 
     /// Set the PTY's size and signal the program, without changing `winsize`
@@ -1360,7 +1371,7 @@ pub const Master = struct {
         // A program that doesn't redraw for the nudge
         if (self.nudging and now - self.nudge_started_ns >= NUDGE_TIMEOUT_NS) {
             log.info("nudge: no redraw, going back", .{});
-            self.finishNudge();
+            self.finishNudge(false);
         }
 
         // Write title to file if dirty (debounced)
@@ -1480,7 +1491,7 @@ pub const Master = struct {
     /// and then this master carries on as it was.
     fn upgradeTo(self: *Master, path: []const u8) void {
         // Not with the PTY one row short
-        if (self.nudging) self.finishNudge();
+        if (self.nudging) self.finishNudge(true);
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
         const path_z = std.fmt.bufPrintZ(&path_buf, "{s}", .{path}) catch return;
         if (std.c.access(path_z, std.c.X_OK) != 0) {
@@ -1750,7 +1761,7 @@ pub const Master = struct {
         if (ends_nudge) self.nudging = false;
         defer if (ends_nudge) {
             for (self.clients.items) |client| {
-                if (client.awaiting_ready and !client.pending_remove) self.sendReady(client);
+                if (client.awaiting_ready and !client.pending_remove) self.sendReady(client, true);
             }
         };
         self.winsize = ws;
@@ -2177,7 +2188,7 @@ pub const Master = struct {
                         client.awaiting_ready = true;
                         self.startNudge();
                     } else {
-                        self.sendReady(client);
+                        self.sendReady(client, true);
                     }
                 }
 
