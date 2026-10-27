@@ -14,6 +14,7 @@ const active = @import("active.zig");
 const inbox = @import("inbox.zig");
 const pane_state = @import("pane_state.zig");
 const ws = @import("ws.zig");
+const review = @import("review.zig");
 
 /// Names rtach answers to as this command
 pub fn isCommandName(argv0: []const u8) bool {
@@ -35,6 +36,10 @@ const usage =
     \\  tab <port>        Open a port in a Clauntty web tab
     \\  show <file>...    Show images (png, jpg, gif, heic, webp) or videos (mp4, mov,
     \\                    m4v) in Clauntty; they wait on this machine until it connects
+    \\  review <notes.json> [--repo DIR] [--base REF]
+    \\                    Show a code change as a review in Clauntty, with the
+    \\                    notes' priorities and comments; prints the user's
+    \\                    comments when they send them
     \\  status            Show which session commands go to
     \\  ws <command>      Workspaces, tabs and split panes (clauntty ws for help)
     \\
@@ -104,6 +109,7 @@ fn run(allocator: std.mem.Allocator, io: std.Io, sub: []const u8, args: []const 
     }
 
     if (eql(sub, "show")) return show(allocator, io, args);
+    if (eql(sub, "review")) return reviewCommand(allocator, io, args);
     if (eql(sub, "ws")) return ws.run(allocator, io, args);
     if (eql(sub, "agent-state")) return agentState(allocator, io, args);
 
@@ -242,6 +248,30 @@ fn show(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
     const code = sendLines(io, lines.items, target);
     if (code == 0) printOut("Sent {d} image{s} to Clauntty\n", .{ lines.items.len, plural });
     return code;
+}
+
+/// Bundle the change for the app, send `review;<id>;<pane>` the way `show` sends images,
+/// then wait for the user's comments. With no app listening the review waits on this
+/// machine: the app looks for reviews when it connects.
+fn reviewCommand(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const pane = paneId();
+    const made = review.make(arena, io, args, pane) orelse return 1;
+    const plural = if (made.files == 1) "" else "s";
+
+    var pointer_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const target = appTarget(io, &pointer_buf);
+    var value_buf: [160]u8 = undefined;
+    const value = std.fmt.bufPrint(&value_buf, "{s};{s}", .{ made.id, pane }) catch unreachable;
+    if (target != null and fifoOpen(target.?.fifo) and sendLines(io, &.{.{ "review", value }}, target) == 0) {
+        printOut("Review of {d} file{s} sent to Clauntty; waiting for comments\n", .{ made.files, plural });
+    } else {
+        printOut("Review of {d} file{s} queued (shown when Clauntty connects); waiting for comments\n", .{ made.files, plural });
+    }
+    return review.wait(arena, io, made);
 }
 
 /// This session's ID (`$RTACH_SESSION_ID`), or empty outside rtach or if it isn't one

@@ -224,7 +224,10 @@ pub const Protocol = @import("protocol.zig");
 /// 2.37.0 - `ready` says when the program on the alternate screen didn't draw for the
 ///          nudge (READY_FLAG_NO_REDRAW, then its name): the app's pane was blank with no
 ///          sign why (Claude stuck behind a permission dialog on the host).
-pub const version = "2.37.0";
+/// 2.38.0 - `clauntty review notes.json [--repo DIR] [--base REF]`: bundles a change (the
+///          diff, each file's old and new contents, the notes) in ~/.clauntty/reviews for
+///          the app, sends `review;<id>;<pane>`, and waits for the user's comments.
+pub const version = "2.38.0";
 
 /// `-a`'s exit code when the session doesn't exist (it ended)
 pub const no_session_exit: u8 = 3;
@@ -685,5 +688,6 @@ test {
     _ = @import("active.zig");
     _ = @import("inbox.zig");
     _ = @import("cli.zig");
+    _ = @import("review.zig");
     _ = @import("sys.zig");
 }
