@@ -227,7 +227,9 @@ pub const Protocol = @import("protocol.zig");
 /// 2.38.0 - `clauntty review notes.json [--repo DIR] [--base REF]`: bundles a change (the
 ///          diff, each file's old and new contents, the notes) in ~/.clauntty/reviews for
 ///          the app, sends `review;<id>;<pane>`, and waits for the user's comments.
-pub const version = "2.38.0";
+/// 2.38.1 - A background task finishing (`<task-notification>`, which Claude Code sends as
+///          a prompt) no longer becomes the pane's task: the app's card showed the tag.
+pub const version = "2.38.1";
 
 /// `-a`'s exit code when the session doesn't exist (it ended)
 pub const no_session_exit: u8 = 3;

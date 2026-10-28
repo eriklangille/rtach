@@ -238,7 +238,8 @@ pub const task_max = 120;
 /// A prompt as a task for a title: its first line with text, without the `[Image #1]` and
 /// `[Pasted text #1 +20 lines]` placeholders Claude Code puts in, spaces collapsed,
 /// cut to `task_max` bytes on a character boundary. Empty for a slash command
-/// (`/clear`, `/compact`), which isn't a task.
+/// (`/clear`, `/compact`) or a message Claude Code sends in its own tags (a background
+/// task finishing: `<task-notification>`), which aren't the user's task.
 pub fn taskFromPrompt(prompt: []const u8, out: *[task_max]u8) []const u8 {
     var len: usize = 0;
     var pending_space = false;
@@ -264,6 +265,7 @@ pub fn taskFromPrompt(prompt: []const u8, out: *[task_max]u8) []const u8 {
             continue;
         }
         if (!started and c == '/') return out[0..0];
+        if (!started and c == '<' and isAgentTag(prompt[i + 1 ..])) return out[0..0];
         // Whole characters only
         const char_len = std.unicode.utf8ByteSequenceLength(c) catch 1;
         const extra: usize = if (pending_space) 1 else 0;
@@ -281,6 +283,25 @@ pub fn taskFromPrompt(prompt: []const u8, out: *[task_max]u8) []const u8 {
 
 fn isPlaceholder(rest: []const u8) bool {
     return std.mem.startsWith(u8, rest, "Image #") or std.mem.startsWith(u8, rest, "Pasted text");
+}
+
+/// The tags Claude Code wraps its own messages in, when they come in as a prompt
+const agent_tags = [_][]const u8{
+    "task-notification>",
+    "command-name>",
+    "command-message>",
+    "local-command-stdout>",
+    "local-command-caveat>",
+    "bash-input>",
+    "bash-stdout>",
+    "system-reminder>",
+};
+
+fn isAgentTag(rest: []const u8) bool {
+    for (agent_tags) |tag| {
+        if (std.mem.startsWith(u8, rest, tag)) return true;
+    }
+    return false;
 }
 
 /// Braille spinner (U+2800 block) or the half circles Claude Code also uses
@@ -474,6 +495,9 @@ test "prompts as tasks" {
     try testing.expectEqualStrings("see and this", taskFromPrompt("see [Pasted text #1 +20 lines] and this", &buf));
     try testing.expectEqualStrings("", taskFromPrompt("/compact keep the plan", &buf));
     try testing.expectEqualStrings("", taskFromPrompt("[Image #1]", &buf));
+    // A background task finishing isn't a prompt; a tag the user typed is
+    try testing.expectEqualStrings("", taskFromPrompt("<task-notification>\n<task-id>b1</task-id>\n<status>completed</status>\n</task-notification>", &buf));
+    try testing.expectEqualStrings("<div> is broken", taskFromPrompt("<div> is broken", &buf));
     // Cut on a character boundary
     const long = "é" ** 100;
     const cut = taskFromPrompt(long, &buf);
