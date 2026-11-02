@@ -86,7 +86,7 @@ A phone that's away (suspended, so not attached) hears about an agent through AP
 
 ### Commands for the app (`src/cli.zig`)
 
-`clauntty show`, `tab`, `forward` and `open` go to the session the app shows on this machine (the active pointer, if its master answers), else to this session's pipe (`appTarget`). The app lets idle panes' channels go, so a pane's own pipe may have no app client, and its master drops commands it can't pass on. `tab` sends `open;<port>;<pane>` so the app files the page under that pane's workspace (`<pane>` empty outside rtach; older rtach sent `open;<port>`). Tests: `tests/show.test.ts`.
+`clauntty show`, `tab`, `forward` and `open` go to the session the app shows on this machine (the active pointer, if its master answers), else to this session's pipe (`appTarget`). The app lets idle panes' channels go, so a pane's own pipe may have no app client, and its master drops commands it can't pass on. `tab` sends `open;<port>;<pane>` so the app files the page under that pane's workspace (`<pane>` empty outside rtach; older rtach sent `open;<port>`). `tab 8000/path` or `tab http://localhost:8000/path` adds the path, everything after the port: `open;<port>;<pane>;<path>`; the app opens the page there, or takes a page already open on the port there (2.39.0+; an older app files it under the workspace shown and ignores the path). Tests: `tests/show.test.ts`.
 
 ### Images (`clauntty show`, `src/inbox.zig`)
 

@@ -31,9 +31,12 @@ const usage =
     \\Send commands to the Clauntty app on your phone.
     \\
     \\Commands:
-    \\  open <url>        Open a URL in the phone's browser (forwards localhost ports)
+    \\  open <url>        Open a URL in the device's own browser, outside Clauntty
+    \\                    (forwards localhost ports)
     \\  forward <port>    Forward a port to the phone (8000 or http://localhost:8000)
-    \\  tab <port>        Open a port in a Clauntty web tab
+    \\  tab <port>[/path] Open a port in a Clauntty web tab, at a path if given
+    \\                    (8000, 8000/admin or http://localhost:8000/admin?x=1);
+    \\                    a page already open on the port goes to the path
     \\  show <file>...    Show images (png, jpg, gif, heic, webp) or videos (mp4, mov,
     \\                    m4v) in Clauntty; they wait on this machine until it connects
     \\  review <notes.json> [--repo DIR] [--base REF]
@@ -95,15 +98,21 @@ fn run(allocator: std.mem.Allocator, io: std.Io, sub: []const u8, args: []const 
         if (args.len != 1) return fail("usage: clauntty {s} <port>", .{sub});
         const port = parsePort(args[0]) orelse return fail("not a port: {s}", .{args[0]});
         const is_forward = eql(sub, "forward");
-        // A tab goes under the workspace of the pane that opened it: `open;<port>;<pane>`
-        var value_buf: [96]u8 = undefined;
+        const path = urlPath(args[0]);
+        if (std.mem.indexOfAny(u8, path, "\r\n") != null) return fail("not a path: {s}", .{path});
+        // A tab goes under the workspace of the pane that opened it, at the path if there
+        // is one: `open;<port>;<pane>[;<path>]`
         const value = if (is_forward)
-            std.fmt.bufPrint(&value_buf, "{d}", .{port}) catch unreachable
+            std.fmt.allocPrint(allocator, "{d}", .{port})
+        else if (path.len > 0)
+            std.fmt.allocPrint(allocator, "{d};{s};{s}", .{ port, paneId(), path })
         else
-            std.fmt.bufPrint(&value_buf, "{d};{s}", .{ port, paneId() }) catch unreachable;
-        const code = sendLines(io, &.{.{ if (is_forward) "forward" else "open", value }}, appTarget(io, &pointer_buf));
+            std.fmt.allocPrint(allocator, "{d};{s}", .{ port, paneId() });
+        const line = value catch return fail("out of memory", .{});
+        defer allocator.free(line);
+        const code = sendLines(io, &.{.{ if (is_forward) "forward" else "open", line }}, appTarget(io, &pointer_buf));
         if (code == 0) {
-            if (is_forward) printOut("Port {d} forwarded\n", .{port}) else printOut("Opened port {d}\n", .{port});
+            if (is_forward) printOut("Port {d} forwarded\n", .{port}) else printOut("Opened port {d}{s}\n", .{ port, path });
         }
         return code;
     }
@@ -477,6 +486,15 @@ pub fn parsePort(arg: []const u8) ?u16 {
     return if (port == 0) null else port;
 }
 
+/// What follows the port: `/app?x=1` from "8000/app?x=1" or "http://localhost:8000/app?x=1",
+/// empty from "8000"
+pub fn urlPath(arg: []const u8) []const u8 {
+    var rest = arg;
+    if (std.mem.indexOf(u8, rest, "://")) |i| rest = rest[i + 3 ..];
+    const start = std.mem.indexOfAny(u8, rest, "/?#") orelse return "";
+    return rest[start..];
+}
+
 /// What the app can show: images, and videos Apple's players play (not webm or mkv)
 pub fn isMediaPath(path: []const u8) bool {
     const ext = std.fs.path.extension(path);
@@ -534,6 +552,16 @@ test "parsePort" {
     try testing.expectEqual(@as(?u16, 8080), parsePort("http://[::1]:8080"));
     try testing.expectEqual(@as(?u16, null), parsePort("http://localhost"));
     try testing.expectEqual(@as(?u16, null), parsePort("0"));
+}
+
+test "urlPath" {
+    try testing.expectEqualStrings("", urlPath("8000"));
+    try testing.expectEqualStrings("", urlPath("http://localhost:8000"));
+    try testing.expectEqualStrings("/", urlPath("localhost:8000/"));
+    try testing.expectEqualStrings("/studio/component/X?plain=1", urlPath("8000/studio/component/X?plain=1"));
+    try testing.expectEqualStrings("/app?x=1#top", urlPath("http://localhost:5173/app?x=1#top"));
+    try testing.expectEqualStrings("?x=1", urlPath(":8000?x=1"));
+    try testing.expectEqualStrings("/x", urlPath("http://[::1]:8080/x"));
     try testing.expectEqual(@as(?u16, null), parsePort("70000"));
 }
 

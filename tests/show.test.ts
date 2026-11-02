@@ -123,6 +123,14 @@ describe("clauntty show", () => {
     expect(await lines(log, 3)).toEqual([`open;8000;${id}`, "forward;8001", "browser;http://localhost:8002/x"]);
   });
 
+  test("tab with a path: the page opens there", async () => {
+    const log = await app();
+    const client = await session();
+    client.stdin.write(`${clauntty()} tab 8000/studio/component/X?plain=1 && ${clauntty()} tab http://localhost:8001/a\n`);
+    await waitForOutput(client, "Opened port 8001/a", 3000);
+    expect(await lines(log, 2)).toEqual([`open;8000;${id};/studio/component/X?plain=1`, `open;8001;${id};/a`]);
+  });
+
   test("tab outside rtach: no pane", async () => {
     const log = await app();
     const r = spawnSync([clauntty(), "tab", "8000"], { env: env() });

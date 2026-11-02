@@ -229,7 +229,10 @@ pub const Protocol = @import("protocol.zig");
 ///          the app, sends `review;<id>;<pane>`, and waits for the user's comments.
 /// 2.38.1 - A background task finishing (`<task-notification>`, which Claude Code sends as
 ///          a prompt) no longer becomes the pane's task: the app's card showed the tag.
-pub const version = "2.38.1";
+/// 2.39.0 - `clauntty tab 8000/path` (or a localhost URL) opens the page at the path:
+///          `open;<port>;<pane>;<path>`. The path was dropped, so agents that wanted one
+///          used `open`, which goes to the device's browser.
+pub const version = "2.39.0";
 
 /// `-a`'s exit code when the session doesn't exist (it ended)
 pub const no_session_exit: u8 = 3;
