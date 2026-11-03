@@ -43,6 +43,10 @@ pub const PaneState = struct {
     /// Unix ms when the agent last went to done, 0 while it isn't: the app tells a finish
     /// the user hasn't seen from one they have, across its restarts
     done_at: i64 = 0,
+    /// The agent's conversation (Claude Code's session id, from its hooks), so the app can
+    /// resume it elsewhere: in its chat view, which runs `claude --resume` headless
+    agent_session: [agent_session_max]u8 = undefined,
+    agent_session_len: usize = 0,
 
     pub fn fgName(self: *const PaneState) []const u8 {
         return self.fg[0..self.fg_len];
@@ -60,6 +64,21 @@ pub const PaneState = struct {
         return self.task[0..self.task_len];
     }
 
+    pub fn agentSession(self: *const PaneState) []const u8 {
+        return self.agent_session[0..self.agent_session_len];
+    }
+
+    /// Record the agent's conversation id. Only an id's characters (letters, digits, '-',
+    /// '_'), as it goes into a command the app types. True if it changed.
+    pub fn setAgentSession(self: *PaneState, id: []const u8) bool {
+        if (id.len > self.agent_session.len) return false;
+        for (id) |c| if (!std.ascii.isAlphanumeric(c) and c != '-' and c != '_') return false;
+        if (std.mem.eql(u8, self.agentSession(), id)) return false;
+        @memcpy(self.agent_session[0..id.len], id);
+        self.agent_session_len = id.len;
+        return true;
+    }
+
     /// An agent pane's name, as the app titles it: the conversation's name from Claude
     /// Code's title (after its spinner or "✳"), else the task, else "Claude"
     pub fn agentLabel(self: *const PaneState, title: []const u8) []const u8 {
@@ -75,7 +94,7 @@ pub const PaneState = struct {
 
     /// Back as it was before a live upgrade (upgrade.zig): fields by name, unknown names
     /// leave the default
-    pub fn restore(self: *PaneState, fg: []const u8, cwd: []const u8, agent: []const u8, status: []const u8, note: []const u8, task: []const u8, from_hook: bool, done_at: i64) void {
+    pub fn restore(self: *PaneState, fg: []const u8, cwd: []const u8, agent: []const u8, status: []const u8, note: []const u8, task: []const u8, from_hook: bool, done_at: i64, agent_session: []const u8) void {
         _ = self.setForeground(fg, cwd);
         self.agent = std.meta.stringToEnum(Agent, agent) orelse .none;
         self.status = std.meta.stringToEnum(Status, status) orelse .none;
@@ -85,6 +104,7 @@ pub const PaneState = struct {
         _ = self.setTask(task);
         self.from_hook = from_hook;
         self.done_at = if (self.status == .done) done_at else 0;
+        _ = self.setAgentSession(agent_session);
     }
 
     /// Record the agent's task. True if it changed.
@@ -120,6 +140,7 @@ pub const PaneState = struct {
             self.status = .none;
             self.from_hook = false;
             self.task_len = 0;
+            self.agent_session_len = 0;
         } else {
             const status = std.meta.stringToEnum(Status, status_name) orelse return false;
             self.agent = .claude;
@@ -138,7 +159,8 @@ pub const PaneState = struct {
             self.done_at = now_ms;
         }
         return !std.meta.eql(before.agent, self.agent) or before.status != self.status or
-            !std.mem.eql(u8, before.note[0..before.note_len], self.noteText()) or before.task_len != self.task_len;
+            !std.mem.eql(u8, before.note[0..before.note_len], self.noteText()) or before.task_len != self.task_len or
+            before.agent_session_len != self.agent_session_len;
     }
 
     /// Claude Code's title, when no hook reports: a spinner first means working, "✳"
@@ -196,6 +218,10 @@ pub const PaneState = struct {
             try jw.objectField("done_at");
             try jw.write(self.done_at);
         }
+        if (self.agent_session_len > 0) {
+            try jw.objectField("agent_session");
+            try jw.write(self.agentSession());
+        }
         // This master sends push notifications (2.18.0), so the app doesn't post its own
         try jw.objectField("pushes");
         try jw.write(true);
@@ -234,6 +260,9 @@ fn writeText(jw: *std.json.Stringify, text: []const u8) !void {
 
 /// The longest task kept (bytes)
 pub const task_max = 120;
+
+/// The longest agent conversation id kept (Claude Code's are UUIDs, 36)
+pub const agent_session_max = 64;
 
 /// A prompt as a task for a title: its first line with text, without the `[Image #1]` and
 /// `[Pasted text #1 +20 lines]` placeholders Claude Code puts in, spaces collapsed,
@@ -479,13 +508,35 @@ test "done_at is when the agent finished, kept while it stays done" {
 
     // Back after an upgrade
     var r: PaneState = .{};
-    r.restore("zsh", "/src", "claude", "done", "", "", true, 500);
+    r.restore("zsh", "/src", "claude", "done", "", "", true, 500, "");
     try testing.expectEqual(@as(i64, 500), r.done_at);
-    r.restore("zsh", "/src", "claude", "working", "", "", true, 500);
+    r.restore("zsh", "/src", "claude", "working", "", "", true, 500, "");
     try testing.expectEqual(@as(i64, 0), r.done_at);
 
     _ = s.applyHook("end", "", 600);
     try testing.expectEqual(@as(i64, 0), s.done_at);
+}
+
+test "the agent's conversation: kept from its hooks, gone when it exits, back after an upgrade" {
+    var s: PaneState = .{};
+    _ = s.applyHook("idle", "", 0);
+    try testing.expect(s.setAgentSession("7d3f2a9e-5b1c-4e8a-9f60-2c4d8e1b7a35"));
+    try testing.expect(!s.setAgentSession("7d3f2a9e-5b1c-4e8a-9f60-2c4d8e1b7a35"));
+    // Not an id: it goes into a command the app types
+    try testing.expect(!s.setAgentSession("x; rm -rf ~"));
+    try testing.expectEqualStrings("7d3f2a9e-5b1c-4e8a-9f60-2c4d8e1b7a35", s.agentSession());
+
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try s.writeJson(&w, "", "2.40.0");
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "\"agent_session\":\"7d3f2a9e-5b1c-4e8a-9f60-2c4d8e1b7a35\"") != null);
+
+    var r: PaneState = .{};
+    r.restore("claude", "/src", "claude", "idle", "", "", true, 0, s.agentSession());
+    try testing.expectEqualStrings(s.agentSession(), r.agentSession());
+
+    try testing.expect(s.applyHook("end", "", 0));
+    try testing.expectEqual(@as(usize, 0), s.agent_session_len);
 }
 
 test "prompts as tasks" {

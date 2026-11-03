@@ -232,7 +232,7 @@ pub const Protocol = @import("protocol.zig");
 /// 2.39.0 - `clauntty tab 8000/path` (or a localhost URL) opens the page at the path:
 ///          `open;<port>;<pane>;<path>`. The path was dropped, so agents that wanted one
 ///          used `open`, which goes to the device's browser.
-pub const version = "2.39.0";
+pub const version = "2.40.0";
 
 /// `-a`'s exit code when the session doesn't exist (it ended)
 pub const no_session_exit: u8 = 3;

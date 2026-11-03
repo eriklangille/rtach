@@ -117,6 +117,25 @@ describe("pane state", () => {
     expect((await waitForState((s) => s.state === "idle")).task).toBeUndefined();
   });
 
+  test("hooks give the agent's conversation id, for the app's chat view; the agent ending clears it", async () => {
+    const client = await start();
+    const sid = "7d3f2a9e-5b1c-4e8a-9f60-2c4d8e1b7a35";
+    // Every Claude Code hook gets the session id on stdin
+    writeFileSync(join(home, "start.json"), JSON.stringify({ session_id: sid, hook_event_name: "SessionStart" }));
+    client.stdin.write("~/.clauntty/bin/clauntty agent-state idle < ~/start.json\n");
+    const s = await waitForState((s) => s.agent_session !== undefined);
+    expect(s.state).toBe("idle");
+    expect(s.agent_session).toBe(sid);
+
+    // Something that isn't an id never gets in (the app types it into a command)
+    writeFileSync(join(home, "bad.json"), JSON.stringify({ session_id: "x; rm -rf ~", hook_event_name: "Stop" }));
+    client.stdin.write("~/.clauntty/bin/clauntty agent-state done < ~/bad.json\n");
+    expect((await waitForState((s) => s.state === "done")).agent_session).toBe(sid);
+
+    client.stdin.write("~/.clauntty/bin/clauntty agent-state end < /dev/null\n");
+    expect((await waitForState((s) => s.agent === "none")).agent_session).toBeUndefined();
+  });
+
   test("a title that isn't valid UTF-8 is still a string in the state and ws list", async () => {
     const client = await start();
     // A spinner character cut in half, then a stray byte

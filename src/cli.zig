@@ -140,6 +140,8 @@ fn agentState(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8
     var note: []const u8 = "";
     // UserPromptSubmit's prompt: the agent's task, for the app's title
     var prompt: ?[]const u8 = null;
+    // The conversation's id (every hook has it), so the app can resume it in its chat view
+    var session_id: ?[]const u8 = null;
     if (!sys.isatty(posix.STDIN_FILENO)) {
         var buf: [64 * 1024]u8 = undefined;
         var len: usize = 0;
@@ -150,6 +152,7 @@ fn agentState(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8
         }
         note = hookField(allocator, buf[0..len], "message") orelse "";
         prompt = hookField(allocator, buf[0..len], "prompt");
+        session_id = hookField(allocator, buf[0..len], "session_id");
     }
     // Claude's "waiting for your input" reminder isn't a question for the user
     if (std.mem.indexOf(u8, note, "waiting for your input") != null) return 0;
@@ -166,7 +169,15 @@ fn agentState(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8
     const line = std.fmt.bufPrint(&line_buf, "state;{s};{s}\n", .{ args[0], clean[0..n] }) catch return 0;
     const fd = openFifo(target.fifo) catch return 0;
     defer sys.close(fd);
-    // The task first: the state line flushes the pane's state to the app
+    // The task and conversation first: the state line flushes the pane's state to the app
+    if (session_id) |id| {
+        var id_line: [pane_state.agent_session_max + 16]u8 = undefined;
+        // Not a whole id (too long, a newline) is no id: the master checks the rest
+        if (id.len <= pane_state.agent_session_max and std.mem.indexOfScalar(u8, id, '\n') == null) {
+            const il = std.fmt.bufPrint(&id_line, "agent-session;{s}\n", .{id}) catch "";
+            writeAllFd(io, fd, il) catch {};
+        }
+    }
     if (prompt) |p| {
         var task_buf: [pane_state.task_max]u8 = undefined;
         const task = pane_state.taskFromPrompt(p, &task_buf);

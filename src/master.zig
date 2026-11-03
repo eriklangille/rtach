@@ -613,7 +613,7 @@ pub const Master = struct {
             @memcpy(self.terminal_title[0..title_len], state.title[0..title_len]);
             _ = pane_state.fixUtf8(self.terminal_title[0..title_len]);
             self.terminal_title_len = @intCast(title_len);
-            self.pane.restore(state.fg, state.cwd, state.agent, state.status, state.note, state.task, state.from_hook, state.done_at);
+            self.pane.restore(state.fg, state.cwd, state.agent, state.status, state.note, state.task, state.from_hook, state.done_at, state.agent_session);
             self.flushed_status = std.meta.stringToEnum(pane_state.Status, state.flushed_status) orelse .none;
             self.pushed_status = std.meta.stringToEnum(pane_state.Status, state.pushed_status) orelse .none;
             const partial = @min(state.cmd_partial.len, self.cmd_line_buf.len);
@@ -1443,6 +1443,9 @@ pub const Master = struct {
                     } else if (std.mem.startsWith(u8, line, "task;")) {
                         // Goes out with the state line after it
                         if (self.pane.setTask(line["task;".len..])) self.pane_dirty = true;
+                    } else if (std.mem.startsWith(u8, line, "agent-session;")) {
+                        // The same
+                        if (self.pane.setAgentSession(line["agent-session;".len..])) self.pane_dirty = true;
                     } else if (std.mem.startsWith(u8, line, "push;")) {
                         self.handlePush(line["push;".len..]);
                     } else if (line.len > 0 and line[0] == '@') {
@@ -1540,6 +1543,7 @@ pub const Master = struct {
             .task = pane.taskText(),
             .from_hook = pane.from_hook,
             .done_at = pane.done_at,
+            .agent_session = pane.agentSession(),
             .flushed_status = @tagName(self.flushed_status),
             .pushed_status = @tagName(self.pushed_status),
             .cmd_partial = self.cmd_line_buf[0..self.cmd_line_len],
