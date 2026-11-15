@@ -165,6 +165,10 @@ pub const QueryFilter = struct {
         if (isQuery(self.kind, self.pending[0..self.pending_len])) {
             self.pending_len = 0;
             self.state = .ground;
+        } else if (self.kind == .csi and setsReplyingMode(self.pending[0..self.pending_len])) {
+            emitWithoutReplyingModes(self.pending[0..self.pending_len], out, n);
+            self.pending_len = 0;
+            self.state = .ground;
         } else {
             self.flush(out, n);
         }
@@ -206,6 +210,41 @@ pub const QueryFilter = struct {
                     std.mem.startsWith(u8, payload, "+q"); // XTGETTCAP
             },
         }
+    }
+
+    /// DEC modes Ghostty answers the moment they're set: 2048 (in-band size reports,
+    /// `ESC [ 48 ; rows ; cols ; height ; width t`) and 2033 (visibility reports). A
+    /// replay that sets one gets an answer typed into whatever runs now: after lazygit
+    /// had exited, a reattach left "8;53;79;1802;1264t" at the shell's prompt. A program
+    /// still running learns the size from the SIGWINCH an attach sends.
+    const replying_modes = [_][]const u8{ "2048", "2033" };
+
+    /// `ESC [ ? Pm h` setting one of `replying_modes`
+    fn setsReplyingMode(seq: []const u8) bool {
+        if (seq.len < 5 or seq[2] != '?' or seq[seq.len - 1] != 'h') return false;
+        var it = std.mem.splitScalar(u8, seq[3 .. seq.len - 1], ';');
+        while (it.next()) |p| if (isReplyingMode(p)) return true;
+        return false;
+    }
+
+    fn isReplyingMode(param: []const u8) bool {
+        for (replying_modes) |m| if (std.mem.eql(u8, param, m)) return true;
+        return false;
+    }
+
+    /// The set without the replying modes (`ESC [ ? 1049 ; 2048 h` keeps 1049), or
+    /// nothing if those were all it set
+    fn emitWithoutReplyingModes(seq: []const u8, out: []u8, n: *usize) void {
+        const begin = n.*;
+        var it = std.mem.splitScalar(u8, seq[3 .. seq.len - 1], ';');
+        var kept: usize = 0;
+        while (it.next()) |p| {
+            if (isReplyingMode(p)) continue;
+            for (if (kept == 0) "\x1b[?" else ";") |b| emit(out, n, b);
+            for (p) |b| emit(out, n, b);
+            kept += 1;
+        }
+        if (kept > 0) emit(out, n, 'h') else n.* = begin;
     }
 
     /// XTWINOPS that report state (sizes, position, title)
@@ -317,6 +356,17 @@ test "drops OSC color queries and DCS requests" {
 test "keeps ordinary sequences" {
     var buf: [256]u8 = undefined;
     const keep = "\x1b[1;31mred\x1b[0m\x1b[2J\x1b[?1049h\x1b[?25l\x1b]0;title\x07\x1b[2 q\x1b[>1u\x1b[22;0t\x1b(B\x1b7";
+    try testing.expectEqualStrings(keep, filterAll(keep, &buf));
+}
+
+test "drops setting the modes Ghostty answers at once" {
+    var buf: [256]u8 = undefined;
+    try testing.expectEqualStrings("ab", filterAll("a\x1b[?2048hb", &buf));
+    try testing.expectEqualStrings("ab", filterAll("a\x1b[?2033hb", &buf));
+    try testing.expectEqualStrings("\x1b[?1049h", filterAll("\x1b[?1049;2048h", &buf));
+    try testing.expectEqualStrings("\x1b[?1049;25h", filterAll("\x1b[?2048;1049;2033;25h", &buf));
+    // Resetting them, and modes that only look alike, stay
+    const keep = "\x1b[?2048l\x1b[?20480h\x1b[?204h\x1b[2048h\x1b[?2031h";
     try testing.expectEqualStrings(keep, filterAll(keep, &buf));
 }
 

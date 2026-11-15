@@ -232,7 +232,12 @@ pub const Protocol = @import("protocol.zig");
 /// 2.39.0 - `clauntty tab 8000/path` (or a localhost URL) opens the page at the path:
 ///          `open;<port>;<pane>;<path>`. The path was dropped, so agents that wanted one
 ///          used `open`, which goes to the device's browser.
-pub const version = "2.40.0";
+/// 2.40.1 - The stored replay leaves out turning on in-band size reports (?2048h) and
+///          visibility reports (?2033h): Ghostty answers them the moment they're set,
+///          so after lazygit exited, a reattach typed "8;53;79;1802;1264t" at the prompt.
+/// 2.40.2 - The app's chat launcher is "clauntty-chat" in pane state on macOS too, not its
+///          interpreter ("bash" for /bin/sh), from the interpreter's argv[1].
+pub const version = "2.40.2";
 
 /// `-a`'s exit code when the session doesn't exist (it ended)
 pub const no_session_exit: u8 = 3;

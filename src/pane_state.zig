@@ -361,12 +361,61 @@ pub fn probe(pty_master: posix.fd_t, name_buf: []u8, cwd_buf: []u8) ?Foreground 
 }
 
 /// Claude Code's binary is named after its version (`~/.local/share/claude/versions/
-/// 2.1.309`, what `claude` links to), so its process is "2.1.309": call it claude
+/// 2.1.309`, what `claude` links to), so its process is "2.1.309": call it claude.
+/// A script is named after itself on Linux, but on macOS it's its interpreter ("bash" for
+/// /bin/sh): the app's chat launcher is called by its name there too, or the app takes its
+/// pane for a shell and stops showing the chat.
 fn programName(pid: posix.pid_t, name: []const u8) []const u8 {
+    if (builtin.os.tag == .macos and isShell(name) and runsScript(pid, chat_launcher)) return chat_launcher;
     if (!looksLikeVersion(name)) return name;
     var buf: [4096]u8 = undefined;
     const path = exePath(pid, &buf) orelse return name;
     return if (std.mem.indexOf(u8, path, "/claude/versions/") != null) "claude" else name;
+}
+
+/// The app's chat launcher (`~/.clauntty/bin/clauntty-chat`, a sh script)
+pub const chat_launcher = "clauntty-chat";
+
+fn isShell(name: []const u8) bool {
+    for ([_][]const u8{ "sh", "bash", "dash", "zsh" }) |shell| {
+        if (std.mem.eql(u8, name, shell)) return true;
+    }
+    return false;
+}
+
+/// Whether the process is an interpreter running the script `script` (its argv[1]'s last
+/// path component), from KERN_PROCARGS2: argc, the executable's path, padding, then argv
+fn runsScript(pid: posix.pid_t, script: []const u8) bool {
+    var buf: [4096]u8 align(4) = undefined;
+    var size: usize = buf.len;
+    var mib = [_]c_int{ 1, 49, pid }; // CTL_KERN, KERN_PROCARGS2
+    if (std.c.sysctl(&mib, mib.len, &buf, &size, null, 0) != 0 or size < 4) return false;
+    return argv1Is(buf[0..size], script);
+}
+
+fn argv1Is(args: []const u8, script: []const u8) bool {
+    const argc = std.mem.readInt(i32, args[0..4], builtin.cpu.arch.endian());
+    if (argc < 2) return false;
+    var i: usize = 4;
+    // The executable's path, then NULs up to argv[0]
+    while (i < args.len and args[i] != 0) i += 1;
+    while (i < args.len and args[i] == 0) i += 1;
+    // argv[0]
+    while (i < args.len and args[i] != 0) i += 1;
+    i += 1;
+    if (i >= args.len) return false;
+    const end = std.mem.indexOfScalarPos(u8, args, i, 0) orelse args.len;
+    const arg = args[i..end];
+    const base = if (std.mem.lastIndexOfScalar(u8, arg, '/')) |slash| arg[slash + 1 ..] else arg;
+    return std.mem.eql(u8, base, script);
+}
+
+test "argv1Is finds the script an interpreter runs" {
+    const args = [_]u8{ 3, 0, 0, 0 } ++ "/bin/sh\x00\x00\x00/bin/sh\x00/Users/u/.clauntty/bin/clauntty-chat\x00--mode\x00".*;
+    try testing.expect(argv1Is(&args, "clauntty-chat"));
+    try testing.expect(!argv1Is(&args, "chat"));
+    const shell = [_]u8{ 1, 0, 0, 0 } ++ "/bin/zsh\x00\x00-zsh\x00".*;
+    try testing.expect(!argv1Is(&shell, "clauntty-chat"));
 }
 
 fn looksLikeVersion(name: []const u8) bool {
@@ -610,4 +659,16 @@ test "state JSON has strings for invalid titles" {
     var w: std.Io.Writer = .fixed(&buf);
     try s.writeJson(&w, "\xe2\xa0 working", "2.32.4");
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "\"title\":\"?? working\"") != null);
+}
+
+test "runsScript on a live process" {
+    if (builtin.os.tag != .macos) return;
+    try testing.expect(!runsScript(std.c.getpid(), "clauntty-chat"));
+    // RTACH_TEST_CHAT_PID: a running chat launcher (by hand: start one, pass its pid)
+    const pid_text = std.c.getenv("RTACH_TEST_CHAT_PID") orelse return;
+    const pid = try std.fmt.parseInt(posix.pid_t, std.mem.span(pid_text), 10);
+    var name_buf: [256]u8 = undefined;
+    var cwd_buf: [1024]u8 = undefined;
+    const fg = probeDarwin(pid, &name_buf, &cwd_buf) orelse return error.NoProcess;
+    try testing.expectEqualStrings("clauntty-chat", programName(pid, fg.name));
 }

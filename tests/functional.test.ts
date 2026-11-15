@@ -1311,12 +1311,14 @@ describe("rtach proxy upgrade ordering", () => {
 describe("rtach replay drops terminal queries", () => {
   afterEach(cleanupAll);
 
-  test("attach replay omits a cursor position query the program printed", async () => {
+  test("attach replay omits a cursor position query and size reports the program turned on", async () => {
     // A replayed query gets answered again by the client's terminal, and the stale
     // answer lands in the program's input (Codex showed "[6;1R" in its prompt).
+    // Ghostty answers turning on in-band size reports (?2048h) the same way: after
+    // lazygit exited, a reattach left "8;53;79;1802;1264t" at the shell's prompt.
     const socketPath = uniqueSocketPath();
     const script = `${socketPath}.sh`;
-    await Bun.write(script, "#!/bin/sh\nprintf 'BEFORE\\033[6nAFTER\\n'\nexec sleep 30\n");
+    await Bun.write(script, "#!/bin/sh\nprintf 'BEFORE\\033[6n\\033[?2048hAFTER\\033[?2048l\\n'\nexec sleep 30\n");
     chmodSync(script, 0o755);
     await startDetachedMaster(socketPath, script);
     await Bun.sleep(300);
@@ -1345,6 +1347,8 @@ describe("rtach replay drops terminal queries", () => {
     const text = replay.toString("latin1");
     expect(text).toContain("BEFOREAFTER");
     expect(text).not.toContain("\x1b[6n");
+    expect(text).not.toContain("\x1b[?2048h");
+    expect(text).toContain("\x1b[?2048l");
   });
 });
 
