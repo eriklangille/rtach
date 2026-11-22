@@ -128,13 +128,42 @@ fn run(allocator: std.mem.Allocator, io: std.Io, sub: []const u8, args: []const 
 /// Leave each image in the inbox, then send `image;<id>;<path>` to the session. With
 /// every image in the inbox, no reachable session isn't an error: the app picks them
 /// up when it connects.
-/// `clauntty agent-state working|blocked|done|idle|end`, run by an agent's hooks
-/// (Claude Code's: see RtachDeployer.deployClaudeHook). Tells this session's master,
-/// which shows it in the app; a hook's JSON on stdin can carry a "message", kept as
-/// the note. Quiet and always exit 0: a failing hook would bother the agent. Outside
-/// an rtach session it does nothing (Claude in a Herdr pane or another terminal).
-fn agentState(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
-    if (args.len != 1) return 0;
+/// `clauntty agent-state [--agent antigravity] working|blocked|done|idle|end`, run by an
+/// agent's hooks (Claude Code's: see RtachDeployer.deployClaudeHook; Antigravity's,
+/// `agy`: deployAntigravityHooks). Tells this session's master, which shows it in the
+/// app; a hook's JSON on stdin can carry a "message", kept as the note. Quiet and always
+/// exit 0: a failing hook would bother the agent. Outside an rtach session it does
+/// nothing (Claude in a Herdr pane or another terminal), but for what Antigravity needs
+/// printed (`antigravityOutput`).
+///
+/// Antigravity's hooks say less than Claude's, so its input decides some of it: `done`
+/// from Stop is `working` while background commands still run (not `fullyIdle`); its
+/// last prompt is the task. `title` is its title command, which runs whenever its state
+/// changes: an approval showing is `blocked`, working again is `unblock` (the master
+/// makes that `working` only if it was waiting on the user). A question has a hook of
+/// its own (PreToolUse on ask_question: `blocked`).
+fn agentState(allocator: std.mem.Allocator, io: std.Io, args_in: []const []const u8) u8 {
+    var args = args_in;
+    var agent: pane_state.Agent = .claude;
+    if (args.len >= 2 and eql(args[0], "--agent")) {
+        agent = std.meta.stringToEnum(pane_state.Agent, args[1]) orelse .none;
+        args = args[2..];
+    }
+    if (args.len != 1 or agent == .none) return 0;
+    var state = args[0];
+
+    var input: []const u8 = "";
+    var buf: [64 * 1024]u8 = undefined;
+    if (!sys.isatty(posix.STDIN_FILENO)) {
+        var len: usize = 0;
+        while (len < buf.len) {
+            const n = sys.read(posix.STDIN_FILENO, buf[len..]) catch break;
+            if (n == 0) break;
+            len += n;
+        }
+        input = buf[0..len];
+    }
+    if (agent == .antigravity) antigravityOutput(allocator, io, state, input);
     const target = envTarget() orelse return 0;
 
     var note: []const u8 = "";
@@ -142,17 +171,26 @@ fn agentState(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8
     var prompt: ?[]const u8 = null;
     // The conversation's id (every hook has it), so the app can resume it in its chat view
     var session_id: ?[]const u8 = null;
-    if (!sys.isatty(posix.STDIN_FILENO)) {
-        var buf: [64 * 1024]u8 = undefined;
-        var len: usize = 0;
-        while (len < buf.len) {
-            const n = sys.read(posix.STDIN_FILENO, buf[len..]) catch break;
-            if (n == 0) break;
-            len += n;
-        }
-        note = hookField(allocator, buf[0..len], "message") orelse "";
-        prompt = hookField(allocator, buf[0..len], "prompt");
-        session_id = hookField(allocator, buf[0..len], "session_id");
+    switch (agent) {
+        .claude => {
+            note = hookField(allocator, input, "message") orelse "";
+            prompt = hookField(allocator, input, "prompt");
+            session_id = hookField(allocator, input, "session_id");
+        },
+        .antigravity => {
+            if (eql(state, "title")) {
+                // An approval showing; else working again after one (or after a question)
+                if (hookBool(allocator, input, "tool_confirmation_pending") == true) {
+                    state = "blocked";
+                } else if (eql(hookField(allocator, input, "agent_state") orelse "", "working")) {
+                    state = "unblock";
+                } else return 0;
+            } else {
+                prompt = hookField(allocator, input, "lastUserInput");
+                if (eql(state, "done") and hookBool(allocator, input, "fullyIdle") == false) state = "working";
+            }
+        },
+        .none => return 0,
     }
     // Claude's "waiting for your input" reminder isn't a question for the user
     if (std.mem.indexOf(u8, note, "waiting for your input") != null) return 0;
@@ -166,7 +204,11 @@ fn agentState(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8
         clean[n] = if (c == '\n' or c == ';') ' ' else c;
         n += 1;
     }
-    const line = std.fmt.bufPrint(&line_buf, "state;{s};{s}\n", .{ args[0], clean[0..n] }) catch return 0;
+    // Claude's is the plain line, which older masters read too
+    const line = (if (agent == .claude)
+        std.fmt.bufPrint(&line_buf, "state;{s};{s}\n", .{ state, clean[0..n] })
+    else
+        std.fmt.bufPrint(&line_buf, "state;{s}:{s};{s}\n", .{ state, @tagName(agent), clean[0..n] })) catch return 0;
     const fd = openFifo(target.fifo) catch return 0;
     defer sys.close(fd);
     // The task and conversation first: the state line flushes the pane's state to the app
@@ -189,6 +231,32 @@ fn agentState(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8
     }
     writeAllFd(io, fd, line) catch {};
     return 0;
+}
+
+/// What Antigravity reads back from its hooks and title command: PreToolUse must
+/// decide ("allow": on to its own rules, as with no hook), the title command's output
+/// is the window's title, and the rest take JSON
+fn antigravityOutput(allocator: std.mem.Allocator, io: std.Io, state: []const u8, input: []const u8) void {
+    const out: []const u8 = if (eql(state, "title"))
+        "Antigravity\n"
+    else if (eql(hookField(allocator, input, "hookEventName") orelse "", "PreToolUse"))
+        "{\"decision\":\"allow\"}\n"
+    else
+        "{}\n";
+    writeAllFd(io, posix.STDOUT_FILENO, out) catch {};
+}
+
+/// A bool field of a hook's JSON input, nil if it isn't there
+fn hookBool(allocator: std.mem.Allocator, input: []const u8, name: []const u8) ?bool {
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, allocator, input, .{}) catch return null;
+    const obj = switch (parsed) {
+        .object => |o| o,
+        else => return null,
+    };
+    return switch (obj.get(name) orelse return null) {
+        .bool => |b| b,
+        else => null,
+    };
 }
 
 /// A string field of a hook's JSON input

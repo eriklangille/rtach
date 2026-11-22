@@ -1,6 +1,6 @@
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { spawn, spawnSync } from "bun";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "fs";
 import { join } from "path";
 import { RTACH_BIN, cleanupAll, trackProcess, waitForOutput } from "./helpers";
 
@@ -135,6 +135,71 @@ describe("pane state", () => {
     client.stdin.write("~/.clauntty/bin/clauntty agent-state end < /dev/null\n");
     expect((await waitForState((s) => s.agent === "none")).agent_session).toBeUndefined();
   });
+
+  test("Antigravity's hooks and title command print what agy reads back, in rtach or not", () => {
+    const run = (state: string, input: object) =>
+      spawnSync([join(home, ".clauntty/bin/clauntty"), "agent-state", "--agent", "antigravity", state], {
+        env: { HOME: home, PATH: process.env.PATH ?? "" },
+        stdin: Buffer.from(JSON.stringify(input)),
+      }).stdout.toString();
+    // PreToolUse must decide: "allow" goes on to agy's own rules
+    expect(run("blocked", { hookEventName: "PreToolUse", toolCall: { name: "ask_question" } })).toBe('{"decision":"allow"}\n');
+    expect(run("done", { hookEventName: "Stop", fullyIdle: true })).toBe("{}\n");
+    // The title command's output is the window title
+    expect(run("title", { agent_state: "working" })).toBe("Antigravity\n");
+  });
+
+  test("Antigravity's hooks and title set the state; agy leaving the foreground ends it", async () => {
+    const client = await start();
+    // A stand-in agy: anything named agy in front (rtach reads the process's name). Built,
+    // not copied: macOS kills a copy of a system binary.
+    spawnSync(["cc", "-x", "c", "-o", join(home, "agy"), "-"], {
+      stdin: Buffer.from("#include <stdlib.h>\n#include <unistd.h>\nint main(int c, char **v) { sleep(atoi(v[1])); return 0; }\n"),
+    });
+    const hook = (state: string, input: object) => {
+      const file = join(home, `in-${Math.random().toString(16).slice(2)}.json`);
+      writeFileSync(file, JSON.stringify(input));
+      return `~/.clauntty/bin/clauntty agent-state --agent antigravity ${state} < ${file} > /dev/null`;
+    };
+    // Hooks in the background, as agy's run while it's in front
+    const steps = [
+      hook("working", { hookEventName: "PreInvocation", lastUserInput: "fix the build\nplease" }),
+      "sleep 1.5",
+      // An approval showing (its title command), then answered
+      hook("title", { agent_state: "tool_use", tool_confirmation_pending: true }),
+      "sleep 1.5",
+      hook("title", { agent_state: "working" }),
+      "sleep 1.5",
+      // Its turn over, a background command still running: not done yet
+      hook("done", { hookEventName: "Stop", fullyIdle: false }),
+      "sleep 1.5",
+      "touch ~/last",
+      hook("done", { hookEventName: "Stop", fullyIdle: true }),
+    ];
+    client.stdin.write(`(sleep 1; ${steps.join("; ")}) & ~/agy 9\n`);
+
+    // Every change, as it happens (the foreground is probed once a second)
+    const seen: { state: string; agent: string; task?: string; fg: string; at: number }[] = [];
+    const deadline = Date.now() + 12000;
+    while (Date.now() < deadline && !seen.some((s) => s.state === "done")) {
+      const s = readState();
+      const last = seen[seen.length - 1];
+      if (s && (!last || last.state !== s.state || last.fg !== s.fg)) seen.push({ ...s, at: Date.now() });
+      await Bun.sleep(50);
+    }
+    const states = seen.filter((s) => s.agent === "antigravity").map((s) => s.state).filter((s, i, a) => s !== a[i - 1]);
+    expect(states).toEqual(["working", "blocked", "working", "done"]);
+    expect(seen.find((s) => s.state === "working")?.task).toBe("fix the build");
+    expect(seen.some((s) => s.fg === "agy" && s.agent === "antigravity")).toBe(true);
+    // Done only from the last Stop (fully idle), not the one before
+    const lastHook = statSync(join(home, "last")).mtimeMs;
+    expect(seen.find((s) => s.state === "done")!.at).toBeGreaterThanOrEqual(lastHook - 100);
+
+    // agy gone, the shell in front: no agent
+    const ended = await waitForState((s) => s.agent === "none", 9000);
+    expect(ended.state).toBe("none");
+    expect(ended.task).toBeUndefined();
+  }, 20000);
 
   test("a title that isn't valid UTF-8 is still a string in the state and ws list", async () => {
     const client = await start();

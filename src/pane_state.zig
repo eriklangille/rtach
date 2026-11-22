@@ -3,7 +3,8 @@
 //!
 //! The master probes the foreground process every second or so (`probe`). Agent state
 //! comes from the agent's hooks (`clauntty agent-state`, a `state;` line on the
-//! command pipe), with the terminal title as a fallback for Claude Code. Its task is the
+//! command pipe): Claude Code's, or Antigravity's (`agy`, its hooks and title command),
+//! with the terminal title as a fallback for Claude Code. Its task is the
 //! last prompt the user sent it (a `task;` line from the same hook). The master
 //! writes it all to `<socket>.state` as one JSON line and sends the same line to the
 //! app as `pane;<id>;<json>`.
@@ -12,7 +13,30 @@ const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
 
-pub const Agent = enum { none, claude };
+pub const Agent = enum {
+    none,
+    claude,
+    /// Antigravity's CLI, `agy`: no hook says when it ends, so it ends when `agy` leaves the
+    /// foreground
+    antigravity,
+
+    /// Its foreground process, when it's in front
+    pub fn program(self: Agent) []const u8 {
+        return switch (self) {
+            .none => "",
+            .claude => "claude",
+            .antigravity => "agy",
+        };
+    }
+
+    /// What the app and notices call it
+    pub fn label(self: Agent) []const u8 {
+        return switch (self) {
+            .none, .claude => "Claude",
+            .antigravity => "Antigravity",
+        };
+    }
+};
 
 pub const Status = enum {
     /// No agent in the session
@@ -80,9 +104,9 @@ pub const PaneState = struct {
     }
 
     /// An agent pane's name, as the app titles it: the conversation's name from Claude
-    /// Code's title (after its spinner or "✳"), else the task, else "Claude"
+    /// Code's title (after its spinner or "✳"), else the task, else the agent's name
     pub fn agentLabel(self: *const PaneState, title: []const u8) []const u8 {
-        const fallback = if (self.task_len > 0) self.taskText() else "Claude";
+        const fallback = if (self.task_len > 0) self.taskText() else self.agent.label();
         const view = std.unicode.Utf8View.init(title) catch return fallback;
         var it = view.iterator();
         const first = it.nextCodepoint() orelse return fallback;
@@ -128,12 +152,34 @@ pub const PaneState = struct {
         self.fg_len = fg_n;
         @memcpy(self.cwd[0..cwd_n], cwd[0..cwd_n]);
         self.cwd_len = cwd_n;
+        // Antigravity has no hook for its end: it ended when the shell (or anything but
+        // agy) is back in front. Its commands run in terminals of its own, not this one.
+        if (self.agent == .antigravity and !std.mem.eql(u8, self.fgName(), self.agent.program())) {
+            self.agent = .none;
+            self.status = .none;
+            self.from_hook = false;
+            self.task_len = 0;
+            self.note_len = 0;
+            self.done_at = 0;
+            self.agent_session_len = 0;
+        }
         return true;
     }
 
-    /// A hook's `state;<status>;<note>` (status "end": the agent exited), at `now_ms`
-    /// (unix ms). True if anything changed.
+    /// Claude Code's hook: see `applyAgentHook`
     pub fn applyHook(self: *PaneState, status_name: []const u8, note: []const u8, now_ms: i64) bool {
+        return self.applyAgentHook(.claude, status_name, note, now_ms);
+    }
+
+    /// A hook's `state;<status>[:<agent>];<note>` (status "end": the agent exited;
+    /// "unblock": back to working if it was waiting on the user, else nothing, for
+    /// Antigravity's title command, which says when an approval was answered), at
+    /// `now_ms` (unix ms). True if anything changed.
+    pub fn applyAgentHook(self: *PaneState, agent: Agent, status_name: []const u8, note: []const u8, now_ms: i64) bool {
+        if (std.mem.eql(u8, status_name, "unblock")) {
+            if (self.agent != agent or self.status != .blocked) return false;
+            return self.applyAgentHook(agent, "working", "", now_ms);
+        }
         const before = self.*;
         if (std.mem.eql(u8, status_name, "end")) {
             self.agent = .none;
@@ -143,7 +189,7 @@ pub const PaneState = struct {
             self.agent_session_len = 0;
         } else {
             const status = std.meta.stringToEnum(Status, status_name) orelse return false;
-            self.agent = .claude;
+            self.agent = agent;
             self.status = status;
             self.from_hook = true;
             // A new session (or /clear) starts idle, with nothing asked yet
@@ -496,6 +542,34 @@ test "a version for a name is claude once the pane is known to run Claude" {
     try testing.expectEqualStrings("claude", s.fgName());
     _ = s.setForeground("node", "/tmp");
     try testing.expectEqualStrings("node", s.fgName());
+}
+
+test "Antigravity's state, and its end when agy leaves the foreground" {
+    var s = PaneState{};
+    _ = s.setForeground("agy", "/src");
+    try testing.expect(s.applyAgentHook(.antigravity, "working", "", 0));
+    try testing.expectEqual(Agent.antigravity, s.agent);
+    _ = s.setTask("fix the build");
+    // An approval: blocked, then answered (the title command's "unblock")
+    try testing.expect(s.applyAgentHook(.antigravity, "blocked", "", 0));
+    try testing.expect(s.applyAgentHook(.antigravity, "unblock", "", 0));
+    try testing.expectEqual(Status.working, s.status);
+    // Not waiting: "unblock" does nothing
+    try testing.expect(!s.applyAgentHook(.antigravity, "unblock", "", 0));
+    try testing.expect(s.applyAgentHook(.antigravity, "done", "", 10));
+    try testing.expectEqualStrings("fix the build", s.agentLabel("Antigravity"));
+    // Running something of its own doesn't change the foreground; the shell back does
+    try testing.expect(!s.setForeground("agy", "/src"));
+    try testing.expect(s.setForeground("zsh", "/src"));
+    try testing.expectEqual(Agent.none, s.agent);
+    try testing.expectEqual(Status.none, s.status);
+    try testing.expectEqual(@as(usize, 0), s.task_len);
+}
+
+test "Antigravity with no task is called Antigravity" {
+    var s = PaneState{};
+    _ = s.applyAgentHook(.antigravity, "idle", "", 0);
+    try testing.expectEqualStrings("Antigravity", s.agentLabel("Antigravity"));
 }
 
 test "a version for a name is Claude Code's binary, maybe" {

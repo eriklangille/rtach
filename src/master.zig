@@ -2611,14 +2611,22 @@ pub const Master = struct {
         }
     }
 
-    /// `state;<status>;<note>` from an agent hook (`clauntty agent-state`)
+    /// `state;<status>[:<agent>];<note>` from an agent hook (`clauntty agent-state`); no
+    /// agent is Claude Code
     fn handleAgentState(self: *Master, args: []const u8) void {
         var parts = std.mem.splitScalar(u8, args, ';');
-        const status = parts.next() orelse return;
+        const field = parts.next() orelse return;
         const note = parts.rest();
-        log.info("agent state: {s}", .{status});
+        const colon = std.mem.indexOfScalar(u8, field, ':');
+        const status = if (colon) |c| field[0..c] else field;
+        const agent: pane_state.Agent = if (colon) |c|
+            std.meta.stringToEnum(pane_state.Agent, field[c + 1 ..]) orelse return
+        else
+            .claude;
+        if (agent == .none) return;
+        log.info("agent state: {s} ({s})", .{ status, @tagName(agent) });
         const now_ms: i64 = @intCast(@divFloor(sys.realtimeNs(), std.time.ns_per_ms));
-        if (self.pane.applyHook(status, note, now_ms)) {
+        if (self.pane.applyAgentHook(agent, status, note, now_ms)) {
             // Right away: the app may notify the user
             self.pane_dirty = true;
             self.flushPaneState();
