@@ -96,4 +96,40 @@ describe("rtach resume flush", () => {
     client.close();
     rmSync(script, { force: true });
   }, 30000);
+
+  test("a flush that starts in overwritten output starts at an escape sequence", async () => {
+    // Like a TUI redrawing (OpenCode): colors and text, no newlines, much more than the
+    // buffer holds. The oldest byte kept is anywhere in a sequence; flushing from there
+    // drew its rest ("8;5;255m") as text.
+    const script = join(tmpdir(), `rtach-resume-cut-${process.pid}.sh`);
+    writeFileSync(
+      script,
+      `#!/bin/sh\nsleep 1.5\ni=0\nwhile [ $i -lt 20000 ]; do printf '\\033[38;5;255mFmp%d' $i; i=$((i+1)); done\nsleep 60\n`,
+    );
+    chmodSync(script, 0o755);
+
+    const socketPath = uniqueSocketPath();
+    await startDetachedMaster(socketPath, script, 64 * 1024);
+
+    const client = await connectRawSocketWithUpgrade(socketPath, 5000, COMPRESSION_ZLIB);
+    sendAttachPacket(client, "resume-cut");
+    await Bun.sleep(100);
+    client.socket.write(Buffer.from([MessageType.PAUSE, 0]));
+    await Bun.sleep(100);
+    const beforePause = client.dataBuffer.length;
+    await Bun.sleep(4000);
+
+    client.socket.write(Buffer.from([MessageType.RESUME, 0]));
+    const deadline = Date.now() + 5000;
+    let flushed = "";
+    while (!flushed.includes("Fmp19999") && Date.now() < deadline) {
+      await Bun.sleep(100);
+      flushed = parseFrames(client.dataBuffer.subarray(beforePause)).terminal;
+    }
+    expect(flushed).toContain("Fmp19999");
+    expect(flushed.startsWith("\x1b[")).toBe(true);
+
+    client.close();
+    rmSync(script, { force: true });
+  }, 30000);
 });

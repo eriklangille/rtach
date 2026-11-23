@@ -73,6 +73,22 @@ pub fn nextLineStart(stored: Stored, pos: u64) u64 {
     return pos;
 }
 
+/// The first position at or after `pos` (at most max_line_search ahead) where output can
+/// be sent from without cutting something in two: a line start or an `ESC [`. Else `pos`.
+/// For output that begins wherever the ring buffer was overwritten up to: a program
+/// that redraws all the time (OpenCode) writes mostly escape sequences, and one cut
+/// after `ESC [3` drew "8;5;255m" over its prompt.
+pub fn nextSequenceStart(stored: Stored, pos: u64) u64 {
+    const limit = @min(stored.end(), pos + max_line_search);
+    var p = pos;
+    while (p < limit) : (p += 1) {
+        const b = stored.at(p);
+        if (b == '\n') return p + 1;
+        if (b == 0x1b and p + 1 < stored.end() and stored.at(p + 1) == '[') return p;
+    }
+    return pos;
+}
+
 /// Append the bytes of `range` to `out`, leaving out alternate-screen output. The
 /// screen mode at range.start is found by scanning from the oldest stored byte, which is
 /// assumed to be on the normal screen.
@@ -261,4 +277,17 @@ test "other private modes and CSI sequences pass through" {
     const text = try pageText(alloc, s, .{ .start = 0, .end = s.end() });
     defer alloc.free(text);
     try testing.expectEqualStrings("\x1b[?25l\x1b[?2004hhi\x1b[1;31mred\x1b[0m", text);
+}
+
+test "nextSequenceStart skips a cut escape sequence" {
+    const data = "8;5;255mxy\x1b[0mz\nw";
+    const s: Stored = .{ .first = data[0..6], .second = data[6..], .oldest = 100 };
+    // Cut inside the SGR: from the next ESC [
+    try testing.expectEqual(@as(u64, 110), nextSequenceStart(s, 100));
+    // At an ESC [ already
+    try testing.expectEqual(@as(u64, 110), nextSequenceStart(s, 110));
+    // Cut between ESC and [: after the newline
+    try testing.expectEqual(@as(u64, 116), nextSequenceStart(s, 111));
+    // Nothing safe ahead: where it was
+    try testing.expectEqual(@as(u64, 116), nextSequenceStart(s, 116));
 }

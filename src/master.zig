@@ -2466,7 +2466,9 @@ pub const Master = struct {
                     if (start < oldest_available) {
                         const dropped = oldest_available - start;
                         log.warn("client {} resume: buffered output overwritten ({} bytes lost)", .{ idx, dropped });
-                        start = oldest_available;
+                        // The oldest byte kept can be in the middle of an escape sequence,
+                        // whose rest the terminal would draw as text
+                        start = history.nextSequenceStart(self.storedOutput(), oldest_available);
                     }
 
                     const available = total_written - start;

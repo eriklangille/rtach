@@ -237,7 +237,7 @@ pub const Protocol = @import("protocol.zig");
 ///          so after lazygit exited, a reattach typed "8;53;79;1802;1264t" at the prompt.
 /// 2.40.2 - The app's chat launcher is "clauntty-chat" in pane state on macOS too, not its
 ///          interpreter ("bash" for /bin/sh), from the interpreter's argv[1].
-pub const version = "2.41.0";
+pub const version = "2.41.1";
 
 /// `-a`'s exit code when the session doesn't exist (it ended)
 pub const no_session_exit: u8 = 3;
